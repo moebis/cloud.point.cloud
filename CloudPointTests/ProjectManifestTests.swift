@@ -2,9 +2,96 @@ import XCTest
 @testable import CloudPoint
 
 final class ProjectManifestTests: XCTestCase {
-    func testLoadIgnoresPartialArtifacts() throws {
+    func testFractionalManifestDatesRoundTripExactlyAsRFC3339Strings() throws {
+        var manifest = ProjectManifest.fixture()
+        manifest.createdAt = Date(timeIntervalSince1970: 1_700_000_000.123_456_7)
+        manifest.updatedAt = Date(timeIntervalSince1970: 1_700_000_001.987_654_2)
+
+        let data = try ProjectManifest.encode(manifest)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let createdAt = try XCTUnwrap(object["createdAt"] as? String)
+        let updatedAt = try XCTUnwrap(object["updatedAt"] as? String)
+        let decoded = try ProjectManifest.decode(data)
+
+        XCTAssertEqual(createdAt, "2023-11-14T22:13:20.1234567Z")
+        XCTAssertEqual(updatedAt, "2023-11-14T22:13:21.9876542Z")
+        XCTAssertEqual(decoded.createdAt, manifest.createdAt)
+        XCTAssertEqual(decoded.updatedAt, manifest.updatedAt)
+        XCTAssertEqual(decoded, manifest)
+    }
+
+    func testNegativeReferenceIntervalDateRoundTripsExactly() throws {
+        var manifest = ProjectManifest.fixture()
+        manifest.createdAt = Date(timeIntervalSinceReferenceDate: -0.1)
+
+        let data = try ProjectManifest.encode(manifest)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let createdAt = try XCTUnwrap(object["createdAt"] as? String)
+        let decoded = try ProjectManifest.decode(data)
+
+        XCTAssertEqual(createdAt, "2000-12-31T23:59:59.9Z")
+        XCTAssertEqual(
+            decoded.createdAt.timeIntervalSinceReferenceDate.bitPattern,
+            manifest.createdAt.timeIntervalSinceReferenceDate.bitPattern
+        )
+        XCTAssertEqual(decoded.createdAt, manifest.createdAt)
+    }
+
+    func testManifestDateCodecRoundTripsRepresentativeDoubleBitPatterns() throws {
+        let referenceIntervals: [Double] = [
+            -10_000_000_000.123_457,
+            -1_234.567_89,
+            -1.1,
+            -1,
+            -0.999_999_999_999_999_9,
+            -0.5,
+            -0.1,
+            -Double.leastNonzeroMagnitude,
+            0,
+            Double.leastNonzeroMagnitude,
+            0.1,
+            0.5,
+            0.999_999_999_999_999_9,
+            1,
+            1.1,
+            1_234.567_89,
+            10_000_000_000.123_457,
+        ]
+
+        for interval in referenceIntervals {
+            var manifest = ProjectManifest.fixture()
+            manifest.createdAt = Date(timeIntervalSinceReferenceDate: interval)
+
+            let decoded = try ProjectManifest.decode(ProjectManifest.encode(manifest))
+
+            XCTAssertEqual(
+                decoded.createdAt.timeIntervalSinceReferenceDate.bitPattern,
+                interval.bitPattern,
+                "Did not preserve reference interval \(interval)"
+            )
+        }
+    }
+
+    func testManifestDateDecoderAcceptsWholeSecondRFC3339Strings() throws {
+        let manifest = ProjectManifest.fixture()
+        var object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: ProjectManifest.encode(manifest)) as? [String: Any]
+        )
+        object["createdAt"] = "2001-01-01T00:16:40Z"
+        object["updatedAt"] = "2001-01-01T00:33:20Z"
+
+        let decoded = try ProjectManifest.decode(
+            JSONSerialization.data(withJSONObject: object)
+        )
+
+        XCTAssertEqual(decoded.createdAt, manifest.createdAt)
+        XCTAssertEqual(decoded.updatedAt, manifest.updatedAt)
+    }
+
+    func testLoadLeavesWorkerOwnedPartialArtifactsUntouched() throws {
         let package = try TemporaryProjectPackage.make()
         var manifest = ProjectManifest.fixture()
+        manifest.frames = [.fixture(index: 0)]
         manifest.completedWindows = [.fixture(index: 0)]
 
         try manifest.writeAtomically(to: package.url)
@@ -16,7 +103,7 @@ final class ProjectManifestTests: XCTestCase {
         let loaded = try ProjectManifest.load(from: package.url)
 
         XCTAssertEqual(loaded.completedWindows.map(\.index), [0])
-        XCTAssertFalse(
+        XCTAssertTrue(
             FileManager.default.fileExists(
                 atPath: package.url.appending(path: "Points/window-1.cpc.partial").path
             )
@@ -91,35 +178,32 @@ final class ProjectManifestTests: XCTestCase {
 
     func testLoadRejectsAnUnsupportedFormatVersion() throws {
         let package = try TemporaryProjectPackage.make()
-        var unsupported = ProjectManifest.fixture()
-        unsupported.formatVersion = 2
-        try ProjectManifest.encode(unsupported).write(to: package.url.appending(path: "Manifest.json"))
+        let unsupported = try manifestData(formatVersion: 1)
+        try unsupported.write(to: package.url.appending(path: "Manifest.json"))
 
         XCTAssertThrowsError(try ProjectManifest.load(from: package.url)) { error in
-            XCTAssertEqual(error as? ProjectManifestError, .unsupportedFormatVersion(2))
+            XCTAssertEqual(error as? ProjectManifestError, .unsupportedFormatVersion(1))
         }
     }
 
     @MainActor
     func testDocumentReadRejectsAnUnsupportedFormatVersion() throws {
-        var unsupported = ProjectManifest.fixture()
-        unsupported.formatVersion = 2
         let packageWrapper = FileWrapper(directoryWithFileWrappers: [
-            "Manifest.json": FileWrapper(regularFileWithContents: try ProjectManifest.encode(unsupported)),
+            "Manifest.json": FileWrapper(regularFileWithContents: try manifestData(formatVersion: 1)),
         ])
 
         XCTAssertThrowsError(try CloudPointDocument.loadManifest(from: packageWrapper)) { error in
-            XCTAssertEqual(error as? ProjectManifestError, .unsupportedFormatVersion(2))
+            XCTAssertEqual(error as? ProjectManifestError, .unsupportedFormatVersion(1))
         }
     }
 
     func testAtomicWriteRejectsAnUnsupportedFormatVersion() throws {
         let package = try TemporaryProjectPackage.make()
         var unsupported = ProjectManifest.fixture()
-        unsupported.formatVersion = 2
+        unsupported.formatVersion = 1
 
         XCTAssertThrowsError(try unsupported.writeAtomically(to: package.url)) { error in
-            XCTAssertEqual(error as? ProjectManifestError, .unsupportedFormatVersion(2))
+            XCTAssertEqual(error as? ProjectManifestError, .unsupportedFormatVersion(1))
         }
         XCTAssertFalse(FileManager.default.fileExists(atPath: package.url.appending(path: "Manifest.json").path))
     }
@@ -129,6 +213,13 @@ final class ProjectManifestTests: XCTestCase {
         let identifiers = declarations?.compactMap { $0["UTTypeIdentifier"] as? String } ?? []
 
         XCTAssertTrue(identifiers.contains("cloud.point.cloud.project"))
+    }
+
+    private func manifestData(formatVersion: Int) throws -> Data {
+        let valid = try ProjectManifest.encode(.fixture())
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: valid) as? [String: Any])
+        object["formatVersion"] = formatVersion
+        return try JSONSerialization.data(withJSONObject: object)
     }
 }
 
@@ -146,18 +237,46 @@ extension ProjectManifest {
 }
 
 extension CompletedWindow {
-    static func fixture(index: Int) -> CompletedWindow {
+    static func fixture(index: UInt32) -> CompletedWindow {
         CompletedWindow(
             index: index,
-            frameStart: index * 32,
-            frameEnd: (index * 32) + 31,
-            pointChunkRelativePath: "Points/window-\(index).cpc",
+            inferenceFrameStart: index,
+            frameStart: index,
+            frameEnd: index,
+            pointChunkRelativePath: String(format: "Points/window-%08u.cpc", index),
             alignmentRowMajor: [
                 1, 0, 0, 0,
                 0, 1, 0, 0,
                 0, 0, 1, 0,
                 0, 0, 0, 1,
-            ]
+            ],
+            lastProcessedFrameIndex: index,
+            inlierCount: 1,
+            durationSeconds: 0,
+            frameArtifacts: [.fixture(frameIndex: index, windowIndex: index)]
+        )
+    }
+}
+
+private extension PersistedFrame {
+    static func fixture(index: UInt32) -> PersistedFrame {
+        PersistedFrame(
+            index: index,
+            sourceTimestamp: Double(index),
+            relativePath: String(format: "Frames/%08u.jpg", index)
+        )
+    }
+}
+
+private extension FrameArtifacts {
+    static func fixture(frameIndex: UInt32, windowIndex: UInt32) -> FrameArtifacts {
+        FrameArtifacts(
+            frameIndex: frameIndex,
+            windowIndex: windowIndex,
+            depthRelativePath: WorkerArtifactPath.depth(frameIndex: frameIndex),
+            confidenceRelativePath: WorkerArtifactPath.confidence(frameIndex: frameIndex),
+            geometryRelativePath: WorkerArtifactPath.geometry(frameIndex: frameIndex),
+            durationSeconds: 0
         )
     }
 }

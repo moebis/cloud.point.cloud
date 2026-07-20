@@ -32,27 +32,28 @@ enum SessionEvent: String, Codable, Sendable {
 
 enum SessionTransitionError: Error, Equatable, Sendable {
     case illegal(from: SessionPhase, event: SessionEvent)
+    case counterOverflow
 }
 
 struct SessionState: Codable, Sendable, Equatable {
     var phase: SessionPhase
     var isCapturing: Bool
-    var capturedCount: Int
-    var queuedCount: Int
-    var processedCount: Int
-    var failedCount: Int
-    var currentWindow: Int?
+    var capturedCount: UInt64
+    var queuedCount: UInt64
+    var processedCount: UInt64
+    var failedCount: UInt64
+    var currentWindow: UInt32?
 
     static let empty = SessionState(phase: .empty)
 
     init(
         phase: SessionPhase,
         isCapturing: Bool = false,
-        capturedCount: Int = 0,
-        queuedCount: Int = 0,
-        processedCount: Int = 0,
-        failedCount: Int = 0,
-        currentWindow: Int? = nil
+        capturedCount: UInt64 = 0,
+        queuedCount: UInt64 = 0,
+        processedCount: UInt64 = 0,
+        failedCount: UInt64 = 0,
+        currentWindow: UInt32? = nil
     ) {
         self.phase = phase
         self.isCapturing = isCapturing
@@ -72,8 +73,8 @@ struct SessionState: Codable, Sendable, Equatable {
         }
     }
 
-    var backlogCount: Int {
-        max(0, queuedCount - processedCount)
+    var backlogCount: UInt64 {
+        queuedCount >= processedCount ? queuedCount - processedCount : 0
     }
 
     func applying(_ event: SessionEvent) throws -> SessionState {
@@ -90,8 +91,11 @@ struct SessionState: Codable, Sendable, Equatable {
             next.phase = .capturing
             next.isCapturing = true
         case (.importing, .enqueueFrame), (.capturing, .enqueueFrame):
-            next.capturedCount += 1
-            next.queuedCount += 1
+            let (capturedCount, capturedOverflow) = next.capturedCount.addingReportingOverflow(1)
+            let (queuedCount, queuedOverflow) = next.queuedCount.addingReportingOverflow(1)
+            guard !capturedOverflow, !queuedOverflow else { throw SessionTransitionError.counterOverflow }
+            next.capturedCount = capturedCount
+            next.queuedCount = queuedCount
         case (.capturing, .stopCapture):
             next.phase = .processing
             next.isCapturing = false
@@ -118,7 +122,9 @@ struct SessionState: Codable, Sendable, Equatable {
              (.finalizing, .fail):
             next.phase = .failed
             next.isCapturing = false
-            next.failedCount += 1
+            let (failedCount, overflow) = next.failedCount.addingReportingOverflow(1)
+            guard !overflow else { throw SessionTransitionError.counterOverflow }
+            next.failedCount = failedCount
         default:
             throw SessionTransitionError.illegal(from: phase, event: event)
         }

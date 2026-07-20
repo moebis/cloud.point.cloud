@@ -140,18 +140,21 @@ final class PointChunkTests: XCTestCase {
         )
         try await engine.finishInput()
 
-        var result: FrameResult?
+        var result: WindowResult?
         for try await event in events {
-            if case let .frameCompleted(value) = event {
+            if case let .windowCompleted(value) = event {
                 result = value
             }
         }
 
         let completed = try XCTUnwrap(result)
-        let chunk = try PointChunk.open(url: package.url.appending(path: completed.pointChunkPath))
+        let chunk = try PointChunk.open(url: package.url.appending(path: completed.pointChunkRelativePath))
         XCTAssertEqual(chunk.pointCount, 64 * 64)
         XCTAssertEqual(try chunk.vertex(at: 0).sourceFrame, 17)
-        XCTAssertGreaterThanOrEqual(try chunk.vertex(at: 0).confidence, EngineConfiguration().confidenceThreshold)
+        XCTAssertGreaterThanOrEqual(
+            try chunk.vertex(at: 0).confidence,
+            Float(EngineConfiguration().confidenceThreshold)
+        )
     }
 }
 

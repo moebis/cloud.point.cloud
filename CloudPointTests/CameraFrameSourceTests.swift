@@ -119,7 +119,7 @@ final class CameraEventChannelTests: XCTestCase {
         XCTAssertFalse(senderCompletion.isComplete)
 
         var iterator = stream.makeAsyncIterator()
-        var indexes: [Int] = []
+        var indexes: [UInt32] = []
         for _ in 0..<40 {
             guard case let .persisted(frame)? = await iterator.next() else {
                 return XCTFail("Authoritative persisted event was lost")
@@ -129,7 +129,7 @@ final class CameraEventChannelTests: XCTestCase {
         await sender.value
         channel.finish()
 
-        XCTAssertEqual(indexes, Array(0..<40))
+        XCTAssertEqual(indexes, (0..<40).map(UInt32.init))
     }
 
     func testCancelingPendingSendReleasesProducerButRetainsEventForFIFODrain() async throws {
@@ -1186,7 +1186,7 @@ private actor PersistenceProbe: FramePersistence {
         try Task.checkCancellation()
         if let error { throw error }
         let persisted = PersistedFrame(
-            index: frame.index,
+            index: UInt32(frame.index),
             sourceTimestamp: frame.presentationTimestamp.seconds,
             relativePath: String(format: "Frames/%08d.jpg", frame.index)
         )
@@ -1262,7 +1262,7 @@ private actor FileMarkerPersistence: FramePersistence {
         let filename = String(format: "%08d.jpg", frame.index)
         try Data([0xFF, 0xD8, 0xFF, 0xD9]).write(to: directory.appending(path: filename))
         return PersistedFrame(
-            index: frame.index,
+            index: UInt32(frame.index),
             sourceTimestamp: frame.presentationTimestamp.seconds,
             relativePath: "Frames/\(filename)"
         )
@@ -1592,7 +1592,7 @@ private final class CancellationInsensitivePersistenceProbe: FramePersistence, @
         }
         lock.withLock { _activeCallCount -= 1 }
         return PersistedFrame(
-            index: frame.index,
+            index: UInt32(frame.index),
             sourceTimestamp: frame.presentationTimestamp.seconds,
             relativePath: String(format: "Frames/%08d.jpg", frame.index)
         )
@@ -1626,7 +1626,7 @@ private protocol FrameEmittingCameraCaptureSession: CameraCaptureSession, AnyObj
 private func persistedEvent(index: Int) -> CameraFrameSourceEvent {
     .persisted(
         PersistedFrame(
-            index: index,
+            index: UInt32(index),
             sourceTimestamp: Double(index),
             relativePath: String(format: "Frames/%08d.jpg", index)
         )
@@ -1641,9 +1641,9 @@ private func sendPersisted(index: Int, through producer: CameraEventProducer) as
     await producer.send(persistedEvent(index: index))
 }
 
-private func persistedIndexesUntilFinished(from stream: CameraFrameSourceEvents) async -> [Int] {
+private func persistedIndexesUntilFinished(from stream: CameraFrameSourceEvents) async -> [UInt32] {
     var iterator = stream.makeAsyncIterator()
-    var indexes: [Int] = []
+    var indexes: [UInt32] = []
     while let event = await iterator.next() {
         guard case let .persisted(frame) = event else { continue }
         indexes.append(frame.index)

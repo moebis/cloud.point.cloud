@@ -36,7 +36,7 @@ CloudPoint/Persistence/CloudPointDocument.swift   SwiftUI document package adapt
 CloudPoint/Engine/ReconstructionEngine.swift      replaceable engine contract
 CloudPoint/Engine/MockReconstructionEngine.swift  deterministic in-process geometry
 CloudPoint/Engine/WorkerProtocol.swift            length-prefixed JSON messages
-CloudPoint/Engine/WorkerProcess.swift             subprocess/socket supervision
+CloudPoint/Engine/WorkerProcess.swift             subprocess/framed-stdio supervision
 CloudPoint/Capture/FrameSampler.swift             timestamp sampling policy
 CloudPoint/Capture/AssetFrameSource.swift         AVAssetReader import
 CloudPoint/Capture/CameraFrameSource.swift        AVCaptureSession capture actor
@@ -161,7 +161,8 @@ git commit -m "build: scaffold CloudPoint macOS app"
 - Modify: `project.yml`
 
 **Interfaces:**
-- Produces: `PersistedFrame(index:sourceTimestamp:relativePath:)`.
+- Produces: `PersistedFrame(index:sourceTimestamp:relativePath:)` with a UInt32
+  source index and finite nonnegative Double timestamp.
 - Produces: `SessionPhase`, `SessionEvent`, and `SessionState.applying(_:) throws -> SessionState`.
 - Produces: `ProjectManifest.load(from:)` and `writeAtomically(to:fileManager:)`.
 - Produces: `.cloudpoint` package document support.
@@ -200,31 +201,36 @@ Expected: FAIL because `SessionState` is undefined.
 
 - [ ] **Step 3: Implement immutable state and shared values**
 
-Define `SessionPhase: String, Codable, Sendable` with `empty`, `preparing`, `ready`, `importing`, `capturing`, `processing`, `paused`, `finalizing`, `completed`, `cancelled`, and `failed`. Define explicit transition switches; reject every unspecified pair with `SessionTransitionError.illegal(from:event:)`. Define IDs as UUIDs, frame timestamps as `Double` seconds, and paths as package-relative strings.
+Define `SessionPhase: String, Codable, Sendable` with `empty`, `preparing`, `ready`, `importing`, `capturing`, `processing`, `paused`, `finalizing`, `completed`, `cancelled`, and `failed`. Define explicit transition switches; reject every unspecified pair with `SessionTransitionError.illegal(from:event:)`. Define IDs as UUIDs, frame/window indices as UInt32, counts as UInt64, frame timestamps as finite nonnegative `Double` seconds, and paths as safe package-relative strings.
 
-- [ ] **Step 4: Write failing manifest recovery tests**
+- [ ] **Step 4: Write failing manifest-version and validation tests**
 
 Create `TemporaryProjectPackage` as an XCTest support value that uses
-`FileManager.default.temporaryDirectory.appending(path: UUID().uuidString).appendingPathExtension("cloudpoint")`, creates the four package subdirectories, and removes its URL in `deinit`. Add deterministic `fixture()` factories in the test target for `ProjectManifest` and `CompletedWindow`. Then write a manifest, leave a `Points/window-1.cpc.partial`, reload, and assert the incomplete path is omitted while the last completed window remains recoverable:
+`FileManager.default.temporaryDirectory.appending(path: UUID().uuidString).appendingPathExtension("cloudpoint")`, creates the four package subdirectories, and removes its URL in `deinit`. Add deterministic `fixture()` factories in the test target for `ProjectManifest` and `CompletedWindow`. Assert format v2 round trips, v1 is rejected by the actionable unsupported-version path, malformed safe paths/nonfinite values/orderings fail, and the final completed window remains recoverable:
 
 ```swift
-func testLoadIgnoresPartialArtifacts() throws {
+func testVersionTwoRoundTripsCompletedWindow() throws {
     let package = try TemporaryProjectPackage.make()
     var manifest = ProjectManifest.fixture()
     manifest.completedWindows = [.fixture(index: 0)]
     try manifest.writeAtomically(to: package.url)
-    FileManager.default.createFile(
-        atPath: package.url.appending(path: "Points/window-1.cpc.partial").path,
-        contents: Data("partial".utf8)
-    )
     let loaded = try ProjectManifest.load(from: package.url)
+    XCTAssertEqual(loaded.formatVersion, 2)
     XCTAssertEqual(loaded.completedWindows.map(\.index), [0])
 }
 ```
 
 - [ ] **Step 5: Implement versioned manifest and document package**
 
-Use format version `1`, sorted-key JSON, ISO-8601 dates, and same-directory `Manifest.json.partial` followed by `FileManager.replaceItemAt`. `CloudPointDocument` must conform to `ReferenceFileDocument`, declare UTType `cloud.point.cloud.project`, and create `Frames`, `Predictions`, `Points`, and `Logs` directories on first save.
+Use format version `2` only, sorted-key JSON, ISO-8601 dates, and a synchronized
+same-directory manifest temporary followed by atomic replacement. Never silently
+decode v1 as v2. Persist the complete engine configuration and validate all paths,
+finite timestamps/durations/transforms, inclusive ranges, artifact/window ownership,
+and strictly increasing source/window order while permitting source-index gaps.
+`CloudPointDocument` must conform to `ReferenceFileDocument`, declare UTType
+`cloud.point.cloud.project`, and create `Frames`, `Predictions`, `Points`, and `Logs`
+directories on first save. The worker owns output-orphan cleanup; document loading
+must not guess which artifact files are removable.
 
 - [ ] **Step 6: Run tests and commit**
 
@@ -276,7 +282,7 @@ Run the focused test. Expected: FAIL because `ReconstructionEngine` and `MockRec
 
 - [ ] **Step 3: Implement the engine types and actor**
 
-Use `AsyncThrowingStream<EngineEvent, Error>` and an actor-owned continuation. Add a private `MockCPCWriter` in `MockReconstructionEngine.swift` so this task has no forward dependency on Task 7. It writes the exact approved 32-byte CPC1 header and 24-byte vertex records using explicit little-endian integers and bit patterns. `MockReconstructionEngine.enqueue` creates a deterministic 64-by-64 RGB plane centered on the origin, writes the valid CPC chunk beneath the project `Points` directory, and emits `.frameCompleted(FrameResult(...))`. Its color and Z offset derive from the frame index so tests and screenshots are reproducible. Pause suspends consumption; cancel closes the stream with `.cancelled`.
+Use `AsyncThrowingStream<EngineEvent, Error>` and an actor-owned continuation. Add a private `MockCPCWriter` in `MockReconstructionEngine.swift` so this task has no forward dependency on Task 7. It writes the exact approved 32-byte CPC1 header and 24-byte vertex records using explicit little-endian integers and bit patterns. For each new mock frame, create deterministic depth, confidence-above-1.5, and geometry artifacts, then one one-frame window CPC. Emit `frameStarted`, `frameCompleted(FrameArtifacts)` without a CPC, and `windowCompleted(WindowResult)` with the CPC, in that order and only after the files exist. Its color and Z offset derive from the source index so tests and screenshots are reproducible. Pause suspends consumption; cancel closes the stream with `.cancelled`. Check UInt32 arithmetic and honor replay checkpoints without rewriting or emitting events for replay frames.
 
 - [ ] **Step 4: Run and commit**
 
@@ -322,15 +328,35 @@ func testCodecRejectsOversizedPayload() {
 
 - [ ] **Step 2: Verify codec tests fail, then implement framing**
 
-Use a four-byte big-endian unsigned length and sorted-key JSON. Reject zero-length payloads, payloads over 1 MB, unknown protocol versions, duplicate command IDs, and trailing malformed JSON. Run focused tests and expect PASS.
+Use a four-byte big-endian unsigned length and the canonical JSON rules frozen in
+Task 7.5. Enforce the exact no-response/async-fault/command-error disposition for
+invalid framing, JSON, headers, payloads, and versions; reject duplicate command IDs
+without repeating mutation. Run focused tests and expect PASS.
 
-- [ ] **Step 3: Write a failing worker lifecycle test**
+- [ ] **Step 3: Write failing worker lifecycle and protocol-readiness tests**
 
-Launch `CloudPointMockWorker --mode heartbeat`, wait for `.ready`, then terminate it and assert `WorkerProcess` emits `.processExited(status:)` exactly once and closes file descriptors.
+Launch `CloudPointMockWorker --mode heartbeat`, perform `hello`, assert its ACK is
+followed immediately by a heartbeat, call idempotent
+`WorkerProcess.markProtocolReady()`, then terminate it and assert `WorkerProcess`
+emits `.processExited(status:)` exactly once and closes file descriptors. With an
+injected clock, assert launch requests no heartbeat timer, duplicate readiness arms
+one timer, the first heartbeat may arm/reset it, and three missed intervals after
+arming are terminal.
 
 - [ ] **Step 4: Implement process supervision and mock worker**
 
-Use `Process`, explicit pipes for stdin/stdout/stderr, a process-group termination path, and an actor for decoder state. The mock worker supports `normal`, `heartbeat`, `crash-after-ready`, and `silent` modes. A five-second heartbeat interval and three missed heartbeats produce `WorkerProcessError.unresponsive`.
+Use `Process`, explicit framed stdin/stdout pipes, a diagnostics-only stderr pipe, a
+process-group termination path, and an actor for decoder state. Supply the child
+environment as an exact replacement containing only `HOME`, `TMPDIR`,
+`PATH=/usr/bin:/bin`, `PYTHONNOUSERSITE=1`, `PYTHONHASHSEED=0`, `LC_ALL=C`, and
+`LANG=C`, plus explicit mock controls in tests; prove an inherited sentinel secret
+is absent. The mock worker supports `normal`,
+`heartbeat`, `crash-after-ready`, and `silent` modes and writes protocol frames only
+to stdout. Launcher readiness proves process ownership and writable stdio only.
+Protocol readiness after hello ACK or the first valid heartbeat arms supervision;
+three missed five-second intervals then produce `WorkerProcessError.unresponsive`.
+Exit/shutdown races produce one terminal result with no timer, task, pipe, or child
+leak.
 
 - [ ] **Step 5: Run and commit**
 
@@ -380,7 +406,10 @@ Have `VideoFixtureFactory` generate a one-second, 640-by-360 HEVC or H.264 movie
 
 - [ ] **Step 4: Implement AVAssetReader source and atomic JPEG persistence**
 
-Use `AVAssetReaderTrackOutput`, request native bi-planar YUV when supported, transform orientation before JPEG encoding, write `Frames/%08d.jpg.partial`, synchronize, rename, then emit `PersistedFrame`. Do not load the complete recording into memory.
+Use `AVAssetReaderTrackOutput`, request native bi-planar YUV when supported,
+transform orientation before JPEG encoding, convert the capture counter exactly to
+UInt32, write and synchronize a sibling temporary for `Frames/%08u.jpg`, promote it,
+then emit `PersistedFrame`. Do not load the complete recording into memory.
 
 - [ ] **Step 5: Run and commit**
 
@@ -439,7 +468,7 @@ git commit -m "feat: capture sampled camera frames"
 - Create: `CloudPointTests/RendererBufferTests.swift`
 
 **Interfaces:**
-- Produces: `PointChunk.open(url:limits:) throws -> PointChunk` for CPC1 stride-24 files.
+- Produces: `PointChunk.open(url:limits:) throws -> PointChunk` for window-owned CPC1 stride-24 files.
 - Produces: `PointCloudRenderer.append(_:)`, `setConfidenceThreshold(_:)`, and camera controls.
 - Consumes: CPC files emitted by either mock or real engine.
 
@@ -468,6 +497,144 @@ Expected: all CPC and buffer tests PASS; `xcodebuild build` compiles `PointShade
 ```bash
 git add CloudPoint/Rendering CloudPointTests/PointChunkTests.swift CloudPointTests/RendererBufferTests.swift
 git commit -m "feat: render validated point-cloud chunks"
+```
+
+### Task 7.5: Reconcile Protocol, Manifest, and Window Ownership
+
+**Files:**
+- Modify: `CloudPoint/Domain/ProjectModels.swift`
+- Modify: `CloudPoint/Persistence/ProjectManifest.swift`
+- Modify: `CloudPoint/Engine/ReconstructionEngine.swift`
+- Modify: `CloudPoint/Engine/MockReconstructionEngine.swift`
+- Modify: `CloudPoint/Engine/WorkerProtocol.swift`
+- Modify: `CloudPoint/Engine/WorkerProcess.swift`
+- Modify: `CloudPointMockWorker/main.swift`
+- Test: focused manifest/protocol/mock/process/CPC suites
+
+**Interfaces:**
+- Produces: canonical UInt32 `ResumeCheckpoint`, `FrameArtifacts`, and
+  window-owned `WindowResult` domain values reused by protocol and manifest code.
+- Produces: manifest format 2, a pure `PendingWindowAccumulator`, and tested exact
+  checkpoint derivation over ordered committed artifacts.
+- Produces: framed-stdio disposition/canonical-JSON fixtures and protocol-readiness
+  heartbeat supervision.
+
+- [ ] **Step 1: Freeze shared values and complete configuration**
+
+`ProjectDescriptor` carries `resumeCheckpoint: ResumeCheckpoint?`. The checkpoint
+has UInt32 `lastCommittedFrameIndex`, actual `replayFromFrameIndex`, and
+`nextWindowIndex`. `EngineConfiguration` persists UInt32 `scaleFrames`,
+`windowSize`, `windowOverlap`, `keyframeInterval`, and
+`cameraRefinementIterations`, plus finite positive Double `confidenceThreshold` and
+`voxelSize`. Defaults are 8, 32, 8, 1, 4, 1.5, and 0.01 respectively. Validate
+window size `1...1024`, scale frames
+`1...windowSize`, overlap less than window size (zero is legal), positive
+keyframe/refinement values,
+and positive finite confidence/voxel values.
+
+`FrameArtifacts` carries UInt32 frame/window IDs, depth/confidence/geometry paths,
+and finite nonnegative Double duration. `WindowResult` carries UInt32 window index,
+inference start, inclusive unique-output start/end, CPC path, 16 finite Double
+row-major alignment values, UInt32 last processed frame, UInt64 inlier count, and
+finite nonnegative duration. `EngineEvent` keeps frame and window completion
+separate and uses UInt64 queued/processed/model-progress counts. Structured async
+errors preserve code, message, recoverability, and canonical detail values.
+`queuedFrames` is cumulative unique-output admission this invocation, not pending
+depth; replay is excluded, `processedFrames <= queuedFrames`, and backlog is their
+difference.
+
+- [ ] **Step 2: Reset and validate manifest v2 plus checkpoint derivation**
+
+Create only format v2 and reject v1 through the actionable unsupported-version
+path. A completed window stores its full window result plus ordered committed frame
+artifacts. Validate safe paths, finite nonnegative timestamps/durations, exactly 16
+finite transform values, matching window IDs, inclusive ranges, artifact uniqueness,
+and strictly increasing source/window order while permitting source gaps.
+
+Derive the resume checkpoint from the final completed window and the final
+`max(windowOverlap, 1)` actual committed artifacts across window boundaries.
+`replayFromFrameIndex` is the first selected source index, never subtraction;
+`nextWindowIndex` is checked addition. Test gapped frames, zero overlap,
+cross-window selection, UInt32 maximums, and next-window overflow.
+
+- [ ] **Step 3: Freeze protocol commands, events, and response ownership**
+
+`beginSession` carries the nullable checkpoint object. `configure` includes
+`voxelSize`. `frameCompleted` contains only frame/window IDs, depth/confidence/
+geometry paths, and duration. `windowCompleted` contains window index, inference
+start, unique-output bounds, CPC path, 16-number transform, last processed index,
+inliers, and duration. Require
+`inferenceFrameStart <= frameStart <= frameEnd <= lastProcessedFrameIndex`.
+`hello.supportedProtocolVersions` is `[UInt32]` and must contain 1.
+
+The real integration launches
+`cloudpoint-worker serve --project ABSOLUTE_PATH --model ABSOLUTE_PATH`, sends
+framed commands on stdin, receives framed responses/events on protocol-only stdout,
+and captures diagnostics-only stderr. There is no listener or network transport.
+
+Canonical JSON uses sorted keys, lowercase UUIDs, no whitespace, finite
+shortest-round-trip typed Doubles, integral values without `.0`, normalized negative
+zero, and lowercase `e` without `+` or redundant exponent zeroes. Relayed raw
+numeric tokens in error details retain their exact lexeme. Encoders emit and
+decoders require lowercase canonical UUID text.
+Test null/full checkpoints, nested missing/unknown fields, integral/nonintegral/
+exponent Doubles, UUID casing, configuration, both completion events, and raw detail
+lexemes.
+
+Disposition is explicit: invalid lengths/truncation close without response; invalid
+JSON or no complete recoverable header gets at most one async fault then close; a
+complete header with bad type/payload gets exactly one command error and leaves the
+transport/state open; an unsupported version gets one flushed command error then
+close. Every decoded valid command gets exactly one ACK/error.
+
+- [ ] **Step 4: Freeze native pending-window and worker output transactions**
+
+`PendingWindowAccumulator` accepts artifacts by window and finalizes only when a
+matching window result is paired with the ordered expected unique output IDs selected
+from persisted/enqueued frame records. Require exact ID-list equality; reject
+duplicate, missing, extra, cross-window, and out-of-order artifacts. Native Task 8
+will atomically persist the finalized transaction and only then publish the CPC.
+
+Canonical paths are `Predictions/%08u.depth-f16`,
+`Predictions/%08u.confidence-f16`, `Predictions/%08u.geometry.json`, and
+`Points/window-%08u.cpc`, where UInt32 IDs may expand to ten digits. Exclusive
+siblings are `.<final-basename>.<lowercase-UUID>.partial`; promotion is no-clobber.
+Before begin ACK, worker/mock read manifest references and descriptor-relatively
+remove only exact-pattern partials and unreferenced exact-pattern finals, without
+following symlinks or deleting unknown names. Native never removes guessed output
+orphans. The worker's manifest access is read-only; only native writes it.
+
+- [ ] **Step 5: Correct mocks, replay, ACKs, and heartbeat arming**
+
+Mocks write artifacts before events, keep confidence above 1.5, emit frame artifacts
+then window CPC, consume replay through the committed boundary without events or
+writes, accept strictly increasing source IDs beginning at the actual replay start
+before new frames, and number new windows from `nextWindowIndex`. Source gaps are
+legal. Replay is excluded from CPC
+and queued/processed counters. ACK always precedes lifecycle output: hello completes
+negotiation and precedes the immediate heartbeat; configure stores the complete
+validated configuration; begin follows manifest/checkpoint validation and exact
+cleanup; enqueue means bounded queue admission; finish closes admission; pause
+records a request, resume releases it after cooperative quiescence with the queue
+retained, and cancel/shutdown ACKs precede later completion, cleanup, or exit.
+
+The mock worker waits for hello, emits its sole ACK, then an immediate heartbeat
+before ready/model/lifecycle output. `WorkerProcess.markProtocolReady()` is
+idempotent, launcher handoff does not arm the timer, and the first heartbeat may
+arm/reset it. The exact child environment is the allowlist above, not a merge with
+inherited values. The real worker contract reserves one dedicated serial executor
+for MLX/model work so framing, controls, and an at-most-five-second heartbeat cadence
+stay live during loading, inference, finalization, and idle.
+
+- [ ] **Step 6: Verify and commit the reconciled boundary**
+
+Run focused manifest/protocol/mock/process/CPC tests, `scripts/test-native`, and
+`git diff --check`. Cross-language work must not begin until an independent review
+approves the base-to-head diff.
+
+```bash
+git add CloudPoint CloudPointMockWorker CloudPointTests project.yml docs/superpowers
+git commit -m "fix: reconcile reconstruction protocol ownership"
 ```
 
 ### Task 8: Runnable Vertical-Slice Workspace
@@ -508,7 +675,11 @@ Add tests for recording import, pause/resume, cancel, engine failure, project cl
 
 - [ ] **Step 2: Implement `SessionController` and `WorkspaceViewModel`**
 
-Make the view model `@MainActor`, expose a single `WorkspaceSnapshot`, and delegate mutable workflow state to `SessionController` actor. The controller owns `SessionState`, ordered queued frames, and manifest mutations; each method applies a legal domain event and writes the manifest before returning its snapshot. Consume engine events in one view-model-owned task and cancel that task on document close. Persist manifest changes before publishing counts to the UI.
+Make the view model `@MainActor`, expose a single `WorkspaceSnapshot`, and delegate mutable workflow state to `SessionController` actor. The controller owns `SessionState`, ordered persisted/enqueued frame records, one monotonically revised manifest snapshot, and manifest mutations; each method applies a legal domain event and writes the manifest before returning its snapshot. Consume engine events in one view-model-owned task that starts before engine calls and cancel it on document close. Feed frame artifacts through `PendingWindowAccumulator`; on matching window completion select the exact expected unique output IDs, atomically commit artifacts plus window, and only then publish the CPC. Persist manifest changes before counts. Event generations and revisions prevent reentrant stale work from overwriting newer state.
+
+Treat queued count as cumulative successful unique-output admissions for the current
+invocation: increment only after enqueue returns its ACK-equivalent, never decrement,
+exclude replay, and derive backlog as queued minus processed.
 
 - [ ] **Step 3: Implement the four-region workspace**
 

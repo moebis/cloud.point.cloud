@@ -1,8 +1,8 @@
 # CloudPoint 0.1 Design
 
-**Status:** Approved architecture and product scope; technical design prepared for final review  
-**Date:** 2026-07-20  
-**Working product name:** CloudPoint  
+**Status:** Approved architecture and product scope; technical design prepared for final review
+**Date:** 2026-07-20
+**Working product name:** CloudPoint
 **Target:** Apple Silicon Macs running macOS 15 or later
 
 ## 1. Purpose
@@ -142,7 +142,7 @@ protocol ReconstructionEngine: Sendable {
 }
 ```
 
-`PythonMLXEngine` launches, monitors, and terminates the initial worker. No view or persistence type references Python, sockets, NumPy, or MLX.
+`PythonMLXEngine` launches, monitors, and terminates the initial worker. No view or persistence type references Python, framed stdio, NumPy, or MLX.
 
 ### `PointCloudRenderer`
 
@@ -161,7 +161,7 @@ The main document window has four stable regions:
 1. **Left source panel:** recording import, camera selection, live preview, source metadata, and capture controls.
 2. **Center viewport:** Metal point cloud, trajectory, camera frustum, grid, axes, and empty/loading/error states.
 3. **Right inspector:** sampling rate, confidence threshold, point size, rendering budget, reconstruction status, and model health.
-4. **Bottom timeline:** captured-frame count, processed-frame count, current window, elapsed time, backlog, and pause/resume/cancel controls.
+4. **Bottom timeline:** captured-frame, cumulative admitted-frame, and processed-frame counts; current window; elapsed time; backlog (`admitted - processed`); and pause/resume/cancel controls.
 
 Opening an empty document first presents two primary actions: **Open Recording** and **Use Camera**. If the worker or model is unavailable, either action routes through the setup sheet before creating a reconstruction session.
 
@@ -195,25 +195,46 @@ Example.cloudpoint/
     worker.log
 ```
 
-`Manifest.json` contains:
+`Manifest.json` uses format version 2. Version 0.1 creates only v2 packages and
+rejects v1 through an actionable unsupported-version error rather than silently
+decoding it as v2. It contains:
 
 - Format version.
 - Project identifier and creation/update dates.
 - Source type and non-sensitive source metadata.
-- Sampling and reconstruction configuration.
+- Complete sampling and reconstruction configuration: UInt32 scale-frame, window,
+  overlap, keyframe, and camera-refinement values plus finite positive Double
+  confidence threshold and voxel size (default `0.01`).
 - Model identifier, source revision, converted-weight checksum, and engine version.
-- Per-frame timestamps and relative paths.
-- Window boundaries, completion state, and alignment transforms.
+- UInt32 per-frame indices, finite nonnegative timestamps, and relative paths.
+- Strictly increasing UInt32 window indices; inference and inclusive unique-output
+  bounds; window CPC path; exactly 16 finite Double Sim3 values; last processed
+  frame, UInt64 inlier count, nonnegative duration, and ordered committed frame
+  artifacts.
 - Captured, queued, processed, failed, and exported counts.
-- Session state and the last recoverable checkpoint.
+- Session state; the recoverable checkpoint is derived from ordered completed-window
+  artifacts rather than stored as an arithmetic marker.
 
-Manifests are written to a sibling temporary file, synchronized, and atomically renamed. Partial prediction or point files use a `.partial` suffix and are ignored during recovery.
+Native code is the sole manifest writer. It validates every package-relative path,
+timestamp, duration, transform, range, and ordering rule before writing a sibling
+temporary file, synchronizing, and atomically renaming it. Source-frame gaps are
+legal. The worker may read committed manifest state for replay and orphan cleanup
+but never mutates it.
 
 Raw source recordings are not copied into the package. Only sampled frames and derived data are stored. The app estimates required space before starting and warns when the package exceeds 10 GB or the volume has less than 20 GB free.
 
 ## 8. Worker Protocol
 
-The app creates a private Unix-domain socket inside its per-launch temporary directory and starts the worker with explicit socket, project, and model paths. Messages use a four-byte big-endian length followed by UTF-8 JSON. Large frames and tensors never travel through JSON; messages reference files inside the project package.
+The app starts
+`cloudpoint-worker serve --project ABSOLUTE_PATH --model ABSOLUTE_PATH` with an
+exactly replaced child environment containing only `HOME`, `TMPDIR`,
+`PATH=/usr/bin:/bin`, `PYTHONNOUSERSITE=1`, `PYTHONHASHSEED=0`, `LC_ALL=C`, and
+`LANG=C` (plus explicit mock controls in tests). Commands use framed stdin, responses
+and events use framed stdout, and diagnostics use stderr. The worker creates no
+listener, binds no network port, and makes no network request. Messages use a
+four-byte big-endian length followed by canonical UTF-8 JSON; large frames and
+tensors never travel through JSON and messages reference files inside the project
+package.
 
 ### App-to-worker commands
 
@@ -227,7 +248,30 @@ The app creates a private Unix-domain socket inside its per-launch temporary dir
 - `cancel`
 - `shutdown`
 
-Each command has a UUID, protocol version, project ID, and typed payload. The worker returns exactly one acknowledgement or structured error for every command.
+Each command has a lowercase canonical UUID, protocol version, project ID, and exact
+typed payload. Encoders emit and decoders require lowercase UUID text; unknown or
+missing fields are rejected at every level. `hello.supportedProtocolVersions` is a
+UInt32 array containing `1`. Generated JSON has
+sorted keys, no insignificant whitespace, finite shortest-round-trip Double tokens,
+integral Doubles without `.0`, normalized negative zero, lowercase `e` without `+`
+or redundant exponent zeroes. Relayed raw numeric
+tokens inside structured error `details` preserve their original lexemes.
+
+`configure` carries UInt32 `scaleFrames`, `windowSize`, `windowOverlap`,
+`keyframeInterval`, and `cameraRefinementIterations`, plus finite positive Double
+`confidenceThreshold` and `voxelSize`. `beginSession` carries
+`resumeCheckpoint: null | ResumeCheckpoint`, whose fields are UInt32
+`lastCommittedFrameIndex`, `replayFromFrameIndex`, and `nextWindowIndex`. A decoded
+valid command receives exactly one acknowledgement or
+structured error. Zero, oversized, or incomplete frames close without a response;
+invalid JSON or an unrecoverable header produces at most one asynchronous protocol
+fault before close; a recoverable complete header with bad type/payload gets one
+command error without state mutation; an unsupported version gets one flushed
+command error and then closes.
+
+Configuration validation requires window size `1...1024`, scale frames
+`1...windowSize`, overlap less than window size (zero is legal), positive
+keyframe/refinement counts, and positive finite confidence/voxel values.
 
 ### Worker-to-app events
 
@@ -243,9 +287,40 @@ Each command has a UUID, protocol version, project ID, and typed payload. The wo
 - `error`
 - `heartbeat`
 
-`frameCompleted` identifies depth, confidence, pose, intrinsics, and point-chunk files. `windowCompleted` includes the window's global alignment and recoverable manifest checkpoint.
+`frameCompleted` identifies exactly the depth, confidence, and geometry artifacts
+for one unique output frame. `windowCompleted` separately owns one CPC containing
+only the window's unique output range; it carries the inference start, inclusive
+unique-output bounds, global alignment, last processed index, inlier count, and
+duration. Replay/overlap context emits no completion events and is never duplicated
+in CPC output.
 
-The worker emits a heartbeat at least every five seconds while busy. Missing three heartbeats marks the engine unresponsive and offers restart-from-window.
+Wire frame/window IDs and bounds are UInt32; queued/processed/model-progress counts
+and inliers are UInt64; durations, heartbeat time, and transforms are finite Double.
+Protocol queued/processed/window counts cover unique current-invocation output only
+and exclude replay context. `queuedFrames` is cumulative descriptors admitted, not
+pending depth; `processedFrames <= queuedFrames`, and backlog is their difference.
+
+ACKs precede lifecycle events. Hello ACK completes version negotiation and is
+followed immediately by a heartbeat; configure ACK means the complete configuration
+was stored; begin ACK means checkpoint/manifest validation and exact orphan cleanup
+succeeded. Enqueue ACK means admission to the bounded ordered descriptor queue, not
+completed inference. Finish ACK closes admission only; pause ACK records the request
+before later quiescence with the queue retained; resume ACK releases paused work;
+cancel ACK records cancellation before later safe-boundary cleanup/event; shutdown ACK is flushed
+before active-session quiescence/cleanup or direct idle exit.
+
+Native owns a pending-window accumulator. It groups frame artifacts by window and
+commits them with a matching window completion only when their ordered IDs exactly
+match the expected unique output IDs selected from persisted/enqueued frames.
+Bounds alone are insufficient because source indices may have gaps. The atomic
+manifest commit occurs before the CPC is published to the renderer.
+
+Immediately after the `hello` ACK the worker emits a heartbeat, then emits at least
+one every five seconds during loading, inference, finalization, and idle. MLX work
+runs on one dedicated serial executor so framing, control, and heartbeat scheduling
+remain live. Process launch does not arm the native watchdog: protocol readiness
+after the hello ACK, or the first valid heartbeat, arms it idempotently. Three missed
+intervals after arming mark the engine unresponsive and offer restart-from-window.
 
 ## 9. Point Chunk Format
 
@@ -305,8 +380,9 @@ The app and worker never deserialize an arbitrary `.pt` file. The converter firs
 - 32-frame windows.
 - Eight overlapping frames between windows.
 - Keyframe interval one.
-- One iterative camera refinement pass.
+- Four iterative camera refinement passes.
 - Confidence threshold 1.5.
+- Voxel size 0.01 reconstruction units.
 - Direct processing when the session fits one window; overlapping-window processing otherwise.
 
 These defaults are recorded in every project. Advanced model/cache controls remain hidden in 0.1; only sampling rate, confidence threshold, and point-display settings are user-facing.
@@ -337,7 +413,9 @@ Lingbot reconstruction scale is treated as internally consistent but not guarant
 2. `FrameSampler` computes deterministic target timestamps at the selected FPS.
 3. Frames are decoded, oriented, persisted, entered atomically in the manifest, and enqueued.
 4. The worker loads its model once, establishes anchor frames, and processes windows.
-5. Each completed frame updates progress; each point chunk is validated and appended to the renderer.
+5. Frame artifacts accumulate provisionally; a matching completed window commits
+   its exact unique-frame set atomically, then its validated point chunk is appended
+   to the renderer and committed progress advances.
 6. `finishInput` closes the input stream, the final partial window is processed, and the package becomes exportable.
 
 ### Live camera
@@ -368,7 +446,26 @@ empty
 
 Capture and processing are orthogonal flags inside the active states, allowing camera capture to continue while processing trails behind.
 
-Recovery occurs only at completed-window boundaries. When reopening an interrupted package, the app removes `.partial` files, validates the manifest and completed chunks, then offers to continue from the first frame after the last completed window. Saved sampled frames make both imported and formerly live sessions resumable as recording-style jobs.
+Recovery occurs only at completed-window boundaries. Native validates manifest v2
+and completed chunks, derives `lastCommittedFrameIndex` from the last window's
+inclusive output end, derives the next window with checked addition, and selects the
+last `max(windowOverlap, 1)` actual committed frame-artifact records across window
+boundaries. The first selected source index becomes `replayFromFrameIndex`; it is
+never computed by subtraction. The worker reads those committed artifacts from the
+manifest, consumes replay through the committed boundary without writes/events or
+counter increments, then processes strictly increasing new saved frames. Saved
+sampled frames make both imported and formerly live sessions resumable as finite
+recording-style jobs.
+
+Canonical artifacts are `Predictions/%08u.depth-f16`,
+`Predictions/%08u.confidence-f16`, `Predictions/%08u.geometry.json`, and
+`Points/window-%08u.cpc` (minimum width eight; UInt32 may require ten digits).
+Exclusive siblings use `.<final-basename>.<lowercase-UUID>.partial`. Before
+promotion, the worker synchronizes and never clobbers an existing final. Before
+`beginSession` ACK, the worker compares exact-pattern outputs with the
+manifest-referenced set and descriptor-relatively removes only exact-pattern partials and
+unreferenced canonical finals. It does not follow symlinks or delete unknown names;
+native never guesses orphan files.
 
 ## 13. Error Handling and Safety
 
@@ -404,7 +501,10 @@ The worker binds no TCP port and makes no network requests. Model download is pe
 - Timestamp-based sampling for constant and variable frame rates.
 - Session state transitions and illegal-transition rejection.
 - Atomic manifest save and interrupted-save recovery.
-- Unix socket framing, size limits, acknowledgements, and malformed messages.
+- Framed stdin/stdout size limits, canonical JSON, response-disposition rules,
+  acknowledgements, and malformed messages.
+- Manifest-v2 checkpoint derivation, gapped source indices, ordered pending-window
+  commits, and exact worker orphan cleanup.
 - Worker heartbeat supervision and process cleanup.
 - `.cpc` header/length/NaN validation.
 - Depth unprojection with known intrinsics and pose.

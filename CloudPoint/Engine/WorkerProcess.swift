@@ -7,6 +7,7 @@ enum WorkerProcessError: Error, Sendable, Equatable {
     case notRunning
     case inputQueueFull
     case eventBufferOverflow
+    case standardOutputClosed
     case unresponsive
     case protocolFailure(WorkerProtocolError)
 }
@@ -40,7 +41,7 @@ struct ContinuousWorkerProcessClock: WorkerProcessClock {
 
 private actor WorkerFrameDecoder {
     private var decoder = LengthPrefixedJSONCodec.Decoder()
-    func append(_ data: Data) throws -> [WorkerEnvelope] { try decoder.append(data) }
+    func append(_ data: Data) -> [WorkerFrameDecodeOutcome] { decoder.appendOutcomes(data) }
     func finish() throws { try decoder.finish() }
 }
 
@@ -194,6 +195,7 @@ actor WorkerProcess {
     static let missedHeartbeatLimit = 3
     static let maximumPendingInputBytes = 2 * 1_048_576
     static let maximumDiagnosticChunkBytes = 4_096
+    static let standardOutputExitGrace: Duration = .milliseconds(100)
 
     nonisolated private let eventStream: AsyncThrowingStream<WorkerProcessEvent, Error>
     nonisolated private let diagnosticStream: AsyncStream<String>
@@ -213,6 +215,7 @@ actor WorkerProcess {
     private var heartbeatTask: Task<Void, Never>?
     private var launcherTimeoutTask: Task<Void, Never>?
     private var escalationTask: Task<Void, Never>?
+    private var stdoutEOFTask: Task<Void, Never>?
     private var cleanupTask: Task<Void, Never>?
     private var launcherWaiter: CheckedContinuation<Void, Error>?
     private var terminalWaiters: [CheckedContinuation<Int32, Error>] = []
@@ -228,6 +231,8 @@ actor WorkerProcess {
     private var terminalFailure: WorkerProcessError?
     private var cleanupStarted = false
     private var didEmitTerminal = false
+    private var protocolReady = false
+    private var heartbeatObservedSinceLastTick = false
     private var missedHeartbeats = 0
 
     private init(clock: any WorkerProcessClock, launcherHandshakeTimeout: Duration) throws {
@@ -311,6 +316,27 @@ actor WorkerProcess {
         try await writer.enqueue(frame)
     }
 
+    func markProtocolReady() {
+        guard isRunning,
+              launcherReady,
+              !protocolReady,
+              !cleanupStarted,
+              !terminationRequested,
+              terminalFailure == nil,
+              processExitStatus == nil else {
+            return
+        }
+        protocolReady = true
+        heartbeatObservedSinceLastTick = false
+        missedHeartbeats = 0
+        startHeartbeatSupervision()
+    }
+
+#if DEBUG
+    var missedHeartbeatCountForTesting: Int { missedHeartbeats }
+    var heartbeatObservedSinceLastTickForTesting: Bool { heartbeatObservedSinceLastTick }
+#endif
+
     func terminate() async {
         guard isRunning, !cleanupStarted, !terminationRequested else { return }
         terminationRequested = true
@@ -336,7 +362,7 @@ actor WorkerProcess {
     ) async throws {
         process.executableURL = launcherExecutable
         process.arguments = [executable.path] + arguments
-        process.environment = ProcessInfo.processInfo.environment.merging(environment) { _, supplied in supplied }
+        process.environment = environment
         process.standardInput = standardInput
         process.standardOutput = standardOutput
         process.standardError = standardError
@@ -390,32 +416,41 @@ actor WorkerProcess {
 
     private func receiveStandardOutput(_ data: Data) async {
         guard !cleanupStarted else { return }
-        do {
-            for envelope in try await decoder.append(data) {
-                if case .heartbeat? = envelope.event { missedHeartbeats = 0 }
+        for outcome in await decoder.append(data) {
+            switch outcome {
+            case let .envelope(envelope):
+                if case .heartbeat? = envelope.event { heartbeatArrived() }
                 switch eventContinuation.yield(.envelope(envelope)) {
                 case .enqueued: break
                 case .dropped, .terminated: await initiateFailure(.eventBufferOverflow)
                 @unknown default: await initiateFailure(.eventBufferOverflow)
                 }
+            case let .failure(error, _):
+                await initiateFailure(.protocolFailure(error))
+                return
             }
-        } catch let error as WorkerProtocolError {
-            await initiateFailure(.protocolFailure(error))
-        } catch {
-            await initiateFailure(.protocolFailure(.malformedEnvelope))
         }
     }
 
     private func stdoutDidEnd() async {
         guard !stdoutEnded else { return }
-        do { try await decoder.finish() }
-        catch let error as WorkerProtocolError {
-            if terminalFailure == nil { terminalFailure = .protocolFailure(error) }
-        }
-        catch {
-            if terminalFailure == nil { terminalFailure = .protocolFailure(.malformedEnvelope) }
+        let protocolFailure: WorkerProcessError?
+        do {
+            try await decoder.finish()
+            protocolFailure = nil
+        } catch let error as WorkerProtocolError {
+            protocolFailure = .protocolFailure(error)
+        } catch {
+            protocolFailure = .protocolFailure(.malformedEnvelope)
         }
         stdoutEnded = true
+        if terminalFailure == nil, let protocolFailure {
+            await initiateFailure(protocolFailure)
+            return
+        }
+        if terminalFailure == nil, processExitStatus == nil {
+            scheduleStandardOutputClosureCheck()
+        }
         await beginCleanupIfReady()
     }
 
@@ -455,7 +490,6 @@ actor WorkerProcess {
             await writer.start()
             if isRunning, terminalFailure == nil {
                 acceptsWrites = true
-                startHeartbeatSupervision()
             }
             launcherWaiter?.resume()
             launcherWaiter = nil
@@ -473,6 +507,8 @@ actor WorkerProcess {
         acceptsWrites = false
         heartbeatTask?.cancel()
         launcherTimeoutTask?.cancel()
+        stdoutEOFTask?.cancel()
+        stdoutEOFTask = nil
         signalProcessTreeForCleanup(SIGKILL)
         if !launcherReady {
             launcherWaiter?.resume(throwing: WorkerProcessError.launchFailed("launcher exited with status \(status)"))
@@ -483,6 +519,15 @@ actor WorkerProcess {
     }
 
     private func startHeartbeatSupervision() {
+        guard protocolReady,
+              heartbeatTask == nil,
+              isRunning,
+              !cleanupStarted,
+              !terminationRequested,
+              terminalFailure == nil,
+              processExitStatus == nil else {
+            return
+        }
         let ticks = clock.timer(interval: Self.heartbeatInterval)
         heartbeatTask = Task { [weak self] in
             for await _ in ticks {
@@ -490,6 +535,21 @@ actor WorkerProcess {
                 await self?.heartbeatTick()
             }
         }
+    }
+
+    private func heartbeatArrived() {
+        guard isRunning,
+              !cleanupStarted,
+              !terminationRequested,
+              terminalFailure == nil,
+              processExitStatus == nil else {
+            return
+        }
+        let supervisionWasAlreadyArmed = protocolReady
+        protocolReady = true
+        missedHeartbeats = 0
+        heartbeatObservedSinceLastTick = supervisionWasAlreadyArmed
+        startHeartbeatSupervision()
     }
 
     private func startLauncherTimeout() {
@@ -509,15 +569,48 @@ actor WorkerProcess {
     }
 
     private func heartbeatTick() async {
-        guard isRunning, !cleanupStarted, !terminationRequested else { return }
+        guard protocolReady, isRunning, !cleanupStarted, !terminationRequested else { return }
+        if heartbeatObservedSinceLastTick {
+            heartbeatObservedSinceLastTick = false
+            missedHeartbeats = 0
+            return
+        }
         missedHeartbeats += 1
         if missedHeartbeats >= Self.missedHeartbeatLimit { await initiateFailure(.unresponsive) }
+    }
+
+    private func scheduleStandardOutputClosureCheck() {
+        guard stdoutEOFTask == nil else { return }
+        stdoutEOFTask = Task { [weak self] in
+            do {
+                try await ContinuousClock().sleep(for: Self.standardOutputExitGrace)
+            } catch {
+                return
+            }
+            await self?.standardOutputExitGraceElapsed()
+        }
+    }
+
+    private func standardOutputExitGraceElapsed() async {
+        stdoutEOFTask = nil
+        guard stdoutEnded,
+              processExitStatus == nil,
+              terminalFailure == nil,
+              isRunning,
+              !cleanupStarted,
+              !terminationRequested,
+              process.isRunning else {
+            return
+        }
+        await initiateFailure(.standardOutputClosed)
     }
 
     private func initiateFailure(_ error: WorkerProcessError) async {
         guard terminalFailure == nil, !cleanupStarted else { return }
         terminalFailure = error
         acceptsWrites = false
+        stdoutEOFTask?.cancel()
+        stdoutEOFTask = nil
         if !launcherReady {
             launcherWaiter?.resume(throwing: error)
             launcherWaiter = nil
@@ -576,6 +669,8 @@ actor WorkerProcess {
         heartbeatTask?.cancel()
         launcherTimeoutTask?.cancel()
         escalationTask?.cancel()
+        stdoutEOFTask?.cancel()
+        stdoutEOFTask = nil
         await writer.close()
         standardOutput.fileHandleForReading.closeFile()
         standardError.fileHandleForReading.closeFile()
@@ -654,6 +749,8 @@ actor WorkerProcess {
         heartbeatTask?.cancel()
         launcherTimeoutTask?.cancel()
         escalationTask?.cancel()
+        stdoutEOFTask?.cancel()
+        stdoutEOFTask = nil
         _ = await stdoutTask?.value
         _ = await stderrTask?.value
         _ = await heartbeatTask?.value
@@ -670,6 +767,7 @@ actor WorkerProcess {
         heartbeatTask?.cancel()
         launcherTimeoutTask?.cancel()
         escalationTask?.cancel()
+        stdoutEOFTask?.cancel()
         cleanupTask?.cancel()
         if !didEmitTerminal {
             if let processGroupID = verifiedProcessGroupID {

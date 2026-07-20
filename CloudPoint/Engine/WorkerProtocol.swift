@@ -1,3 +1,4 @@
+import CoreFoundation
 import Foundation
 
 enum WorkerProtocolError: Error, Sendable, Equatable {
@@ -9,6 +10,11 @@ enum WorkerProtocolError: Error, Sendable, Equatable {
     case unknownMessageType(String)
     case duplicateCommandID(UUID)
     case invalidPayload(String)
+}
+
+enum WorkerFrameDecodeOutcome: Sendable, Equatable {
+    case envelope(WorkerEnvelope)
+    case failure(WorkerProtocolError, jsonPayload: Data?)
 }
 
 private extension CodingUserInfoKey {
@@ -134,16 +140,9 @@ enum WorkerModelProgressPhase: String, Codable, Sendable, Equatable {
 }
 
 enum WorkerCommand: Sendable, Equatable {
-    case hello(clientVersion: String, supportedProtocolVersions: [Int])
-    case configure(
-        scaleFrames: Int,
-        windowSize: Int,
-        windowOverlap: Int,
-        keyframeInterval: Int,
-        cameraRefinementIterations: Int,
-        confidenceThreshold: Double
-    )
-    case beginSession(resumeAfterFrameIndex: UInt32?)
+    case hello(clientVersion: String, supportedProtocolVersions: [UInt32])
+    case configure(EngineConfiguration)
+    case beginSession(resumeCheckpoint: ResumeCheckpoint?)
     case enqueueFrame(frameIndex: UInt32, sourceTimestamp: Double, relativePath: String)
     case finishInput
     case pause
@@ -156,32 +155,139 @@ enum WorkerEvent: Sendable, Equatable {
     case ack(commandId: UUID, command: String)
     case error(commandId: UUID?, WorkerErrorPayload)
     case ready(engineVersion: String, modelIdentifier: String, modelRevision: String, convertedWeightsSHA256: String)
-    case modelProgress(phase: WorkerModelProgressPhase, completed: Int, total: Int)
-    case frameStarted(frameIndex: UInt32, windowIndex: Int)
-    case frameCompleted(
-        frameIndex: UInt32,
-        windowIndex: Int,
-        depthPath: String,
-        confidencePath: String,
-        geometryPath: String,
-        pointChunkPath: String,
-        durationSeconds: Double
-    )
-    case windowCompleted(
-        windowIndex: Int,
-        frameStart: UInt32,
-        frameEnd: UInt32,
-        pointChunkPath: String,
-        alignmentTransform: [Double],
-        lastProcessedFrameIndex: UInt32,
-        inlierCount: Int,
-        durationSeconds: Double
-    )
-    case sessionCompleted(processedFrames: Int, windowCount: Int, durationSeconds: Double)
-    case paused(queuedFrames: Int, processedFrames: Int)
-    case cancelled(lastCompletedWindowIndex: Int?)
+    case modelProgress(phase: WorkerModelProgressPhase, completed: UInt64, total: UInt64)
+    case frameStarted(frameIndex: UInt32, windowIndex: UInt32)
+    case frameCompleted(FrameArtifacts)
+    case windowCompleted(WindowResult)
+    case sessionCompleted(processedFrames: UInt64, windowCount: UInt32, durationSeconds: Double)
+    case paused(queuedFrames: UInt64, processedFrames: UInt64)
+    case cancelled(lastCompletedWindowIndex: UInt32?)
     case warning(WorkerErrorPayload)
-    case heartbeat(busy: Bool, monotonicSeconds: Double, queuedFrames: Int, processedFrames: Int, currentWindow: Int?)
+    case heartbeat(
+        busy: Bool,
+        monotonicSeconds: Double,
+        queuedFrames: UInt64,
+        processedFrames: UInt64,
+        currentWindow: UInt32?
+    )
+}
+
+extension WorkerEvent {
+    func engineEvent() throws -> EngineEvent? {
+        switch self {
+        case .ack: return nil
+        case let .error(commandID, payload):
+            if commandID != nil { return nil }
+            throw ReconstructionEngineError.workerFailure(
+                code: payload.code,
+                message: payload.message,
+                recoverable: payload.recoverable,
+                details: payload.details
+            )
+        case let .ready(engine, model, revision, sha):
+            return .ready(
+                engineVersion: engine,
+                modelIdentifier: model,
+                modelRevision: revision,
+                convertedWeightsSHA256: sha
+            )
+        case let .modelProgress(phase, completed, total):
+            return .modelProgress(phase: phase, completed: completed, total: total)
+        case let .frameStarted(frame, window):
+            return .frameStarted(frameIndex: frame, windowIndex: window)
+        case let .frameCompleted(artifacts): return .frameCompleted(artifacts)
+        case let .windowCompleted(result): return .windowCompleted(result)
+        case let .sessionCompleted(frames, windows, duration):
+            return .sessionCompleted(processedFrames: frames, windowCount: windows, durationSeconds: duration)
+        case let .paused(queued, processed):
+            return .paused(queuedFrames: queued, processedFrames: processed)
+        case let .cancelled(last): return .cancelled(lastCompletedWindowIndex: last)
+        case let .warning(payload):
+            return .warning(
+                code: payload.code,
+                message: payload.message,
+                recoverable: payload.recoverable,
+                details: payload.details
+            )
+        case let .heartbeat(busy, seconds, queued, processed, current):
+            return .heartbeat(
+                busy: busy,
+                monotonicSeconds: seconds,
+                queuedFrames: queued,
+                processedFrames: processed,
+                currentWindow: current
+            )
+        }
+    }
+}
+
+struct WorkerCommandHeader: Sendable, Equatable {
+    var id: UUID
+    var projectID: UUID
+    var protocolVersion: Int
+    var type: String
+
+    static func recover(fromJSONPayload payload: Data) -> WorkerCommandHeader? {
+        guard let object = try? JSONSerialization.jsonObject(with: payload),
+              let dictionary = object as? [String: Any],
+              let idText = dictionary["id"] as? String,
+              let projectIDText = dictionary["projectId"] as? String,
+              let versionNumber = dictionary["protocolVersion"] as? NSNumber,
+              CFGetTypeID(versionNumber) != CFBooleanGetTypeID(),
+              !["f", "d"].contains(String(cString: versionNumber.objCType)),
+              let protocolVersion = Int(exactly: versionNumber.int64Value),
+              let type = dictionary["type"] as? String,
+              !type.isEmpty,
+              idText == idText.lowercased(),
+              projectIDText == projectIDText.lowercased(),
+              let id = UUID(uuidString: idText),
+              let projectID = UUID(uuidString: projectIDText),
+              id.uuidString.lowercased() == idText,
+              projectID.uuidString.lowercased() == projectIDText else {
+            return nil
+        }
+        return WorkerCommandHeader(
+            id: id,
+            projectID: projectID,
+            protocolVersion: protocolVersion,
+            type: type
+        )
+    }
+}
+
+enum WorkerProtocolFailureDisposition: Sendable, Equatable {
+    case closeWithoutResponse
+    case asynchronousProtocolFaultThenClose
+    case commandErrorThenContinue(WorkerCommandHeader)
+    case commandErrorThenClose(WorkerCommandHeader)
+
+    static func classify(
+        _ error: WorkerProtocolError,
+        recoverableHeader: WorkerCommandHeader?
+    ) -> WorkerProtocolFailureDisposition {
+        switch error {
+        case .zeroLengthPayload, .payloadTooLarge, .truncatedFrame:
+            return .closeWithoutResponse
+        case .unsupportedProtocolVersion:
+            if let recoverableHeader { return .commandErrorThenClose(recoverableHeader) }
+            return .asynchronousProtocolFaultThenClose
+        case .unknownMessageType, .duplicateCommandID, .invalidPayload:
+            if let recoverableHeader { return .commandErrorThenContinue(recoverableHeader) }
+            return .asynchronousProtocolFaultThenClose
+        case .malformedEnvelope:
+            return .asynchronousProtocolFaultThenClose
+        }
+    }
+
+    static func classify(
+        _ error: WorkerProtocolError,
+        JSONPayload payload: Data?
+    ) -> WorkerProtocolFailureDisposition {
+        classify(
+            error,
+            recoverableHeader: payload.flatMap(WorkerCommandHeader.recover(fromJSONPayload:))
+        )
+    }
 }
 
 struct WorkerEnvelope: Codable, Sendable, Equatable {
@@ -242,44 +348,158 @@ struct WorkerEnvelope: Codable, Sendable, Equatable {
     }
 
     private struct EmptyPayload: Codable, Equatable {}
-    private struct HelloPayload: Codable { let clientVersion: String; let supportedProtocolVersions: [Int] }
+    private struct HelloPayload: Codable { let clientVersion: String; let supportedProtocolVersions: [UInt32] }
     private struct ConfigurePayload: Codable {
-        let scaleFrames: Int; let windowSize: Int; let windowOverlap: Int; let keyframeInterval: Int
-        let cameraRefinementIterations: Int; let confidenceThreshold: Double
+        let scaleFrames: UInt32
+        let windowSize: UInt32
+        let windowOverlap: UInt32
+        let keyframeInterval: UInt32
+        let cameraRefinementIterations: UInt32
+        let confidenceThreshold: Double
+        let voxelSize: Double
+
+        init(_ configuration: EngineConfiguration) {
+            scaleFrames = configuration.scaleFrames
+            windowSize = configuration.windowSize
+            windowOverlap = configuration.windowOverlap
+            keyframeInterval = configuration.keyframeInterval
+            cameraRefinementIterations = configuration.cameraRefinementIterations
+            confidenceThreshold = configuration.confidenceThreshold
+            voxelSize = configuration.voxelSize
+        }
+
+        var configuration: EngineConfiguration {
+            EngineConfiguration(
+                scaleFrames: scaleFrames,
+                windowSize: windowSize,
+                windowOverlap: windowOverlap,
+                keyframeInterval: keyframeInterval,
+                cameraRefinementIterations: cameraRefinementIterations,
+                confidenceThreshold: confidenceThreshold,
+                voxelSize: voxelSize
+            )
+        }
+    }
+    private struct ResumeCheckpointPayload: Codable {
+        let lastCommittedFrameIndex: UInt32
+        let replayFromFrameIndex: UInt32
+        let nextWindowIndex: UInt32
+
+        init(_ checkpoint: ResumeCheckpoint) {
+            lastCommittedFrameIndex = checkpoint.lastCommittedFrameIndex
+            replayFromFrameIndex = checkpoint.replayFromFrameIndex
+            nextWindowIndex = checkpoint.nextWindowIndex
+        }
+
+        var checkpoint: ResumeCheckpoint {
+            ResumeCheckpoint(
+                lastCommittedFrameIndex: lastCommittedFrameIndex,
+                replayFromFrameIndex: replayFromFrameIndex,
+                nextWindowIndex: nextWindowIndex
+            )
+        }
     }
     private struct BeginSessionPayload: Codable {
-        let resumeAfterFrameIndex: UInt32?
-        private enum CodingKeys: String, CodingKey { case resumeAfterFrameIndex }
-        init(resumeAfterFrameIndex: UInt32?) { self.resumeAfterFrameIndex = resumeAfterFrameIndex }
+        let resumeCheckpoint: ResumeCheckpointPayload?
+        private enum CodingKeys: String, CodingKey { case resumeCheckpoint }
+        init(resumeCheckpoint: ResumeCheckpoint?) {
+            self.resumeCheckpoint = resumeCheckpoint.map(ResumeCheckpointPayload.init)
+        }
         init(from decoder: Decoder) throws {
-            resumeAfterFrameIndex = try decoder.container(keyedBy: CodingKeys.self).decode(UInt32?.self, forKey: .resumeAfterFrameIndex)
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            resumeCheckpoint = try container.decode(ResumeCheckpointPayload?.self, forKey: .resumeCheckpoint)
+            if resumeCheckpoint != nil {
+                let nested = try container.superDecoder(forKey: .resumeCheckpoint)
+                try WorkerEnvelope.requireExactKeys(
+                    ["lastCommittedFrameIndex", "replayFromFrameIndex", "nextWindowIndex"],
+                    in: nested,
+                    context: "resumeCheckpoint"
+                )
+            }
         }
         func encode(to encoder: Encoder) throws {
             var container = encoder.container(keyedBy: CodingKeys.self)
-            try container.encode(resumeAfterFrameIndex, forKey: .resumeAfterFrameIndex)
+            try container.encode(resumeCheckpoint, forKey: .resumeCheckpoint)
         }
     }
     private struct EnqueueFramePayload: Codable { let frameIndex: UInt32; let sourceTimestamp: Double; let relativePath: String }
     private struct AckPayload: Codable { let command: String }
     private struct ReadyPayload: Codable { let engineVersion: String; let modelIdentifier: String; let modelRevision: String; let convertedWeightsSHA256: String }
-    private struct ModelProgressPayload: Codable { let phase: WorkerModelProgressPhase; let completed: Int; let total: Int }
-    private struct FrameStartedPayload: Codable { let frameIndex: UInt32; let windowIndex: Int }
+    private struct ModelProgressPayload: Codable { let phase: WorkerModelProgressPhase; let completed: UInt64; let total: UInt64 }
+    private struct FrameStartedPayload: Codable { let frameIndex: UInt32; let windowIndex: UInt32 }
     private struct FrameCompletedPayload: Codable {
-        let frameIndex: UInt32; let windowIndex: Int; let depthPath: String; let confidencePath: String
-        let geometryPath: String; let pointChunkPath: String; let durationSeconds: Double
+        let frameIndex: UInt32
+        let windowIndex: UInt32
+        let depthPath: String
+        let confidencePath: String
+        let geometryPath: String
+        let durationSeconds: Double
+
+        init(_ artifacts: FrameArtifacts) {
+            frameIndex = artifacts.frameIndex
+            windowIndex = artifacts.windowIndex
+            depthPath = artifacts.depthRelativePath
+            confidencePath = artifacts.confidenceRelativePath
+            geometryPath = artifacts.geometryRelativePath
+            durationSeconds = artifacts.durationSeconds
+        }
+
+        var artifacts: FrameArtifacts {
+            FrameArtifacts(
+                frameIndex: frameIndex,
+                windowIndex: windowIndex,
+                depthRelativePath: depthPath,
+                confidenceRelativePath: confidencePath,
+                geometryRelativePath: geometryPath,
+                durationSeconds: durationSeconds
+            )
+        }
     }
     private struct WindowCompletedPayload: Codable {
-        let windowIndex: Int; let frameStart: UInt32; let frameEnd: UInt32; let pointChunkPath: String
-        let alignmentTransform: [Double]; let lastProcessedFrameIndex: UInt32; let inlierCount: Int; let durationSeconds: Double
+        let windowIndex: UInt32
+        let inferenceFrameStart: UInt32
+        let frameStart: UInt32
+        let frameEnd: UInt32
+        let pointChunkPath: String
+        let alignmentTransform: [Double]
+        let lastProcessedFrameIndex: UInt32
+        let inlierCount: UInt64
+        let durationSeconds: Double
+
+        init(_ result: WindowResult) {
+            windowIndex = result.windowIndex
+            inferenceFrameStart = result.inferenceFrameStart
+            frameStart = result.frameStart
+            frameEnd = result.frameEnd
+            pointChunkPath = result.pointChunkRelativePath
+            alignmentTransform = result.alignmentRowMajor
+            lastProcessedFrameIndex = result.lastProcessedFrameIndex
+            inlierCount = result.inlierCount
+            durationSeconds = result.durationSeconds
+        }
+
+        var result: WindowResult {
+            WindowResult(
+                windowIndex: windowIndex,
+                inferenceFrameStart: inferenceFrameStart,
+                frameStart: frameStart,
+                frameEnd: frameEnd,
+                pointChunkRelativePath: pointChunkPath,
+                alignmentRowMajor: alignmentTransform,
+                lastProcessedFrameIndex: lastProcessedFrameIndex,
+                inlierCount: inlierCount,
+                durationSeconds: durationSeconds
+            )
+        }
     }
-    private struct SessionCompletedPayload: Codable { let processedFrames: Int; let windowCount: Int; let durationSeconds: Double }
-    private struct PausedPayload: Codable { let queuedFrames: Int; let processedFrames: Int }
+    private struct SessionCompletedPayload: Codable { let processedFrames: UInt64; let windowCount: UInt32; let durationSeconds: Double }
+    private struct PausedPayload: Codable { let queuedFrames: UInt64; let processedFrames: UInt64 }
     private struct CancelledPayload: Codable {
-        let lastCompletedWindowIndex: Int?
+        let lastCompletedWindowIndex: UInt32?
         private enum CodingKeys: String, CodingKey { case lastCompletedWindowIndex }
-        init(lastCompletedWindowIndex: Int?) { self.lastCompletedWindowIndex = lastCompletedWindowIndex }
+        init(lastCompletedWindowIndex: UInt32?) { self.lastCompletedWindowIndex = lastCompletedWindowIndex }
         init(from decoder: Decoder) throws {
-            lastCompletedWindowIndex = try decoder.container(keyedBy: CodingKeys.self).decode(Int?.self, forKey: .lastCompletedWindowIndex)
+            lastCompletedWindowIndex = try decoder.container(keyedBy: CodingKeys.self).decode(UInt32?.self, forKey: .lastCompletedWindowIndex)
         }
         func encode(to encoder: Encoder) throws {
             var container = encoder.container(keyedBy: CodingKeys.self)
@@ -287,9 +507,13 @@ struct WorkerEnvelope: Codable, Sendable, Equatable {
         }
     }
     private struct HeartbeatPayload: Codable {
-        let busy: Bool; let monotonicSeconds: Double; let queuedFrames: Int; let processedFrames: Int; let currentWindow: Int?
+        let busy: Bool
+        let monotonicSeconds: Double
+        let queuedFrames: UInt64
+        let processedFrames: UInt64
+        let currentWindow: UInt32?
         private enum CodingKeys: String, CodingKey { case busy, monotonicSeconds, queuedFrames, processedFrames, currentWindow }
-        init(busy: Bool, monotonicSeconds: Double, queuedFrames: Int, processedFrames: Int, currentWindow: Int?) {
+        init(busy: Bool, monotonicSeconds: Double, queuedFrames: UInt64, processedFrames: UInt64, currentWindow: UInt32?) {
             self.busy = busy; self.monotonicSeconds = monotonicSeconds; self.queuedFrames = queuedFrames
             self.processedFrames = processedFrames; self.currentWindow = currentWindow
         }
@@ -297,9 +521,9 @@ struct WorkerEnvelope: Codable, Sendable, Equatable {
             let container = try decoder.container(keyedBy: CodingKeys.self)
             busy = try container.decode(Bool.self, forKey: .busy)
             monotonicSeconds = try container.decode(Double.self, forKey: .monotonicSeconds)
-            queuedFrames = try container.decode(Int.self, forKey: .queuedFrames)
-            processedFrames = try container.decode(Int.self, forKey: .processedFrames)
-            currentWindow = try container.decode(Int?.self, forKey: .currentWindow)
+            queuedFrames = try container.decode(UInt64.self, forKey: .queuedFrames)
+            processedFrames = try container.decode(UInt64.self, forKey: .processedFrames)
+            currentWindow = try container.decode(UInt32?.self, forKey: .currentWindow)
         }
         func encode(to encoder: Encoder) throws {
             var container = encoder.container(keyedBy: CodingKeys.self)
@@ -316,8 +540,18 @@ struct WorkerEnvelope: Codable, Sendable, Equatable {
         let version = try container.decode(Int.self, forKey: .protocolVersion)
         guard version == Self.currentProtocolVersion else { throw WorkerProtocolError.unsupportedProtocolVersion(version) }
         protocolVersion = version
-        id = try container.decode(UUID.self, forKey: .id)
-        projectId = try container.decode(UUID.self, forKey: .projectId)
+        let idText = try container.decode(String.self, forKey: .id)
+        let projectIDText = try container.decode(String.self, forKey: .projectId)
+        guard idText == idText.lowercased(),
+              projectIDText == projectIDText.lowercased(),
+              let decodedID = UUID(uuidString: idText),
+              let decodedProjectID = UUID(uuidString: projectIDText),
+              decodedID.uuidString.lowercased() == idText,
+              decodedProjectID.uuidString.lowercased() == projectIDText else {
+            throw WorkerProtocolError.malformedEnvelope
+        }
+        id = decodedID
+        projectId = decodedProjectID
         let type = try container.decode(String.self, forKey: .type)
         let topLevelKeys = ["protocolVersion", "id", "projectId", "type", "payload"] + (["ack", "error"].contains(type) ? ["commandId"] : [])
         try Self.requireExactKeys(topLevelKeys, in: decoder, context: "envelope")
@@ -327,11 +561,11 @@ struct WorkerEnvelope: Codable, Sendable, Equatable {
             let payload = try Self.decodePayload(HelloPayload.self, keys: ["clientVersion", "supportedProtocolVersions"], from: container)
             message = .command(.hello(clientVersion: payload.clientVersion, supportedProtocolVersions: payload.supportedProtocolVersions))
         case "configure":
-            let p = try Self.decodePayload(ConfigurePayload.self, keys: ["scaleFrames", "windowSize", "windowOverlap", "keyframeInterval", "cameraRefinementIterations", "confidenceThreshold"], from: container)
-            message = .command(.configure(scaleFrames: p.scaleFrames, windowSize: p.windowSize, windowOverlap: p.windowOverlap, keyframeInterval: p.keyframeInterval, cameraRefinementIterations: p.cameraRefinementIterations, confidenceThreshold: p.confidenceThreshold))
+            let p = try Self.decodePayload(ConfigurePayload.self, keys: ["scaleFrames", "windowSize", "windowOverlap", "keyframeInterval", "cameraRefinementIterations", "confidenceThreshold", "voxelSize"], from: container)
+            message = .command(.configure(p.configuration))
         case "beginSession":
-            let p = try Self.decodePayload(BeginSessionPayload.self, keys: ["resumeAfterFrameIndex"], from: container)
-            message = .command(.beginSession(resumeAfterFrameIndex: p.resumeAfterFrameIndex))
+            let p = try Self.decodePayload(BeginSessionPayload.self, keys: ["resumeCheckpoint"], from: container)
+            message = .command(.beginSession(resumeCheckpoint: p.resumeCheckpoint?.checkpoint))
         case "enqueueFrame":
             let p = try Self.decodePayload(EnqueueFramePayload.self, keys: ["frameIndex", "sourceTimestamp", "relativePath"], from: container)
             message = .command(.enqueueFrame(frameIndex: p.frameIndex, sourceTimestamp: p.sourceTimestamp, relativePath: p.relativePath))
@@ -342,10 +576,25 @@ struct WorkerEnvelope: Codable, Sendable, Equatable {
         case "shutdown": message = try Self.decodeEmpty(.shutdown, from: container)
         case "ack":
             let p = try Self.decodePayload(AckPayload.self, keys: ["command"], from: container)
-            message = .event(.ack(commandId: try container.decode(UUID.self, forKey: .commandId), command: p.command))
+            let commandIDText = try container.decode(String.self, forKey: .commandId)
+            guard commandIDText == commandIDText.lowercased(),
+                  let commandID = UUID(uuidString: commandIDText),
+                  commandID.uuidString.lowercased() == commandIDText else {
+                throw WorkerProtocolError.malformedEnvelope
+            }
+            message = .event(.ack(commandId: commandID, command: p.command))
         case "error":
             let p = try Self.decodePayload(WorkerErrorPayload.self, keys: ["code", "message", "recoverable", "details"], from: container)
-            message = .event(.error(commandId: try container.decode(UUID?.self, forKey: .commandId), p))
+            let optionalCommandIDText = try container.decode(String?.self, forKey: .commandId)
+            let commandID = try optionalCommandIDText.map {
+                guard $0 == $0.lowercased(),
+                      let id = UUID(uuidString: $0),
+                      id.uuidString.lowercased() == $0 else {
+                    throw WorkerProtocolError.malformedEnvelope
+                }
+                return id
+            }
+            message = .event(.error(commandId: commandID, p))
         case "ready":
             let p = try Self.decodePayload(ReadyPayload.self, keys: ["engineVersion", "modelIdentifier", "modelRevision", "convertedWeightsSHA256"], from: container)
             message = .event(.ready(engineVersion: p.engineVersion, modelIdentifier: p.modelIdentifier, modelRevision: p.modelRevision, convertedWeightsSHA256: p.convertedWeightsSHA256))
@@ -356,11 +605,11 @@ struct WorkerEnvelope: Codable, Sendable, Equatable {
             let p = try Self.decodePayload(FrameStartedPayload.self, keys: ["frameIndex", "windowIndex"], from: container)
             message = .event(.frameStarted(frameIndex: p.frameIndex, windowIndex: p.windowIndex))
         case "frameCompleted":
-            let p = try Self.decodePayload(FrameCompletedPayload.self, keys: ["frameIndex", "windowIndex", "depthPath", "confidencePath", "geometryPath", "pointChunkPath", "durationSeconds"], from: container)
-            message = .event(.frameCompleted(frameIndex: p.frameIndex, windowIndex: p.windowIndex, depthPath: p.depthPath, confidencePath: p.confidencePath, geometryPath: p.geometryPath, pointChunkPath: p.pointChunkPath, durationSeconds: p.durationSeconds))
+            let p = try Self.decodePayload(FrameCompletedPayload.self, keys: ["frameIndex", "windowIndex", "depthPath", "confidencePath", "geometryPath", "durationSeconds"], from: container)
+            message = .event(.frameCompleted(p.artifacts))
         case "windowCompleted":
-            let p = try Self.decodePayload(WindowCompletedPayload.self, keys: ["windowIndex", "frameStart", "frameEnd", "pointChunkPath", "alignmentTransform", "lastProcessedFrameIndex", "inlierCount", "durationSeconds"], from: container)
-            message = .event(.windowCompleted(windowIndex: p.windowIndex, frameStart: p.frameStart, frameEnd: p.frameEnd, pointChunkPath: p.pointChunkPath, alignmentTransform: p.alignmentTransform, lastProcessedFrameIndex: p.lastProcessedFrameIndex, inlierCount: p.inlierCount, durationSeconds: p.durationSeconds))
+            let p = try Self.decodePayload(WindowCompletedPayload.self, keys: ["windowIndex", "inferenceFrameStart", "frameStart", "frameEnd", "pointChunkPath", "alignmentTransform", "lastProcessedFrameIndex", "inlierCount", "durationSeconds"], from: container)
+            message = .event(.windowCompleted(p.result))
         case "sessionCompleted":
             let p = try Self.decodePayload(SessionCompletedPayload.self, keys: ["processedFrames", "windowCount", "durationSeconds"], from: container)
             message = .event(.sessionCompleted(processedFrames: p.processedFrames, windowCount: p.windowCount, durationSeconds: p.durationSeconds))
@@ -384,8 +633,8 @@ struct WorkerEnvelope: Codable, Sendable, Equatable {
         try validate()
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(protocolVersion, forKey: .protocolVersion)
-        try container.encode(id, forKey: .id)
-        try container.encode(projectId, forKey: .projectId)
+        try container.encode(id.uuidString.lowercased(), forKey: .id)
+        try container.encode(projectId.uuidString.lowercased(), forKey: .projectId)
 
         switch message {
         case let .command(command): try encode(command, into: &container)
@@ -420,10 +669,10 @@ struct WorkerEnvelope: Codable, Sendable, Equatable {
         switch command {
         case let .hello(clientVersion, versions):
             try c.encode("hello", forKey: .type); try c.encode(HelloPayload(clientVersion: clientVersion, supportedProtocolVersions: versions), forKey: .payload)
-        case let .configure(scaleFrames, windowSize, overlap, keyframe, iterations, confidence):
-            try c.encode("configure", forKey: .type); try c.encode(ConfigurePayload(scaleFrames: scaleFrames, windowSize: windowSize, windowOverlap: overlap, keyframeInterval: keyframe, cameraRefinementIterations: iterations, confidenceThreshold: confidence), forKey: .payload)
-        case let .beginSession(index):
-            try c.encode("beginSession", forKey: .type); try c.encode(BeginSessionPayload(resumeAfterFrameIndex: index), forKey: .payload)
+        case let .configure(configuration):
+            try c.encode("configure", forKey: .type); try c.encode(ConfigurePayload(configuration), forKey: .payload)
+        case let .beginSession(checkpoint):
+            try c.encode("beginSession", forKey: .type); try c.encode(BeginSessionPayload(resumeCheckpoint: checkpoint), forKey: .payload)
         case let .enqueueFrame(index, timestamp, path):
             try c.encode("enqueueFrame", forKey: .type); try c.encode(EnqueueFramePayload(frameIndex: index, sourceTimestamp: timestamp, relativePath: path), forKey: .payload)
         case .finishInput: try encodeEmpty("finishInput", into: &c)
@@ -437,19 +686,19 @@ struct WorkerEnvelope: Codable, Sendable, Equatable {
     private func encode(_ event: WorkerEvent, into c: inout KeyedEncodingContainer<CodingKeys>) throws {
         switch event {
         case let .ack(commandId, command):
-            try c.encode("ack", forKey: .type); try c.encode(commandId, forKey: .commandId); try c.encode(AckPayload(command: command), forKey: .payload)
+            try c.encode("ack", forKey: .type); try c.encode(commandId.uuidString.lowercased(), forKey: .commandId); try c.encode(AckPayload(command: command), forKey: .payload)
         case let .error(commandId, payload):
-            try c.encode("error", forKey: .type); try c.encode(commandId, forKey: .commandId); try c.encode(payload, forKey: .payload)
+            try c.encode("error", forKey: .type); try c.encode(commandId?.uuidString.lowercased(), forKey: .commandId); try c.encode(payload, forKey: .payload)
         case let .ready(engine, model, revision, sha):
             try c.encode("ready", forKey: .type); try c.encode(ReadyPayload(engineVersion: engine, modelIdentifier: model, modelRevision: revision, convertedWeightsSHA256: sha), forKey: .payload)
         case let .modelProgress(phase, completed, total):
             try c.encode("modelProgress", forKey: .type); try c.encode(ModelProgressPayload(phase: phase, completed: completed, total: total), forKey: .payload)
         case let .frameStarted(frame, window):
             try c.encode("frameStarted", forKey: .type); try c.encode(FrameStartedPayload(frameIndex: frame, windowIndex: window), forKey: .payload)
-        case let .frameCompleted(frame, window, depth, confidence, geometry, points, duration):
-            try c.encode("frameCompleted", forKey: .type); try c.encode(FrameCompletedPayload(frameIndex: frame, windowIndex: window, depthPath: depth, confidencePath: confidence, geometryPath: geometry, pointChunkPath: points, durationSeconds: duration), forKey: .payload)
-        case let .windowCompleted(window, start, end, path, transform, last, inliers, duration):
-            try c.encode("windowCompleted", forKey: .type); try c.encode(WindowCompletedPayload(windowIndex: window, frameStart: start, frameEnd: end, pointChunkPath: path, alignmentTransform: transform, lastProcessedFrameIndex: last, inlierCount: inliers, durationSeconds: duration), forKey: .payload)
+        case let .frameCompleted(artifacts):
+            try c.encode("frameCompleted", forKey: .type); try c.encode(FrameCompletedPayload(artifacts), forKey: .payload)
+        case let .windowCompleted(result):
+            try c.encode("windowCompleted", forKey: .type); try c.encode(WindowCompletedPayload(result), forKey: .payload)
         case let .sessionCompleted(frames, windows, duration):
             try c.encode("sessionCompleted", forKey: .type); try c.encode(SessionCompletedPayload(processedFrames: frames, windowCount: windows, durationSeconds: duration), forKey: .payload)
         case let .paused(queued, processed):
@@ -478,10 +727,17 @@ struct WorkerEnvelope: Codable, Sendable, Equatable {
     private static func validate(_ command: WorkerCommand) throws {
         switch command {
         case let .hello(clientVersion, versions):
-            guard !clientVersion.isEmpty, versions.contains(currentProtocolVersion) else { throw WorkerProtocolError.invalidPayload("hello") }
-        case let .configure(scale, window, overlap, keyframe, iterations, confidence):
-            guard scale > 0, window > 0, overlap >= 0, overlap < window, keyframe > 0, iterations > 0, confidence.isFinite, confidence > 0 else { throw WorkerProtocolError.invalidPayload("configure") }
-        case .beginSession: break
+            guard !clientVersion.isEmpty,
+                  versions.contains(UInt32(currentProtocolVersion)) else {
+                throw WorkerProtocolError.invalidPayload("hello")
+            }
+        case let .configure(configuration):
+            do { try configuration.validate() }
+            catch { throw WorkerProtocolError.invalidPayload("configure") }
+        case let .beginSession(checkpoint):
+            guard checkpoint == nil || checkpoint!.replayFromFrameIndex <= checkpoint!.lastCommittedFrameIndex else {
+                throw WorkerProtocolError.invalidPayload("beginSession")
+            }
         case let .enqueueFrame(_, timestamp, path):
             guard timestamp.isFinite, timestamp >= 0, isSafeRelativePath(path) else { throw WorkerProtocolError.invalidPayload("enqueueFrame") }
         case .finishInput, .pause, .resume, .cancel, .shutdown: break
@@ -495,19 +751,34 @@ struct WorkerEnvelope: Codable, Sendable, Equatable {
         case let .ready(engine, model, revision, sha):
             guard !engine.isEmpty, !model.isEmpty, !revision.isEmpty, !sha.isEmpty else { throw WorkerProtocolError.invalidPayload("ready") }
         case let .modelProgress(_, completed, total):
-            guard completed >= 0, total >= 0, completed <= total else { throw WorkerProtocolError.invalidPayload("modelProgress") }
-        case let .frameStarted(_, window): guard window >= 0 else { throw WorkerProtocolError.invalidPayload("frameStarted") }
-        case let .frameCompleted(_, window, depth, confidence, geometry, points, duration):
-            guard window >= 0, [depth, confidence, geometry, points].allSatisfy(isSafeRelativePath), validDuration(duration) else { throw WorkerProtocolError.invalidPayload("frameCompleted") }
-        case let .windowCompleted(window, start, end, path, transform, last, inliers, duration):
-            guard window >= 0, start <= end, last >= end, isSafeRelativePath(path), transform.count == 16, transform.allSatisfy(\.isFinite), inliers >= 0, validDuration(duration) else { throw WorkerProtocolError.invalidPayload("windowCompleted") }
-        case let .sessionCompleted(frames, windows, duration):
-            guard frames >= 0, windows >= 0, validDuration(duration) else { throw WorkerProtocolError.invalidPayload("sessionCompleted") }
+            guard completed <= total else { throw WorkerProtocolError.invalidPayload("modelProgress") }
+        case .frameStarted: break
+        case let .frameCompleted(artifacts):
+            guard artifacts.depthRelativePath == WorkerArtifactPath.depth(frameIndex: artifacts.frameIndex),
+                  artifacts.confidenceRelativePath == WorkerArtifactPath.confidence(frameIndex: artifacts.frameIndex),
+                  artifacts.geometryRelativePath == WorkerArtifactPath.geometry(frameIndex: artifacts.frameIndex),
+                  validDuration(artifacts.durationSeconds) else {
+                throw WorkerProtocolError.invalidPayload("frameCompleted")
+            }
+        case let .windowCompleted(result):
+            guard result.inferenceFrameStart <= result.frameStart,
+                  result.frameStart <= result.frameEnd,
+                  result.frameEnd <= result.lastProcessedFrameIndex,
+                  result.pointChunkRelativePath == WorkerArtifactPath.points(windowIndex: result.windowIndex),
+                  result.alignmentRowMajor.count == 16,
+                  result.alignmentRowMajor.allSatisfy(\.isFinite),
+                  validDuration(result.durationSeconds) else {
+                throw WorkerProtocolError.invalidPayload("windowCompleted")
+            }
+        case let .sessionCompleted(_, _, duration):
+            guard validDuration(duration) else { throw WorkerProtocolError.invalidPayload("sessionCompleted") }
         case let .paused(queued, processed):
-            guard queued >= 0, processed >= 0 else { throw WorkerProtocolError.invalidPayload("paused") }
-        case let .cancelled(last): guard last == nil || last! >= 0 else { throw WorkerProtocolError.invalidPayload("cancelled") }
-        case let .heartbeat(_, seconds, queued, processed, current):
-            guard validDuration(seconds), queued >= 0, processed >= 0, current == nil || current! >= 0 else { throw WorkerProtocolError.invalidPayload("heartbeat") }
+            guard processed <= queued else { throw WorkerProtocolError.invalidPayload("paused") }
+        case .cancelled: break
+        case let .heartbeat(_, seconds, queued, processed, _):
+            guard validDuration(seconds), processed <= queued else {
+                throw WorkerProtocolError.invalidPayload("heartbeat")
+            }
         }
     }
 
@@ -517,11 +788,7 @@ struct WorkerEnvelope: Codable, Sendable, Equatable {
 
     private static func validDuration(_ value: Double) -> Bool { value.isFinite && value >= 0 }
 
-    private static func isSafeRelativePath(_ path: String) -> Bool {
-        guard !path.isEmpty, !path.hasPrefix("/"), !path.hasPrefix("~"), !path.contains("\\"), !path.contains("\0") else { return false }
-        let components = path.split(separator: "/", omittingEmptySubsequences: false)
-        return components.allSatisfy { !$0.isEmpty && $0 != "." && $0 != ".." }
-    }
+    private static func isSafeRelativePath(_ path: String) -> Bool { ProjectRelativePath.isSafe(path) }
 }
 
 private struct ExactJSONNumberDecodingRewriter {
@@ -747,15 +1014,128 @@ enum LengthPrefixedJSONCodec {
             guard var json = String(data: encoded, encoding: .utf8) else {
                 throw WorkerProtocolError.malformedEnvelope
             }
+            json = canonicalizeTypedNumbers(in: json)
             let occurrenceCount = json.components(separatedBy: context.prefix).count - 1
             guard occurrenceCount == context.replacements.count else { continue }
-            for replacement in context.replacements {
-                let placeholder = "\"\(replacement.placeholder)\""
-                guard json.range(of: placeholder) != nil else { throw WorkerProtocolError.malformedEnvelope }
-                json = json.replacingOccurrences(of: placeholder, with: replacement.token)
-            }
-            return Data(json.utf8)
+            guard let substituted = substituteExactJSONNumbers(in: json, context: context) else { continue }
+            return substituted
         }
+    }
+
+    private static func substituteExactJSONNumbers(
+        in json: String,
+        context: ExactJSONNumberEncodingContext
+    ) -> Data? {
+        let source = Array(json.utf8)
+        let marker = [UInt8(0x22)] + Array(context.prefix.utf8)
+        var output: [UInt8] = []
+        output.reserveCapacity(source.count)
+        var replaced = Set<Int>()
+        var index = 0
+
+        while index < source.count {
+            guard index + marker.count <= source.count,
+                  source[index..<(index + marker.count)].elementsEqual(marker) else {
+                output.append(source[index])
+                index += 1
+                continue
+            }
+
+            var cursor = index + marker.count
+            var replacementIndex = 0
+            var sawDigit = false
+            while cursor < source.count, (0x30...0x39).contains(source[cursor]) {
+                sawDigit = true
+                let (scaled, multiplyOverflow) = replacementIndex.multipliedReportingOverflow(by: 10)
+                let (advanced, addOverflow) = scaled.addingReportingOverflow(Int(source[cursor] - 0x30))
+                guard !multiplyOverflow, !addOverflow else { return nil }
+                replacementIndex = advanced
+                cursor += 1
+            }
+            guard sawDigit,
+                  cursor < source.count,
+                  source[cursor] == 0x22,
+                  context.replacements.indices.contains(replacementIndex),
+                  replaced.insert(replacementIndex).inserted else {
+                return nil
+            }
+            output.append(contentsOf: context.replacements[replacementIndex].token.utf8)
+            index = cursor + 1
+        }
+
+        guard replaced.count == context.replacements.count else { return nil }
+        return Data(output)
+    }
+
+    private static func canonicalizeTypedNumbers(in json: String) -> String {
+        let bytes = Array(json.utf8)
+        var output: [UInt8] = []
+        output.reserveCapacity(bytes.count)
+        var index = 0
+        var inString = false
+        var escaped = false
+
+        while index < bytes.count {
+            let byte = bytes[index]
+            if inString {
+                output.append(byte)
+                if escaped {
+                    escaped = false
+                } else if byte == 0x5C {
+                    escaped = true
+                } else if byte == 0x22 {
+                    inString = false
+                }
+                index += 1
+                continue
+            }
+            if byte == 0x22 {
+                inString = true
+                output.append(byte)
+                index += 1
+                continue
+            }
+            if byte == 0x2D || (0x30...0x39).contains(byte) {
+                let start = index
+                index += 1
+                while index < bytes.count,
+                      (bytes[index] == 0x2B || bytes[index] == 0x2D || bytes[index] == 0x2E ||
+                       bytes[index] == 0x45 || bytes[index] == 0x65 || (0x30...0x39).contains(bytes[index])) {
+                    index += 1
+                }
+                let token = String(decoding: bytes[start..<index], as: UTF8.self)
+                output.append(contentsOf: canonicalNumberToken(token).utf8)
+                continue
+            }
+            output.append(byte)
+            index += 1
+        }
+        return String(decoding: output, as: UTF8.self)
+    }
+
+    private static func canonicalNumberToken(_ token: String) -> String {
+        let exponentSplit = token.firstIndex { $0 == "e" || $0 == "E" }
+        var mantissa = exponentSplit.map { String(token[..<$0]) } ?? token
+        let exponent = exponentSplit.map { String(token[token.index(after: $0)...]) }
+
+        let mantissaDigits = mantissa.filter(\.isNumber)
+        if !mantissaDigits.isEmpty, mantissaDigits.allSatisfy({ $0 == "0" }) {
+            return "0"
+        }
+        if let decimal = mantissa.firstIndex(of: ".") {
+            while mantissa.last == "0" { mantissa.removeLast() }
+            if mantissa.lastIndex(of: ".") == decimal, mantissa.last == "." { mantissa.removeLast() }
+        }
+        guard var exponent else { return mantissa }
+        var sign = ""
+        if exponent.first == "+" { exponent.removeFirst() }
+        else if exponent.first == "-" {
+            sign = "-"
+            exponent.removeFirst()
+        }
+        while exponent.count > 1, exponent.first == "0" { exponent.removeFirst() }
+        if exponent.allSatisfy({ $0 == "0" }) { return mantissa }
+        return "\(mantissa)e\(sign)\(exponent)"
     }
 
     struct Decoder: Sendable {
@@ -774,7 +1154,20 @@ enum LengthPrefixedJSONCodec {
 
         mutating func append<S: DataProtocol>(_ bytes: S) throws -> [WorkerEnvelope] {
             var envelopes: [WorkerEnvelope] = []
+            for outcome in appendOutcomes(bytes, continuingAfterRecoverableFailures: false) {
+                switch outcome {
+                case let .envelope(envelope): envelopes.append(envelope)
+                case let .failure(error, _): throw error
+                }
+            }
+            return envelopes
+        }
 
+        mutating func appendOutcomes<S: DataProtocol>(
+            _ bytes: S,
+            continuingAfterRecoverableFailures: Bool = true
+        ) -> [WorkerFrameDecodeOutcome] {
+            var outcomes: [WorkerFrameDecodeOutcome] = []
             for byte in bytes {
                 if expectedPayloadBytes == nil {
                     header.append(byte)
@@ -782,11 +1175,13 @@ enum LengthPrefixedJSONCodec {
                     let length = header.reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
                     if length == 0 {
                         resetFrame()
-                        throw WorkerProtocolError.zeroLengthPayload
+                        outcomes.append(.failure(.zeroLengthPayload, jsonPayload: nil))
+                        break
                     }
                     if length > maxPayloadBytes {
                         resetFrame()
-                        throw WorkerProtocolError.payloadTooLarge(Int(length))
+                        outcomes.append(.failure(.payloadTooLarge(Int(length)), jsonPayload: nil))
+                        break
                     }
                     expectedPayloadBytes = Int(length)
                     payload.reserveCapacity(Int(length))
@@ -795,11 +1190,25 @@ enum LengthPrefixedJSONCodec {
 
                 payload.append(byte)
                 guard payload.count == expectedPayloadBytes else { continue }
-                let envelope = try decodePayload()
-                envelopes.append(envelope)
+                let completedPayload = payload
                 resetFrame()
+                do {
+                    outcomes.append(.envelope(try decodePayload(completedPayload)))
+                } catch let error as WorkerProtocolError {
+                    outcomes.append(.failure(error, jsonPayload: completedPayload))
+                    switch WorkerProtocolFailureDisposition.classify(error, JSONPayload: completedPayload) {
+                    case .commandErrorThenContinue where continuingAfterRecoverableFailures:
+                        continue
+                    case .closeWithoutResponse, .asynchronousProtocolFaultThenClose,
+                         .commandErrorThenContinue, .commandErrorThenClose:
+                        return outcomes
+                    }
+                } catch {
+                    outcomes.append(.failure(.malformedEnvelope, jsonPayload: completedPayload))
+                    return outcomes
+                }
             }
-            return envelopes
+            return outcomes
         }
 
         func finish() throws {
@@ -808,7 +1217,7 @@ enum LengthPrefixedJSONCodec {
             }
         }
 
-        private mutating func decodePayload() throws -> WorkerEnvelope {
+        private mutating func decodePayload(_ payload: Data) throws -> WorkerEnvelope {
             let envelope: WorkerEnvelope
             do {
                 let rewritten = try Self.rewriteExactNumbers(in: payload, maximumPayloadBytes: maxPayloadBytes)
@@ -817,7 +1226,12 @@ enum LengthPrefixedJSONCodec {
                 envelope = try decoder.decode(WorkerEnvelope.self, from: rewritten.payload)
             }
             catch let error as WorkerProtocolError { throw error }
-            catch { throw WorkerProtocolError.malformedEnvelope }
+            catch {
+                if let header = WorkerCommandHeader.recover(fromJSONPayload: payload) {
+                    throw WorkerProtocolError.invalidPayload(header.type)
+                }
+                throw WorkerProtocolError.malformedEnvelope
+            }
 
             if envelope.command != nil {
                 guard recentCommandIDSet.insert(envelope.id).inserted else {
@@ -836,7 +1250,8 @@ enum LengthPrefixedJSONCodec {
             maximumPayloadBytes: Int
         ) throws -> (payload: Data, prefix: String) {
             while true {
-                let prefix = "__CLOUDPOINT_JSON_NUMBER_\(UUID().uuidString)__:"
+                let random = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+                let prefix = "~cpn\(random.prefix(8)):"
                 var rewriter = ExactJSONNumberDecodingRewriter(
                     payload: payload,
                     prefix: prefix,

@@ -70,6 +70,8 @@ targets:
     platform: macOS
     sources:
       - path: CloudPointMockWorker
+      - path: CloudPoint/Domain/ProjectModels.swift
+      - path: CloudPoint/Engine/ReconstructionEngine.swift
       - path: CloudPoint/Engine/WorkerProtocol.swift
     configFiles:
       Debug: Config/Base.xcconfig

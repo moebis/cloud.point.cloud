@@ -4,7 +4,7 @@
 
 **Goal:** Integrate the native CloudPoint foundation with the real Lingbot MLX worker and finish a locally testable CloudPoint 0.1 app that can set up its model, reconstruct imported and live captures, recover, export, and pass the release gate.
 
-**Architecture:** Keep Python and MLX behind the existing `ReconstructionEngine` boundary: the native app resolves one repository-managed Python 3.12 runtime, supervises `cloudpoint-worker`, and exchanges protocol-v1 file references over its private Unix socket. `SessionController` remains the single orchestration actor; it commits persisted frames and completed-window checkpoints atomically before publishing immutable UI updates, while model setup, exporting, and performance recording are focused services injected through `AppDependencies`.
+**Architecture:** Keep Python and MLX behind the existing `ReconstructionEngine` boundary: the native app resolves one repository-managed Python 3.12 runtime, supervises `cloudpoint-worker`, and exchanges protocol-v1 file references over framed stdin/stdout with diagnostics on stderr. `SessionController` remains the single orchestration actor; it accumulates frame artifacts and commits each completed-window transaction atomically before publishing immutable UI updates, while model setup, exporting, and performance recording are focused services injected through `AppDependencies`.
 
 **Tech Stack:** Swift 6, SwiftUI, AppKit, AVFoundation, Metal/MetalKit, URLSession, CryptoKit, XCTest/XCUITest, XcodeGen, Python 3.12.11, uv, MLX 0.32.0, safetensors 0.5.3, pytest.
 
@@ -17,12 +17,20 @@
 - Support only `robbyant/lingbot-map` revision `204754b72bb24f561f8d7e7e1e4e4cd9e809adf9`; `lingbot-map-long.pt` is exactly 4,632,303,465 bytes with SHA-256 `832bc82cbae0bc9bbe946ef5ee1f7226abd8c0e183ccf8beddbb3d133576f409`.
 - Pin the reference implementation to Git commit `7ff6f3ed0913d4d326f8f13bbb429c4ffc0195c2`; converted weights remain in Application Support and are not redistributed.
 - Model download is the worker's only prerequisite network activity and is performed by native URLSession; the worker binds no TCP port and makes no network requests.
-- IPC is four-byte big-endian length plus UTF-8 JSON, protocol version 1, maximum message size 1,048,576 bytes, one acknowledgement or structured error per command, and one heartbeat at least every five seconds while busy.
+- IPC is four-byte big-endian length plus canonical UTF-8 JSON over stdin/stdout,
+  protocol version 1, maximum message size 1,048,576 bytes, exact malformed-input
+  dispositions, one acknowledgement or structured error per decoded valid command,
+  and an immediate heartbeat after hello ACK followed by at least one every five
+  seconds during loading, inference, finalization, and idle.
 - Sampling is timestamp-based, 1 through 10 FPS with a default of 5 FPS; persist oriented JPEG at quality 0.92 before enqueueing it.
-- Use Float16 inference, eight anchor frames, 32-frame windows, eight-frame overlap, keyframe interval one, one camera-refinement pass, and confidence threshold 1.5 by default.
+- Use Float16 inference, eight anchor frames, 32-frame windows, eight-frame overlap,
+  keyframe interval one, four camera-refinement passes, confidence threshold 1.5, and
+  voxel size 0.01 by default.
 - Display no more than five million points; release acceptance requires at least 30 renderer FPS at two million points and peak combined app-plus-worker resident memory below 48 GB on the development M1 Ultra with 64 GB unified memory.
 - Store only sampled frames and derived data in `.cloudpoint`; never copy raw source recordings. Warn above a 10 GB estimated package or below 20 GB available volume capacity.
-- Commit recovery only at completed-window boundaries. Ignore and remove `.partial` outputs during recovery.
+- Commit recovery only at completed-window boundaries. Native derives exact replay
+  from committed artifact records; the worker alone performs exact-pattern output
+  orphan cleanup before begin ACK and never mutates the manifest.
 - A worker allocation failure gets exactly one clean restart of the current window with a 16-frame window and four-frame overlap; a second allocation failure stops without deleting captured frames.
 - Coordinates are “reconstruction units,” never meters. Version 0.1 exports binary little-endian PLY and JSON camera trajectory only.
 - App Store packaging, sandbox hardening, dense meshes, texture output, Gaussian splats, USDZ, and arbitrary user-selected model files remain out of scope.
@@ -45,9 +53,15 @@ public protocol ReconstructionEngine: Sendable {
 }
 
 public struct PersistedFrame: Codable, Sendable, Equatable {
-    public let index: Int
+    public let index: UInt32
     public let sourceTimestamp: Double
     public let relativePath: String
+}
+
+public struct ResumeCheckpoint: Codable, Sendable, Equatable {
+    public let lastCommittedFrameIndex: UInt32
+    public let replayFromFrameIndex: UInt32
+    public let nextWindowIndex: UInt32
 }
 
 public extension ProjectManifest {
@@ -56,11 +70,76 @@ public extension ProjectManifest {
 }
 ```
 
+Manifest format 2 is the only newly written schema; v1 is rejected through the
+actionable unsupported-version path. Persist and validate the complete configuration
+(defaults 8/32/8/1/4/1.5/0.01), UInt32 frame/window IDs and inclusive bounds,
+UInt64 counts/inliers, finite Double timestamps/durations/transforms, safe paths,
+exactly 16 alignment values, ordered matching frame artifacts, and strictly
+increasing source/window order while permitting source gaps. Each completed window
+owns its inference start, unique output bounds, CPC, alignment, last processed index,
+inliers, duration, and ordered committed frame artifacts.
+Validate window size `1...1024`, scale frames `1...windowSize`, zero-legal overlap
+less than window size, positive keyframe/refinement counts, and positive finite
+confidence/voxel values.
+
+Canonical outputs are `Predictions/%08u.depth-f16`,
+`Predictions/%08u.confidence-f16`, `Predictions/%08u.geometry.json`, and
+`Points/window-%08u.cpc` (minimum width eight, expanding through UInt32). Exclusive
+siblings are `.<final-basename>.<lowercase-UUID>.partial`; the worker synchronizes
+and promotes them without clobber. Before begin ACK, only the worker reads manifest
+references and descriptor-relatively removes exact-pattern
+partials plus unreferenced exact-pattern finals without following symlinks or
+deleting unknown names; native never guesses output orphans.
+
+Native derives replay from the final `max(windowOverlap, 1)` actual committed
+artifacts, uses checked next-window addition, and never subtracts source indices.
+Replay is read-only/eventless, absent from CPC, and excluded from queued/processed
+counters. `queuedFrames` is cumulative unique-output admission this invocation, not
+pending depth; `processedFrames <= queuedFrames`, backlog is their difference, and
+all counters exclude replay. A native
+`PendingWindowAccumulator` requires the exact ordered expected unique output IDs and
+atomically commits artifacts/window before renderer publication.
+
 The capture contracts are `AssetFrameSource.frames(at:) -> AsyncThrowingStream<CapturedFrame, Error>`, `CameraFrameSource.start(deviceID:sampleRate:)`, and injected `FramePersistence` that returns a `PersistedFrame` only after the JPEG rename. The rendering contracts are `PointChunk.open(url:limits:) throws -> PointChunk` and `PointCloudRenderer.append(_:)`.
 
-The Swift worker boundary is the native plan's `WorkerEnvelope`, `WorkerCommand`, `WorkerEvent`, `LengthPrefixedJSONCodec`, and `WorkerProcess.start(executable:arguments:environment:)`. It mirrors the engine plan's lower-camel protocol-v1 schema: commands `hello`, `configure`, `beginSession`, `enqueueFrame`, `finishInput`, `pause`, `resume`, `cancel`, and `shutdown`; events `ready`, `modelProgress`, `frameStarted`, `frameCompleted`, `windowCompleted`, `sessionCompleted`, `paused`, `cancelled`, `warning`, `error`, and `heartbeat`; `ack` carries top-level `commandId` and payload `{command}`, while command errors carry non-null `commandId` and asynchronous errors carry null `commandId` with `{code,message,recoverable,details}`.
+The Swift worker boundary is the native plan's `WorkerEnvelope`, `WorkerCommand`,
+`WorkerEvent`, `LengthPrefixedJSONCodec`, and
+`WorkerProcess.start(executable:arguments:environment:)`. It mirrors the engine
+plan's strict lower-camel protocol-v1 schema: the complete configure payload includes
+voxel size; begin carries a nullable structured checkpoint; frame completion owns
+only depth/confidence/geometry; window completion owns the CPC plus inference and
+unique-output bounds; hello carries `supportedProtocolVersions: [UInt32]` containing
+1. ACK carries top-level `commandId` and payload `{command}`;
+command errors carry non-null `commandId`, asynchronous errors carry null
+`commandId`, and both retain `{code,message,recoverable,details}`. ACK always
+precedes lifecycle output: hello negotiates, configure validates/stores, begin
+validates checkpoint/manifest and completes cleanup, enqueue admits to the bounded
+ordered queue, finish closes admission, pause records the request, resume releases
+it after cooperative quiescence with the queue retained, and cancel/shutdown are
+distinct from later completion/cleanup/exit.
+MLX/model work runs on one dedicated serial executor so framing, controls, and the
+immediate-then-five-second heartbeat schedule remain live during loading, inference,
+finalization, and idle.
 
-The worker development command is `cd worker && uv run --frozen cloudpoint-worker serve --socket PATH --project PATH --model PATH`. Production launches `<runtime>/bin/cloudpoint-worker` with the same `serve` arguments. Its model directory contains `lingbot-map-long-f16.safetensors`, `weights-manifest.json`, and `model-manifest.json`. CPC output is exactly the engine plan's 32-byte little-endian CPC1 header followed by stride-24 `<fff4BeHI` vertices; native code opens it only through `PointChunk.open(url:limits:)`.
+Generated wire JSON uses sorted keys, lowercase UUIDs, no insignificant whitespace,
+finite shortest-round-trip Double tokens, integral values without `.0`, normalized
+negative zero, and lowercase `e` without `+` or redundant exponent zeroes. Relayed
+raw numeric tokens in structured error details retain their exact lexemes. Encoders
+emit and decoders require lowercase canonical UUID text. Invalid lengths/truncation
+close without response; invalid JSON
+or no recoverable complete command header gets at most one asynchronous fault before
+close; a complete header with bad type/payload gets one command error and remains
+open with state unchanged; an unsupported version gets one flushed command error and
+then closes.
+
+The worker development command is
+`cd worker && uv run --frozen cloudpoint-worker serve --project ABSOLUTE_PATH --model ABSOLUTE_PATH`.
+Production launches `<runtime>/bin/cloudpoint-worker` with the same `serve`
+arguments. The process creates no listener or network connection. Its model
+directory contains `lingbot-map-long-f16.safetensors`, `weights-manifest.json`, and
+`model-manifest.json`. One CPC per output window uses the exact 32-byte little-endian
+CPC1 header followed by stride-24 `<fff4BeHI` vertices; native code opens it only
+through `PointChunk.open(url:limits:)`.
 
 ---
 
@@ -82,7 +161,9 @@ The worker development command is `cd worker && uv run --frozen cloudpoint-worke
 - Create: `CloudPointTests/TestSupport/RealWorkerFixture.swift`
 
 **Interfaces:**
-- Consumes: `WorkerProcess.start(executable:arguments:environment:)`, `WorkerEnvelope`, `WorkerCommand`, `WorkerEvent`, `LengthPrefixedJSONCodec`, and the `cloudpoint-worker serve --socket PATH --project PATH --model PATH` entry point.
+- Consumes: `WorkerProcess.start(executable:arguments:environment:)`,
+  `WorkerEnvelope`, `WorkerCommand`, `WorkerEvent`, `LengthPrefixedJSONCodec`, and
+  `cloudpoint-worker serve --project ABSOLUTE_PATH --model ABSOLUTE_PATH`.
 - Produces: `ReconstructionEngineFactory.makeEngine(modelDirectory:) throws -> any ReconstructionEngine`, `WorkerRuntime.resolve(bundleValue:environment:validateFiles:fileManager:) throws`, and a concrete engine that launches only the configured runtime.
 
 - [ ] **Step 1: Write failing runtime-resolution and launch-contract tests**
@@ -112,13 +193,12 @@ final class WorkerRuntimeTests: XCTestCase {
     func testServeArgumentsContainOnlyResolvedAbsolutePaths() throws {
         let launch = try WorkerLaunch(
             runtime: .unchecked(root: URL(fileURLWithPath: "/opt/cloudpoint/.venv")),
-            socket: URL(fileURLWithPath: "/private/tmp/cp/socket"),
             project: URL(fileURLWithPath: "/tmp/Test.cloudpoint"),
             model: URL(fileURLWithPath: "/tmp/model")
         )
         XCTAssertEqual(launch.arguments, [
-            "serve", "--socket", "/private/tmp/cp/socket",
-            "--project", "/tmp/Test.cloudpoint", "--model", "/tmp/model"
+            "serve", "--project", "/tmp/Test.cloudpoint",
+            "--model", "/tmp/model"
         ])
     }
 }
@@ -186,18 +266,25 @@ public struct WorkerLaunch: Sendable, Equatable {
     public let executable: URL
     public let arguments: [String]
 
-    public init(runtime: WorkerRuntime, socket: URL, project: URL, model: URL) throws {
-        for url in [socket, project, model] where !url.path.hasPrefix("/") {
+    public init(runtime: WorkerRuntime, project: URL, model: URL) throws {
+        for url in [project, model] where !url.path.hasPrefix("/") {
             throw WorkerRuntimeError.runtimeMustBeAbsolute(url.path)
         }
         executable = runtime.workerExecutable
-        arguments = ["serve", "--socket", socket.path,
-                     "--project", project.path, "--model", model.path]
+        arguments = ["serve", "--project", project.path, "--model", model.path]
     }
 }
 ```
 
-`PythonMLXEngineFactory` must create a fresh `PythonMLXEngine` per call. `PythonMLXEngine` delegates subprocess lifecycle to the existing `WorkerProcess`, creates the private Unix listener in a per-launch temporary directory, maps every protocol-v1 `WorkerEvent` to the existing native `EngineEvent`, and passes a sanitized environment containing only `HOME`, `TMPDIR`, `PATH=/usr/bin:/bin`, `PYTHONNOUSERSITE=1`, `PYTHONHASHSEED=0`, `LC_ALL=C`, and `LANG=C`. Never pass Hugging Face or shell credential variables.
+`PythonMLXEngineFactory` must create a fresh `PythonMLXEngine` per call.
+`PythonMLXEngine` delegates subprocess lifecycle and framed pipes to the existing
+`WorkerProcess`, maps every protocol-v1 `WorkerEvent` to the lossless native
+`EngineEvent`, and passes an exact replacement environment containing only `HOME`,
+`TMPDIR`, `PATH=/usr/bin:/bin`, `PYTHONNOUSERSITE=1`, `PYTHONHASHSEED=0`,
+`LC_ALL=C`, and `LANG=C`. Never merge the inherited environment or pass Hugging Face
+or shell credential variables. After hello ACK it calls idempotent
+`markProtocolReady()`; launch alone never arms missed-heartbeat accounting and the
+first valid heartbeat may also arm/reset it.
 
 - [ ] **Step 4: Wire the local build setting and install the locked worker**
 
@@ -519,12 +606,15 @@ func testStopCaptureFinishesInputWithoutCancellingBacklog() async throws {
     await rig.waitForState(.completed)
 }
 
-func testResumeStartsAfterLastCompletedWindow() async throws {
+func testResumeReplaysActualCommittedOverlapThenNewFrames() async throws {
     let rig = try SessionRig.interrupted(completedWindow: 1, lastFrame: 31, persistedFrames: 48)
     try await rig.controller.resume(project: rig.project)
-    XCTAssertEqual(await rig.engine.begunDescriptor?.resumeAfterFrameIndex, 31)
-    XCTAssertEqual(await rig.engine.enqueuedIndices, Array(32..<48))
-    XCTAssertEqual(rig.store.removedPartials, ["Predictions/00000032.depth-f16.partial"])
+    XCTAssertEqual(await rig.engine.begunDescriptor?.resumeCheckpoint,
+                   ResumeCheckpoint(lastCommittedFrameIndex: 31,
+                                    replayFromFrameIndex: 24,
+                                    nextWindowIndex: 2))
+    XCTAssertEqual(await rig.engine.enqueuedIndices, Array(24..<48))
+    XCTAssertEqual(rig.store.nativeRemovedOutputOrphans, [])
 }
 ```
 
@@ -543,36 +633,62 @@ Expected: FAIL because `SessionController.resume(project:)` is absent and the st
 
 ```swift
 public struct CompletedWindow: Codable, Sendable, Equatable {
-    public var index: Int
-    public var frameStart: Int
-    public var frameEnd: Int
+    public var index: UInt32
+    public var inferenceFrameStart: UInt32
+    public var frameStart: UInt32
+    public var frameEnd: UInt32
     public var pointChunkRelativePath: String
-    public var alignmentRowMajor: [Float] // exactly 16 values
+    public var alignmentRowMajor: [Double] // exactly 16 finite values
+    public var lastProcessedFrameIndex: UInt32
+    public var inlierCount: UInt64
+    public var durationSeconds: Double
+    public var frameArtifacts: [FrameArtifacts]
 }
 
 // Add this field to the native plan's existing ProjectDescriptor.
-public var resumeAfterFrameIndex: Int? // inclusive completed-window boundary
+public var resumeCheckpoint: ResumeCheckpoint?
 
 public struct WorkspaceSnapshot: Sendable, Equatable {
     public var phase: SessionPhase
     public var isCapturing: Bool
     public var isProcessing: Bool
-    public var capturedCount: Int
-    public var queuedCount: Int
-    public var processedCount: Int
-    public var failedCount: Int
-    public var currentWindow: Int?
-    public var backlogCount: Int { max(0, queuedCount - processedCount) }
+    public var capturedCount: UInt64
+    public var queuedCount: UInt64
+    public var processedCount: UInt64
+    public var failedCount: UInt64
+    public var currentWindow: UInt32?
+    public var backlogCount: UInt64 {
+        queuedCount >= processedCount ? queuedCount - processedCount : 0
+    }
     public var recoverableAction: RecoveryAction?
 }
 
 public enum WorkspaceEffect: Sendable {
     case appendPointChunk(PointChunk)
-    case selectSourceFrame(Int)
+    case selectSourceFrame(UInt32)
 }
 ```
 
-For every sampled frame, execute this order inside `SessionController`: receive the `PersistedFrame` returned by the native plan's `FramePersistence`, append its relative path and timestamp to a local manifest copy, call `manifest.writeAtomically(to: project.packageURL)`, replace in-memory manifest, then call `engine.enqueue`. Keep the native plan's single `WorkspaceViewModel` event-consumption task. It passes each `EngineEvent` to `SessionController.apply(engineEvent:)`; on `frameCompleted`, the controller validates prediction paths beneath `Predictions/` before updating counts. On `windowCompleted`, open the relative CPC path with `PointChunk.open(url:limits:)`, append the engine plan's frame range and 4x4 alignment to `manifest.completedWindows`, write the manifest atomically, and only then return `.appendPointChunk(chunk)`.
+For every sampled frame, execute this order inside `SessionController`: receive the
+`PersistedFrame` returned by `FramePersistence`, append it to a local manifest copy,
+write that copy atomically, adopt the new revision in memory, then call
+`engine.enqueue`. One view-model event-consumption task starts before any engine
+method and passes each `EngineEvent` to `SessionController.apply(engineEvent:)`.
+Generation tokens and monotonic manifest revisions prevent actor reentrancy from
+letting stale engine/source work overwrite a newer session.
+Publish/increment `queuedCount` only after successful enqueue admission, never
+decrement it, and exclude replay; backlog is `queuedCount - processedCount`.
+
+On `frameCompleted`, validate the three prediction paths and add the artifact to the
+pure `PendingWindowAccumulator`; do not advance committed processed counts. On
+`windowCompleted`, select the ordered expected unique output IDs from the session's
+persisted/enqueued records, require the pending artifact IDs to match exactly, open
+the window CPC, append the complete artifacts and window to one local manifest copy,
+write it atomically, adopt it, update unique current-invocation counts, and only then
+return `.appendPointChunk(chunk)`. Reject missing, extra, duplicate, cross-window,
+and out-of-order artifacts; source-index gaps are legal, so bounds alone are not
+proof of completeness. Native alone owns this pending/manifest transaction; worker
+events are proposals until committed.
 
 - [ ] **Step 4: Implement imported and live termination semantics**
 
@@ -602,7 +718,6 @@ Imported source exhaustion and **Stop Capture** call `finishInput`; neither call
 
 ```swift
 public func resume(project: ProjectDescriptor, modelDirectory: URL) async throws {
-    removeStalePartials(beneath: project.packageURL)
     var manifest = try ProjectManifest.load(from: project.packageURL)
     let completed = try manifest.completedWindows.map { window in
         let url = project.packageURL.appending(path: window.pointChunkRelativePath)
@@ -613,20 +728,31 @@ public func resume(project: ProjectDescriptor, modelDirectory: URL) async throws
     for chunk in completed { effectContinuation.yield(.appendPointChunk(chunk)) }
     let engine = try engineFactory.makeEngine(modelDirectory: modelDirectory)
     self.engine = engine
+    startEventConsumption()
     try await engine.prepare(configuration: manifest.engineConfiguration)
-    let lastFrame = manifest.completedWindows.last?.frameEnd ?? -1
+    let checkpoint = try manifest.resumeCheckpoint()
     var resumedProject = project
-    resumedProject.resumeAfterFrameIndex = lastFrame >= 0 ? lastFrame : nil
+    resumedProject.resumeCheckpoint = checkpoint
     try await engine.begin(project: resumedProject)
-    for frame in manifest.frames where frame.index > lastFrame {
+    let replayStart = checkpoint?.replayFromFrameIndex
+    for frame in manifest.frames where replayStart == nil || frame.index >= replayStart! {
         try await engine.enqueue(frame)
     }
     try await engine.finishInput()
-    startEventConsumption()
 }
 ```
 
-`removeStalePartials(beneath:)` must delete only files whose final suffix is `.partial`; `ProjectManifest.load(from:)` plus `PointChunk.open(url:limits:)` reject invalid completed chunks. Recompute counts from committed manifest frames/windows and resume at `completedWindows.last.frameEnd + 1`. Reopened live projects resume as finite recording-style jobs from saved JPEGs. `CloudPointDocument` must load recovery state during open and expose a **Resume from frame N** action instead of starting automatically.
+`ProjectManifest.load(from:)` plus `PointChunk.open(url:limits:)` reject invalid
+completed chunks. Native never scans for or guesses removable output files. The
+worker reads manifest references and performs exact-pattern, descriptor-relative,
+no-follow orphan cleanup before begin ACK. Derive the checkpoint by checked next
+window addition and by selecting the final `max(windowOverlap, 1)` actual committed
+artifact records across window boundaries; the first selected index is replay start,
+never arithmetic subtraction. Enqueue replay through the committed boundary and all
+new frames in strict source order. Replay is read-only, eventless, absent from CPC,
+and excluded from queued/processed counts. Reopened live projects resume as finite
+recording-style jobs. `CloudPointDocument` loads recovery state on open and exposes
+a resume action instead of starting automatically.
 
 - [ ] **Step 6: Run unit and integration tests**
 
@@ -711,17 +837,26 @@ Expected: FAIL because `EngineFailure` classification and persisted OOM retry st
 public enum EngineFailure: Error, Sendable, Equatable {
     case processExited(status: Int32, stderrLog: URL)
     case heartbeatTimeout(lastHeartbeat: ContinuousClock.Instant)
-    case allocationFailed(windowIndex: Int)
-    case worker(code: String, message: String, recoverable: Bool)
+    case allocationFailed(windowIndex: UInt32)
+    case worker(code: String, message: String, recoverable: Bool,
+                details: [String: JSONValue])
 }
 
 public enum WindowRetryState: Codable, Sendable, Equatable {
     case none
-    case allocationRetryConsumed(windowIndex: Int)
+    case allocationRetryConsumed(windowIndex: UInt32)
 }
 ```
 
-Start the heartbeat watchdog only after `ready`; while busy, reset it on every heartbeat and fail after 15 seconds. Capture bounded stderr to `Logs/worker.log`, rotate at 10 MiB, and include exit status. On failure close the socket, send SIGTERM to the process group, wait two seconds using the injected clock, then SIGKILL the same group if still alive. Never leave the process or watchdog task detached.
+Process launch proves process-group ownership and writable framed stdio only; it
+must not start a heartbeat timer. After hello ACK, call idempotent
+`markProtocolReady()`; the first valid heartbeat may also arm/reset supervision.
+Use local arrival time, never the worker's telemetry clock, and fail after three
+missed five-second intervals regardless of busy/idle state. Capture bounded stderr
+to `Logs/worker.log`, rotate at 10 MiB, and include exit status. On failure close all
+pipes, send SIGTERM to the process group, wait two seconds using the injected clock,
+then SIGKILL the same group if still alive. Never leave the process, reader,
+escalation, or watchdog task detached.
 
 - [ ] **Step 4: Implement checkpoint restart and exact OOM policy**
 
@@ -734,12 +869,13 @@ private func handle(_ failure: EngineFailure) async {
         manifest.engineConfiguration.windowSize = 16
         manifest.engineConfiguration.windowOverlap = 4
         try? manifest.writeAtomically(to: project.packageURL)
-        await restartFromLastCompletedWindow(automatic: true)
+        await restartFromManifestCheckpoint(automatic: true)
     case (.allocationFailed, .allocationRetryConsumed):
         await fail(failure, recoverableAction: nil, preservingCapturedFrames: true)
     case (.processExited, _), (.heartbeatTimeout, _):
+        let checkpoint = try? manifest.resumeCheckpoint()
         await fail(failure,
-                   recoverableAction: .restartFromWindow((manifest.completedWindows.last?.index ?? -1) + 1),
+                   recoverableAction: checkpoint.map { .restartFromWindow($0.nextWindowIndex) },
                    preservingCapturedFrames: true)
     default:
         await fail(failure, recoverableAction: nil, preservingCapturedFrames: true)
@@ -747,7 +883,12 @@ private func handle(_ failure: EngineFailure) async {
 }
 ```
 
-`retry()` must be legal only when `recoverableAction` exists, create a fresh engine, revalidate model and checkpoint, enqueue frames after `lastProcessedFrameIndex`, and retain the previous worker log. A crash never retries automatically; the UI action is **Restart from window N**.
+`retry()` must be legal only when `recoverableAction` exists, create a fresh engine,
+revalidate model and the full manifest-derived checkpoint, then enqueue the exact
+committed replay artifact range through the boundary followed by new frames. It must
+not compute replay from `lastProcessedFrameIndex` arithmetic. Retain the previous
+worker log. A crash never retries automatically; the UI action is **Restart from
+window N**.
 
 - [ ] **Step 5: Run failure suites and the complete core test set**
 
@@ -839,7 +980,7 @@ public struct TrajectoryDocument: Codable, Sendable, Equatable {
 
 public struct TrajectoryPose: Codable, Sendable, Equatable {
     public let timestampSeconds: Double
-    public let sourceFrameIndex: Int
+    public let sourceFrameIndex: UInt32
     public let cameraToWorld: [Float] // row-major, exactly 16 values
     public let intrinsics: [Float]    // row-major 3x3, exactly 9 values
 }
@@ -980,7 +1121,7 @@ struct WorkspaceView: View {
 }
 ```
 
-The source panel contains recording import, camera selection, direct live preview, source metadata, and capture controls. The viewport contains grid, axes, append-only cloud, trajectory, selected frustum, reset, empty/loading/error overlays, orbit/pan/zoom, and no inference work. The inspector exposes sampling 1–10 FPS, confidence default 1.5, point size, display budget up to five million, engine/model health, and coordinate-unit copy. The timeline shows captured, processed, backlog, current window, elapsed time, reconstruction FPS, pause/resume/cancel, and **Stop Capture** separately.
+The source panel contains recording import, camera selection, direct live preview, source metadata, and capture controls. The viewport contains grid, axes, append-only cloud, trajectory, selected frustum, reset, empty/loading/error overlays, orbit/pan/zoom, and no inference work. The inspector exposes sampling 1–10 FPS, confidence default 1.5, point size, display budget up to five million, engine/model health, and coordinate-unit copy. The timeline shows captured, cumulative admitted, processed, backlog (`admitted - processed`), current window, elapsed time, reconstruction FPS, pause/resume/cancel, and **Stop Capture** separately.
 
 Add accessibility identifiers `source-panel`, `point-cloud-viewport`, `inspector-panel`, `session-timeline`, `open-recording`, `use-camera`, `stop-capture`, `pause-processing`, `resume-processing`, `cancel-processing`, and `restart-window`. Every icon-only control has an accessibility label and help text. Disabled controls remain visible with a reason.
 
@@ -1016,10 +1157,10 @@ struct SessionStatusText: Equatable {
 ```swift
 public enum PerformanceEvent: Sendable {
     case modelLoaded(durationSeconds: Double, residentBytes: UInt64)
-    case frameCompleted(index: Int, durationSeconds: Double)
-    case windowCompleted(index: Int, frames: Int, durationSeconds: Double, residentBytes: UInt64)
+    case frameCompleted(index: UInt32, durationSeconds: Double)
+    case windowCompleted(index: UInt32, frames: UInt64, durationSeconds: Double, residentBytes: UInt64)
     case rendererSample(displayedPoints: Int, framesPerSecond: Double)
-    case backlog(captured: Int, processed: Int)
+    case backlog(queued: UInt64, processed: UInt64)
     case export(kind: String, bytes: UInt64, durationSeconds: Double, peakResidentBytes: UInt64)
 }
 ```
@@ -1114,7 +1255,7 @@ xcodebuild build -project CloudPoint.xcodeproj -scheme CloudPoint -configuration
 git diff --exit-code -- CloudPoint.xcodeproj
 ```
 
-`scripts/check-protocol-compatibility` must run `(cd worker && uv run --frozen cloudpoint-worker protocol-fixture --output tests/fixtures/protocol-v1.json && git diff --exit-code -- tests/fixtures/protocol-v1.json)`, then run the focused Swift test against that exact corpus. `ProtocolCompatibilityFixture.messages` is the ordered union of the fixture's command, ack, command-error, asynchronous-error, and event rows; each row is `{name,json,framedBytes}`. The checker asserts all discriminators on both sides and rejects any payload above 1,048,576 bytes. It prints `Protocol compatibility: PASS (version 1)` only after both decoders pass.
+`scripts/check-protocol-compatibility` must run `(cd worker && uv run --frozen cloudpoint-worker protocol-fixture --output tests/fixtures/protocol-v1.json && git diff --exit-code -- tests/fixtures/protocol-v1.json)`, then run the focused Swift test against that exact corpus. `ProtocolCompatibilityFixture.messages` is the ordered union of command, ACK, command-error, asynchronous-error, and event rows; each row is `{name,json,framedBytes}`. Include null/full structured checkpoints, complete configuration including voxel size, frame-artifact and window-CPC completion events, nested unknown/missing fields, lowercase UUIDs, integral/nonintegral/exponent Double tokens, negative zero normalization, and exact raw numeric lexemes relayed in error details. The checker asserts all discriminators, typed widths, canonical bytes, malformed-input disposition cases, and the 1,048,576-byte limit on both sides. It prints `Protocol compatibility: PASS (version 1)` only after both implementations pass.
 
 - [ ] **Step 4: Add exact opt-in real-model and hardware gates**
 

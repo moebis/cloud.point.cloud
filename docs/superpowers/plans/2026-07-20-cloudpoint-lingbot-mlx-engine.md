@@ -4,7 +4,7 @@
 
 **Goal:** Build a Python 3.12/MLX Lingbot Map worker that prepares the one pinned checkpoint, matches the pinned PyTorch SDPA reference, streams versioned reconstruction events, writes recoverable geometry artifacts, and runs independently from the command line.
 
-**Architecture:** A locked `uv` project exposes a network-free worker process and a separate model-preparation command. Focused MLX modules mirror upstream Lingbot Map commit `7ff6f3ed0913d4d326f8f13bbb429c4ffc0195c2`; a session runner owns preprocessing, KV-cached direct/windowed inference, robust Sim(3) alignment, atomic prediction/CPC output, and the JSON-over-Unix-socket adapter.
+**Architecture:** A locked `uv` project exposes a network-free worker process and a separate model-preparation command. Focused MLX modules mirror upstream Lingbot Map commit `7ff6f3ed0913d4d326f8f13bbb429c4ffc0195c2`; a session runner owns preprocessing, KV-cached direct/windowed inference, robust Sim(3) alignment, atomic prediction/CPC output, and the canonical length-prefixed JSON stdin/stdout adapter.
 
 **Tech Stack:** Python 3.12.11, uv, MLX 0.32.0, NumPy 2.3.1, Pillow 11.3.0, SafeTensors 0.5.3, msgspec 0.19.0, pytest 8.4.1, optional PyTorch 2.8.0/torchvision 0.23.0 reference tooling
 
@@ -16,13 +16,22 @@
 - Support only `robbyant/lingbot-map` revision `204754b72bb24f561f8d7e7e1e4e4cd9e809adf9`, file `lingbot-map-long.pt`, exact size `4,632,303,465`, SHA-256 `832bc82cbae0bc9bbe946ef5ee1f7226abd8c0e183ccf8beddbb3d133576f409`.
 - Port and attribute source topology from commit `7ff6f3ed0913d4d326f8f13bbb429c4ffc0195c2`; do not import an unofficial MLX port as a package or runtime dependency.
 - The production worker never accepts or deserializes `.pt`; only the separate converter may deserialize the exact verified checkpoint in a scrubbed subprocess.
-- IPC is protocol version `1`: four-byte big-endian length plus UTF-8 JSON, maximum message length `1,048,576` bytes, exactly one acknowledgement or structured error per command, and no tensors or images in JSON.
+- IPC is protocol version `1`: four-byte big-endian length plus canonical UTF-8 JSON over stdin/stdout, diagnostics on stderr, maximum message length `1,048,576` bytes, exact response-disposition rules, exactly one acknowledgement or structured error per decoded valid command, and no tensors or images in JSON.
 - The native setup layer downloads the checkpoint with URLSession before conversion or worker launch. Both `cloudpoint-model` and `cloudpoint-worker` bind no TCP port and make no network requests.
-- Reconstruction defaults are eight scale frames, 32-frame windows, eight-frame overlap, keyframe interval one, one camera-refinement pass, confidence threshold `1.5`, direct mode at 32 frames or fewer, and overlapping-window mode above 32 frames.
+- `serve` expects an exact replacement child environment containing only `HOME`,
+  `TMPDIR`, `PATH=/usr/bin:/bin`, `PYTHONNOUSERSITE=1`, `PYTHONHASHSEED=0`,
+  `LC_ALL=C`, and `LANG=C`; tests may add only explicit mock controls.
+- Reconstruction defaults are eight scale frames, 32-frame windows, eight-frame overlap, keyframe interval one, four camera-refinement passes, confidence threshold `1.5`, voxel size `0.01`, direct mode at 32 frames or fewer, and overlapping-window mode above 32 frames.
 - Enable depth and camera heads and disable the optional world-point head; emit dense depth/confidence, nine-value camera encoding, decoded intrinsics, camera-to-world pose, and filtered colored points.
 - Coordinates are reconstruction units, not meters. Reject non-finite/non-positive depth, confidence below the stored floor, degenerate alignment, malformed messages, unsafe paths, excessive tensor dimensions, and oversized outputs.
-- Recovery boundaries are completed windows only. Atomic artifacts use a sibling `.partial`, `fsync`, and rename; startup removes stale `.partial` files and resumes after the last completed window.
-- CPC `frameStart` and `frameEnd` are inclusive UInt32 source-frame indices; internal Python windows use `start` inclusive and `stop` exclusive, so writers/events use `frameEnd = stop - 1`.
+- Recovery boundaries are completed windows only. Native supplies an exact manifest-derived checkpoint and replay frames; the worker reads committed manifest artifacts without mutating them. Exclusive sibling partials, no-clobber promotion, and exact-pattern orphan cleanup are the worker's output-transaction responsibility.
+- Project manifests are schema v2 only for this pre-release reset; reject v1 rather
+  than decoding it as v2. IDs/bounds are UInt32, counts/inliers UInt64, and
+  configuration/timestamps/durations/transforms finite Double where applicable.
+- CPC `frameStart` and `frameEnd` are inclusive actual UInt32 source-frame indices.
+  Internal Python windows use sequence offsets with exclusive stops, but writers map
+  the first/last unique output records back to their source IDs; source gaps make
+  `stop - 1` an invalid source-index derivation.
 - Bound inputs before allocation to an 8,192-pixel maximum dimension, 33,554,432 source pixels, 134,217,728 tensor elements, 50,000,000 CPC points, and `1,200,000,032` CPC bytes. The native reader uses the same point/file bounds.
 - Real-model differential thresholds are: Float32 leaf layers `rtol <= 1e-3`, `atol <= 1e-4`; selected aggregator cosine similarity `>= 0.995`; Float16 depth correlation `>= 0.99` and median relative error `<= 0.03`; translation relative error `<= 0.03` after shared-scale normalization; rotation geodesic error `<= 1.0` degree; intrinsics relative error `<= 0.01`.
 
@@ -63,7 +72,7 @@ worker/
     outputs.py                            # depth/confidence/geometry atomic artifacts
     windows.py                            # 32/8 orchestration and checkpoint records
     session.py                            # queue, lifecycle, pause/cancel/recovery
-    server.py                             # Unix-socket command/event adapter and heartbeat
+    server.py                             # framed stdin/stdout adapter and heartbeat
   tools/export_reference.py              # pinned PyTorch SDPA golden generator
   tests/
     fixtures/courthouse/000000.png through 000008.png
@@ -220,20 +229,63 @@ class ErrorPayload(msgspec.Struct, rename="camel"):
     details: dict[str, object]
 ```
 
-`Command` is the union of nine concrete structs. Their payloads are exact: `hello(clientVersion, supportedProtocolVersions=[1])`; `configure(scaleFrames, windowSize, windowOverlap, keyframeInterval, cameraRefinementIterations, confidenceThreshold)`; `beginSession(resumeAfterFrameIndex: int | None)`; `enqueueFrame(frameIndex: int, sourceTimestamp: float, relativePath: str)`; and `{}` for `finishInput`, `pause`, `resume`, `cancel`, and `shutdown`. Only `configure` may carry the 16/4 retry values; validate `0 <= resumeAfterFrameIndex <= UInt32.max`, `0 <= frameIndex <= UInt32.max`, finite non-negative timestamps, and package-relative frame paths.
+`Command` is the union of nine concrete structs with strict unknown/missing-field
+rejection at every level. Payloads are exact:
+`hello(clientVersion, supportedProtocolVersions: list[UInt32]=[1])`;
+`configure(scaleFrames, windowSize, windowOverlap, keyframeInterval,
+cameraRefinementIterations, confidenceThreshold, voxelSize)`;
+`beginSession(resumeCheckpoint)` where the value is null or
+`{lastCommittedFrameIndex, replayFromFrameIndex, nextWindowIndex}` as UInt32;
+`enqueueFrame(frameIndex, sourceTimestamp, relativePath)`; and `{}` for
+`finishInput`, `pause`, `resume`, `cancel`, and `shutdown`. Validate window size
+`1...1024`, scale frames `1...windowSize`, overlap less than window size (zero is
+legal), positive keyframe/refinement values, positive finite confidence/voxel values, replay start no
+later than the committed boundary, UInt32 IDs, finite nonnegative timestamps, and
+safe package-relative frame paths. Only `configure` may carry the 16/4 OOM retry
+values.
+
+The canonical default configure values are `scaleFrames=8`, `windowSize=32`,
+`windowOverlap=8`, `keyframeInterval=1`, `cameraRefinementIterations=4`,
+`confidenceThreshold=1.5`, and `voxelSize=0.01`; explicitly named test fixtures may
+choose other valid values.
 
 All response/event envelopes carry `protocolVersion`, their own UUID `id`, and `projectId`. `Ack` has `type: "ack"`, `commandId`, and payload `{command}`. A command `ErrorMessage` has `type: "error"`, non-null `commandId`, and `ErrorPayload`; an asynchronous error event uses the same discriminator with `commandId: null`. Event payloads are:
 
 - `ready`: `engineVersion`, `modelIdentifier`, `modelRevision`, `convertedWeightsSHA256`.
-- `modelProgress`: `phase` (`validating` or `loading`), `completed`, `total`.
-- `frameStarted`: `frameIndex`, `windowIndex`.
-- `frameCompleted`: `frameIndex`, `windowIndex`, package-relative `depthPath`, `confidencePath`, `geometryPath`, `pointChunkPath`, and `durationSeconds`.
-- `windowCompleted`: `windowIndex`, inclusive `frameStart`, inclusive `frameEnd`, `pointChunkPath`, row-major 16-number `alignmentTransform`, `lastProcessedFrameIndex`, `inlierCount`, and `durationSeconds`.
-- `sessionCompleted`: `processedFrames`, `windowCount`, `durationSeconds`.
-- `paused`: `queuedFrames`, `processedFrames`; `cancelled`: `lastCompletedWindowIndex` (nullable).
-- `warning` and asynchronous `error`: `ErrorPayload`; `heartbeat`: `busy`, `monotonicSeconds`, `queuedFrames`, `processedFrames`, `currentWindow` (nullable).
+- `modelProgress`: `phase` (`validating` or `loading`), `completed: UInt64`,
+  `total: UInt64`.
+- `frameStarted`: `frameIndex: UInt32`, `windowIndex: UInt32`.
+- `frameCompleted`: exactly `frameIndex`, `windowIndex`, package-relative
+  `depthPath`, `confidencePath`, `geometryPath`, and `durationSeconds`; it never
+  owns a CPC.
+- `windowCompleted`: exactly `windowIndex`, `inferenceFrameStart`, inclusive unique
+  output `frameStart`/`frameEnd`, `pointChunkPath`, row-major 16-number
+  `alignmentTransform`, `lastProcessedFrameIndex`, `inlierCount`, and
+  `durationSeconds`. Require
+  `inferenceFrameStart <= frameStart <= frameEnd <= lastProcessedFrameIndex`.
+- `sessionCompleted`: `processedFrames: UInt64`, `windowCount: UInt32`, and finite
+  nonnegative `durationSeconds`.
+- `paused`: `queuedFrames: UInt64`, `processedFrames: UInt64`; `cancelled`:
+  `lastCompletedWindowIndex: UInt32?`.
+- `warning` and asynchronous `error`: `ErrorPayload`; `heartbeat`: `busy`, finite
+  nonnegative `monotonicSeconds` (zero legal), `queuedFrames: UInt64`,
+  `processedFrames: UInt64`, `currentWindow: UInt32?`.
 
-`write_protocol_fixture` writes sorted-key JSON containing `protocolVersion`, `maximumMessageBytes`, and every command/ack/error/event as `{name, json, framedBytes}` where `framedBytes` is the complete frame represented as an array of UInt8. Generate it deterministically with UUIDs `00000000-0000-0000-0000-000000000001` upward so Swift's compatibility decoder can consume the same corpus.
+`write_protocol_fixture` writes canonical JSON containing `protocolVersion`,
+`maximumMessageBytes`, and every command/ack/error/event as
+`{name, json, framedBytes}` where `framedBytes` is the complete frame represented as
+an array of UInt8. Generate it deterministically with lowercase UUIDs
+`00000000-0000-0000-0000-000000000001` upward. Include null/full checkpoints,
+complete configuration, both completion events, nested missing/unknown-field
+rejections, and integral/nonintegral/exponent typed Double cases.
+
+Canonical generated JSON uses lexicographically sorted object keys, UTF-8, no
+insignificant whitespace, finite shortest-round-trip Double tokens, integral
+doubles without `.0`, negative zero normalized to `0`, lowercase `e`, no exponent
+`+`, and no redundant exponent zeroes. `ErrorPayload.details` alone preserves a
+decoded arbitrary valid raw numeric token byte-for-byte; generated signed,
+unsigned, and Decimal detail tokens remain exact. Encoders emit and decoders require
+lowercase canonical UUID text.
 
 - [ ] **Step 4: Implement bounded framing without partial-read ambiguity**
 
@@ -257,13 +309,19 @@ def read_json_frame(stream: BinaryIO) -> dict[str, object]:
         raise WorkerFault("MESSAGE_TOO_LARGE", f"{length} exceeds 1048576", False)
     return msgspec.json.decode(_read_exact(stream, length), type=dict[str, object])
 
+def _write_all(stream: BinaryIO, data: bytes) -> None:
+    remaining = memoryview(data)
+    while remaining:
+        written = stream.write(remaining)
+        if written is None or written <= 0:
+            raise WorkerFault("TRUNCATED_MESSAGE", "peer closed during write", False)
+        remaining = remaining[written:]
+
 def write_json_frame(stream: BinaryIO, value: object) -> None:
-    canonical = msgspec.to_builtins(value)
-    body = json.dumps(canonical, sort_keys=True, separators=(",", ":"),
-                      ensure_ascii=False, allow_nan=False).encode("utf-8")
+    body = encode_canonical_json(value)
     if len(body) > MAX_MESSAGE_BYTES:
         raise WorkerFault("MESSAGE_TOO_LARGE", f"{len(body)} exceeds 1048576", False)
-    stream.write(len(body).to_bytes(4, "big") + body)
+    _write_all(stream, len(body).to_bytes(4, "big") + body)
     stream.flush()
 ```
 
@@ -271,7 +329,13 @@ def write_json_frame(stream: BinaryIO, value: object) -> None:
 
 Run: `cd worker && uv lock --python 3.12.11 && uv sync --frozen --group dev && uv run --frozen python -m cloudpoint_worker.protocol.fixtures --output tests/fixtures/protocol-v1.json && uv run --frozen pytest tests/protocol -q`
 
-Expected: lock creation succeeds, the canonical fixture is written, and all protocol tests PASS.
+Expected: lock creation succeeds, the canonical fixture is written, and all
+protocol tests PASS, including short writes, UUID casing, exact Double formatting,
+raw error-detail lexemes, nested strictness, and the disposition table: invalid
+length/truncation closes without response; invalid JSON or no recoverable complete
+header gets at most one asynchronous fault then close; a complete header with a bad
+type/payload gets exactly one command error while the transport stays open and state
+is unchanged; an unsupported version gets one flushed command error then close.
 
 ```bash
 git add worker/.python-version worker/pyproject.toml worker/uv.lock worker/src/cloudpoint_worker worker/tests/protocol worker/tests/fixtures/protocol-v1.json
@@ -609,7 +673,7 @@ def attention(q: mx.array, k: mx.array, v: mx.array, mask: mx.array | None) -> m
 
 - [ ] **Step 4: Assemble the exact current upstream graph**
 
-Port DINOv2 ViT-L/14 with four register tokens and 24 blocks. The streaming aggregator adds camera/four-register/scale tokens, runs 24 alternating same-frame and causal-global blocks, and concatenates frame/global outputs at groups 4, 11, 17, and 23 to 2048 channels. Port DPT projections `[256,512,1024,1024]`, transpose-convolution scales `[4,2,1]`, stride-two fourth projection, four 256-channel fusion blocks, exponential depth and `expm1` confidence activation. Port the 2048-channel camera token norm, four causal trunk blocks, one refinement iteration, nine-value `absT_quaR_FoV` output, and OpenCV world-to-camera convention.
+Port DINOv2 ViT-L/14 with four register tokens and 24 blocks. The streaming aggregator adds camera/four-register/scale tokens, runs 24 alternating same-frame and causal-global blocks, and concatenates frame/global outputs at groups 4, 11, 17, and 23 to 2048 channels. Port DPT projections `[256,512,1024,1024]`, transpose-convolution scales `[4,2,1]`, stride-two fourth projection, four 256-channel fusion blocks, exponential depth and `1 + exp(raw)` confidence activation. Port the 2048-channel camera token norm, four causal trunk blocks, four refinement iterations, nine-value `absT_quaR_FoV` output, and OpenCV world-to-camera convention.
 
 `weight_specs()` must flatten every MLX parameter, map exactly one checkpoint key, annotate layout kind, and make Task 2's strict converter public CLI usable:
 
@@ -672,8 +736,10 @@ class WindowConfig:
 @dataclass(frozen=True)
 class Window:
     index: int
-    start: int                 # inclusive sequence offset
-    stop: int                  # exclusive sequence offset
+    inference_start: int       # inclusive sequence offset, including overlap
+    inference_stop: int        # exclusive sequence offset
+    output_start: int          # inclusive unique-output sequence offset
+    output_stop: int           # exclusive unique-output sequence offset
     overlap_frames: tuple[int, ...]
 
 @dataclass(frozen=True)
@@ -706,10 +772,11 @@ def test_cache_keeps_anchors_skips_non_keyframes_evicts_live_and_resets() -> Non
 
 def test_window_plan_is_direct_then_32_with_eight_overlap() -> None:
     DEFAULTS = WindowConfig(size=32, overlap=8, scale_frames=8, keyframe_interval=1)
-    assert plan_windows(32, DEFAULTS) == [Window(0, 0, 32, ())]
+    assert plan_windows(32, DEFAULTS) == [Window(0, 0, 32, 0, 32, ())]
     assert plan_windows(57, DEFAULTS) == [
-        Window(0, 0, 32, ()), Window(1, 24, 56, tuple(range(24, 32))),
-        Window(2, 48, 57, tuple(range(48, 56))),
+        Window(0, 0, 32, 0, 32, ()),
+        Window(1, 24, 56, 32, 56, tuple(range(24, 32))),
+        Window(2, 48, 57, 56, 57, tuple(range(48, 56))),
     ]
 ```
 
@@ -731,7 +798,15 @@ Store per-layer Float16 K/V as `[heads, frames, tokens, head_dim]`, anchors sepa
 
 Use all finite overlap camera centers plus a deterministic grid sample of high-confidence unprojected correspondences. Run seeded RANSAC with 256 three-point hypotheses, reject rank `<2`, score normalized residuals with MAD threshold `max(3*MAD, 1e-4)`, require at least 12 inliers spanning three frames, then refit Umeyama Sim(3) over inliers. Apply scale/rotation/translation to current-window c2w translations and point data; rotate c2w bases without scale. Persist the transform and inlier diagnostics in `WindowResult`.
 
-`WindowRunner` chooses direct mode for `<=32`; otherwise it advances by 24, resets cache per window, uses its first eight frames as window anchors, emits only non-duplicate frame outputs, and calls its checkpoint callback only after alignment and all atomic artifacts succeed. `Window.stop` is always exclusive; a completed 0–31 window is `Window(start=0, stop=32)` and produces CPC/event `frameStart=0`, `frameEnd=31`, and `lastProcessedFrameIndex=31`.
+`WindowRunner` chooses direct mode for `<=32`; otherwise each inference range
+advances by 24, resets cache per window, and uses the first eight inference frames
+as anchors. Output ranges are disjoint: 57 ordered frames produce unique offsets
+0–31, 32–55, and 56 even though later inference ranges begin at 24 and 48. Replay
+context and inference overlap never emit frame completions and never enter CPC.
+Call the checkpoint callback only after alignment and all atomic artifacts succeed.
+Stops are exclusive internally; protocol/CPC source bounds are inclusive actual
+UInt32 source indices, so gaps are legal. Each result carries inference start,
+unique output start/end, and last processed source index separately.
 
 - [ ] **Step 6: Test and commit**
 
@@ -753,7 +828,7 @@ git commit -m "feat(worker): add cached windowed reconstruction"
 - Create: `worker/tests/test_geometry_cpc.py`
 
 **Interfaces:**
-- Consumes: pose encoding `[Txyz, quaternion wxyz, fovH, fovW]`, depth/confidence/RGB arrays, frame metadata, and window Sim3.
+- Consumes: pinned upstream pose encoding `[Txyz, quaternion xyzw, fovH, fovW]`, depth/confidence/RGB arrays, frame metadata, and window Sim3.
 - Produces: `decode_camera(pose_encoding: np.ndarray, image_size: tuple[int, int]) -> DecodedCamera`, `unproject_depth(depth: np.ndarray, intrinsics: np.ndarray, camera_to_world: np.ndarray) -> np.ndarray`, `filter_and_reduce_points(depth, confidence, rgb, intrinsics, camera_to_world, source_frame, confidence_floor, voxel_size, flags) -> tuple[CPCVertex, ...]`, `write_frame_outputs(project_root: Path, frame: PersistedFrame, prediction: FramePrediction, preprocessed: PreprocessedFrame) -> FrameArtifactPaths`, and `write_cpc(path: Path, frame_start: int, frame_end_inclusive: int, vertices: Sequence[CPCVertex]) -> CPCDescriptor`.
 
 ```python
@@ -815,15 +890,27 @@ Expected: FAIL importing `unproject_depth` and `write_cpc`.
 
 - [ ] **Step 3: Implement pose decoding and geometry filtering**
 
-Normalize quaternion `wxyz`; decode upstream OpenCV world-to-camera `[R|t]`; construct intrinsics with `fy=(H/2)/tan(fovH/2)`, `fx=(W/2)/tan(fovW/2)`, `cx=W/2`, `cy=H/2`; invert to camera-to-world. Unproject pixel centers with `K^-1 [u,v,1] * depth`, then transform by c2w. Reject depth `<=0`, non-finite values, confidence `< threshold`, invalid pose/intrinsics, and outputs outside configured counts. Carry preprocessed RGB and source-frame index.
+Normalize quaternion `xyzw`; decode upstream OpenCV world-to-camera `[R|t]`; construct intrinsics with `fy=(H/2)/tan(fovH/2)`, `fx=(W/2)/tan(fovW/2)`, `cx=W/2`, `cy=H/2`; invert to camera-to-world. Unproject integer pixel coordinates with `K^-1 [u,v,1] * depth`, then transform by c2w. Reject depth `<=0`, non-finite values, confidence `< threshold`, invalid pose/intrinsics, and outputs outside configured counts. Carry preprocessed RGB and source-frame index.
 
-Voxel reduction uses `floor(position / voxel_size)` Int64 keys, keeps the highest-confidence point per voxel, breaks ties by the lowest source-frame then original pixel index, and sorts final points by `(voxelX,voxelY,voxelZ)` for reproducible bytes. Set RGBA alpha to 255; flags bit 0 means keyframe and bit 1 means anchor, with bits 2–15 zero in version 1.
+Voxel reduction operates once across the full unique output range of a window using
+`floor(position / voxel_size)` Int64 keys. It keeps the highest-confidence point per
+voxel, breaks ties by lowest source-frame then original pixel index, and sorts final
+points by `(voxelX,voxelY,voxelZ)` for reproducible bytes. Version 1 defaults voxel
+size to `0.01`. Set RGBA alpha to 255; flags bit 0 means keyframe and bit 1 means
+anchor, with bits 2–15 zero. Write exactly one CPC per output window, never one per
+frame, and exclude replay/overlap points.
 
 - [ ] **Step 4: Write exact atomic artifacts**
 
 Depth and confidence are raw little-endian Float16 files; geometry JSON contains protocol/engine/model versions, source/model sizes, model-to-source transform, nine-value pose, row-major c2w and intrinsics, confidence floor, and reconstruction-unit label. CPC header is exactly 32 bytes: `4s magic`, `<H version=1`, `<H stride=24`, `<Q pointCount`, inclusive `<I frameStart`, inclusive `<I frameEnd`, eight zero reserved bytes. Each vertex is `<fff4BeHI`; validate finite position/confidence, UInt16 flags, UInt32 frame indices, `frameStart <= frameEnd`, count `<= 50_000_000`, and total `32 + count*24 <= 1_200_000_032` before rename.
 
-Write each target as `name.partial`, flush/fsync, rename, then fsync its parent directory. Any failure removes only that operation's `.partial` and leaves earlier completed-window files intact.
+Canonical finals are `Predictions/%08u.depth-f16`,
+`Predictions/%08u.confidence-f16`, `Predictions/%08u.geometry.json`, and
+`Points/window-%08u.cpc`, with minimum width eight and natural expansion to ten
+digits for UInt32. Create each exclusive sibling as
+`.<final-basename>.<lowercase-UUID>.partial`, flush/fsync, promote without clobber,
+then fsync its parent directory. Never follow symlinks. Any failure removes only
+that operation's partial and leaves committed manifest-referenced files intact.
 
 - [ ] **Step 5: Test and commit**
 
@@ -844,8 +931,13 @@ git commit -m "feat(worker): emit recoverable prediction and CPC artifacts"
 - Create: `worker/tests/test_session_server.py`
 
 **Interfaces:**
-- Consumes: decoded protocol commands, project/model roots, frame-relative paths, `WindowRunner`, and an event sink.
-- Produces: `SessionRunner(project_root: Path, model: LingbotMap, event_sink: EventSink, resume_after_frame_index: int | None)`, exactly one ack/error per command, all version-1 events, a heartbeat at most five seconds apart while busy, and restart from the native-provided completed-window boundary.
+- Consumes: decoded protocol commands from stdin, project/model roots,
+  manifest-v2 committed state, frame-relative paths, `WindowRunner`, and a serialized
+  stdout event sink.
+- Produces: `SessionRunner(project_root: Path, model: LingbotMap,
+  event_sink: EventSink, resume_checkpoint: ResumeCheckpoint | None)`, exact
+  response ownership, all version-1 events, immediate/periodic heartbeats, exact
+  replay, and completed-window recovery without manifest mutation.
 
 ```python
 class SessionState(enum.StrEnum):
@@ -862,11 +954,13 @@ class SessionState(enum.StrEnum):
 
 ```python
 async def test_pause_cancel_and_recovery_are_boundary_safe(project, fake_model) -> None:
+    checkpoint = ResumeCheckpoint(last_committed_frame_index=31,
+                                  replay_from_frame_index=24,
+                                  next_window_index=1)
     runner = SessionRunner(project.root, fake_model, event_sink=events.append,
-                           resume_after_frame_index=31)
+                           resume_checkpoint=checkpoint)
     await runner.begin(CONFIG)
-    assert runner.next_frame_index == 32
-    for frame in persisted_frames(start=32, count=8):
+    for frame in persisted_frames(start=24, count=16):
         await runner.enqueue(frame)
     await runner.pause()
     assert runner.state == SessionState.PAUSED
@@ -875,13 +969,16 @@ async def test_pause_cancel_and_recovery_are_boundary_safe(project, fake_model) 
     await runner.cancel()
     assert events[-1].type == "cancelled"
     assert not list(project.root.rglob("*.partial"))
+    assert not completion_events_for(range(24, 32), events)
+    assert runner.processed_frames == 8
 
-async def test_every_command_has_exactly_one_terminal_response(server) -> None:
+async def test_every_decoded_valid_command_has_exactly_one_response(server) -> None:
     await server.feed(valid_command("pause"))
     assert len(server.responses_for(COMMAND_ID)) == 1
     await server.feed(malformed_enqueue_outside_project())
     assert len(server.responses_for(BAD_ID)) == 1
     assert server.responses_for(BAD_ID)[0].payload.code == "PATH_OUTSIDE_PROJECT"
+    assert server.lifecycle_for(BAD_ID) == []
 ```
 
 - [ ] **Step 2: Run and verify missing runner/server**
@@ -892,21 +989,87 @@ Expected: FAIL importing `SessionRunner` and `WorkerServer`.
 
 - [ ] **Step 3: Implement the queue and cooperative controls**
 
-Maintain FIFO persisted-frame records, never image buffers. `pause` clears an `asyncio.Event`; check it before preprocessing, model forward, Sim3, and every atomic output. `cancel` sets a cancellation token, unblocks pause, discards the active incomplete window and its `.partial` files, resets MLX caches, emits `cancelled`, and preserves sampled frames/completed windows. `finishInput` closes enqueueing and processes a final partial window.
+Maintain a bounded FIFO of persisted-frame descriptors, never image buffers. ACK
+enqueue only after admission and before any lifecycle event for that frame.
+Increment cumulative `queuedFrames` exactly once at admission and never decrement
+it when work starts; backlog is cumulative queued minus cumulative processed.
+Configure ACK follows complete configuration validation/storage. Begin ACK follows
+manifest/checkpoint validation and exact orphan cleanup, after which enqueue may
+begin. Resume ACK releases paused work before any subsequent lifecycle output.
+`finishInput` ACK closes admission but backlog completion and `sessionCompleted`
+follow later. `pause` ACK records the request and prevents another unit from
+starting; emit `paused` only at a cooperative quiescent boundary while retaining the
+queue. `resume` ACK releases paused work before later lifecycle output. `cancel` ACK
+closes admission, unblocks pause, reaches a safe active-unit boundary, resets MLX
+caches, removes transaction orphans, and only then emits `cancelled`. Preserve
+sampled frames and committed windows.
 
-The worker never reads or writes `Manifest.json`; `SessionController` remains its sole owner. `beginSession.resumeAfterFrameIndex` is the native app's validated inclusive completed-window boundary. Reject any subsequent enqueue at or below that value, remove stale `.partial` only beneath `Predictions/` and `Points/`, validate referenced completed artifacts when they are reused, and begin with `next_frame_index = resumeAfterFrameIndex + 1` (or zero for null). `windowCompleted` carries a checkpoint candidate; only the native app commits it to the manifest. Map `MemoryError`/MLX allocation errors to `ALLOCATION_FAILED`; report it recoverably so the native supervisor can restart exactly once with 16-frame/four-overlap configuration. Map degenerate alignment to recoverable `ALIGNMENT_DEGENERATE` and invalid model/output to fatal stable codes.
+Native is the sole manifest writer. At `beginSession`, the worker reads
+`Manifest.json` read-only, validates the checkpoint/range, and resolves exact
+committed depth/confidence/geometry paths. It then accepts strictly increasing
+frames beginning at the actual replay start, including the committed boundary,
+before any new frame greater than it. Source-index gaps are legal. Replay reuses
+committed artifacts byte-for-byte, performs no writes, emits no frame/window
+lifecycle or completion events, never enters CPC, and is excluded from
+queued/processed counters. `processedFrames` is unique output committed during this
+invocation only; `windowCount` likewise counts new output windows in this
+invocation. `queuedFrames` is cumulative unique-output descriptors admitted during
+this invocation, not pending depth; require `processedFrames <= queuedFrames` and
+define backlog as their difference. `nextWindowIndex` establishes global numbering.
+The worker never derives replay arithmetically; a zero-overlap checkpoint still
+contains the committed boundary artifact as an anchor.
 
-- [ ] **Step 4: Implement the socket adapter and heartbeat**
+Before begin ACK, read the manifest-referenced path set and
+descriptor-relatively remove only exact-pattern partials and exact-pattern canonical
+finals absent from that set. Canonical names and partials are those frozen in Task 6.
+Never follow symlinks or delete unknown names. Emit `frameCompleted` only for depth,
+confidence, and geometry; emit one `windowCompleted` CPC for the unique output range.
+Only native's `PendingWindowAccumulator` validates expected unique IDs and atomically
+commits the pending artifact/window transaction.
 
-`cloudpoint-worker serve --socket PATH --project PATH --model PATH` connects within ten seconds to the app-created `AF_UNIX` listener, verifies the socket/project root and exact converted model directory, then reads framed commands on a dedicated asyncio task. The app sends `hello` first; after its ack the worker validates/loads the model, emits `modelProgress`, and emits `ready`. Serialize all writes through one lock. Start heartbeat when work begins; emit `{type:"heartbeat", payload:{busy:true, monotonicSeconds, queuedFrames, processedFrames, currentWindow}}` immediately and every five seconds, stopping only when idle/completed/cancelled/failed.
+Map `MemoryError`/MLX allocation errors to recoverable `ALLOCATION_FAILED` for the
+one clean native 16/4 retry. Map degenerate alignment to recoverable
+`ALIGNMENT_DEGENERATE` and invalid model/output to fatal stable codes.
 
-Command handling validates the project UUID, legal state, and a bounded 4,096-entry recent command-ID set before mutation, sends its sole ack/error, then emits lifecycle events. A duplicate ID receives one `DUPLICATE_COMMAND_ID` error and never repeats the mutation. `shutdown` cancels tasks, resets model/cache, closes the socket, and exits `0`; EOF follows the same cleanup. Never log JSON bodies containing paths; log command IDs, relative artifact paths, error codes, and tracebacks to stderr.
+- [ ] **Step 4: Implement the framed-stdio adapter, dispositions, and heartbeat**
+
+`cloudpoint-worker serve --project ABSOLUTE_PATH --model ABSOLUTE_PATH` verifies the
+project root and exact converted model directory, reads framed commands from stdin,
+writes framed responses/events to stdout, and sends diagnostics only to stderr. It
+creates no listener, opens no network connection, and never logs protocol JSON
+bodies. Serialize stdout through one writer. The app sends `hello` first: flush its
+ACK, emit an immediate heartbeat next, then validate/load the model, emit progress,
+and emit `ready`. Continue heartbeats at intervals no greater than five seconds
+during loading, inference, finalization, and idle; `busy` is telemetry. Run MLX and
+all model work on one dedicated serial executor so framing/control/heartbeat tasks
+remain live.
+
+Command handling validates project UUID, legal state, and a bounded 4,096-entry
+recent command-ID set before mutation, sends its sole ACK/error, then emits lifecycle
+events. A duplicate ID receives one `DUPLICATE_COMMAND_ID` error and never repeats
+the mutation. Zero/oversized/incomplete frames close without response. Invalid JSON
+or no recoverable complete command header gets at most one asynchronous protocol
+fault then close. A complete header with bad/unknown payload or type gets exactly one
+command error and keeps the transport open with state unchanged. An unsupported
+version gets one flushed command error then close.
+
+`shutdown` ACK closes admission and flushes first. If active, reach cancel
+quiescence, clean transaction orphans, emit and flush `cancelled`, then exit; if idle,
+exit directly after ACK. EOF performs the same safe cleanup without manufacturing a
+response. Log only command IDs, relative artifact paths, error codes, and tracebacks
+to stderr.
 
 - [ ] **Step 5: Test fault injection and commit**
 
 Run: `cd worker && uv run --frozen pytest tests/test_session_server.py -q`
 
-Expected: PASS for hello-before-ready, ready/progress/completion, pause/resume, pause-while-enqueueing, cancellation at each cooperative boundary, socket EOF, malformed/zero/oversize messages, duplicate IDs, exact ack/error count, five-second fake-clock heartbeats, stale partial cleanup, path traversal, native-provided resume boundaries, and proof that `Manifest.json` is unchanged.
+Expected: PASS for hello ACK/immediate-heartbeat ordering, ready/progress/completion,
+bounded enqueue ACK ordering, finish/pause/resume/cancel/shutdown semantics,
+cancellation at every cooperative boundary, stdin EOF, the full malformed-input
+disposition table, duplicate IDs, five-second fake-clock heartbeats through all
+states, exact orphan cleanup, symlink/path rejection, gapped replay checkpoints,
+replay byte identity/event suppression/counter exclusion, unique window CPC output,
+and proof that `Manifest.json` is unchanged.
 
 ```bash
 git add worker/src/cloudpoint_worker/session.py worker/src/cloudpoint_worker/server.py worker/tests/test_session_server.py
@@ -921,8 +1084,12 @@ git commit -m "feat(worker): add supervised resumable sessions"
 - Modify: `worker/src/cloudpoint_worker/model_prep/cli.py`
 
 **Interfaces:**
-- Consumes: a verified converted model directory, project directory, and ordered persisted image paths.
-- Produces: `cloudpoint-worker health`, socket `serve`, independently testable `run`, and `protocol-fixture`; `run` emits protocol-v1 JSON Lines to stdout and real project prediction/CPC files, while `protocol-fixture --output PATH` regenerates Task 1's Swift/Python compatibility corpus byte-for-byte.
+- Consumes: a verified converted model directory, an existing manifest-v2 project
+  directory, and ordered persisted image paths.
+- Produces: `cloudpoint-worker health`, framed-stdio `serve`, independently testable
+  `run`, and `protocol-fixture`; `run` emits protocol-v1 JSON Lines to stdout and
+  real project prediction/window-CPC files, while `protocol-fixture --output PATH`
+  regenerates Task 1's Swift/Python compatibility corpus byte-for-byte.
 
 - [ ] **Step 1: Write subprocess tests before the CLI**
 
@@ -956,7 +1123,16 @@ Expected: FAIL because `cloudpoint_worker.cli` is absent; the real-model case is
 
 - [ ] **Step 3: Implement stable exit codes and direct-run wiring**
 
-Use `argparse` subcommands with required absolute `--model` and `--project`. `health` validates architecture/macOS/Python/MLX, both manifests, converted SafeTensors digest, strict MLX weight loading, and prints one JSON object. `run` requires a path ending `.cloudpoint`, creates that root plus only `Frames`, `Predictions`, `Points`, and `Logs` when absent, and never creates or mutates `Manifest.json`; imports the ordered `--frames`, applies default direct/windowed configuration, passes events through the same `SessionRunner` as `serve`, and prints one compact sorted-key JSON event per line. Add `--resume-after-frame-index` with a null default for direct recovery testing.
+Use `argparse` subcommands with required absolute `--model` and `--project`.
+`health` validates architecture/macOS/Python/MLX, both model manifests, converted
+SafeTensors digest, strict MLX weight loading, and prints one canonical JSON object.
+`run` requires an existing path ending `.cloudpoint` with a valid manifest v2 and
+package directories, never creates or mutates `Manifest.json`, imports ordered
+`--frames`, applies the complete default configuration including voxel size 0.01,
+passes events through the same `SessionRunner` as `serve`, and prints one compact
+canonical JSON event per line. A direct recovery fixture supplies the full nullable
+checkpoint object plus replay frames; it never accepts a scalar/arithmetic resume
+marker.
 
 Exit codes are `0` success, `2` correctable setup/input failure, `3` protocol/unsafe-path failure, `4` engine/model/output failure, and `130` cancellation/SIGINT. SIGINT calls cooperative cancel, waits for cleanup, prints `cancelled`, and exits `130`; a second SIGINT exits immediately after closing the output stream.
 
@@ -981,7 +1157,15 @@ uv run --frozen cloudpoint-worker protocol-fixture --output tests/fixtures/proto
 git diff --exit-code -- tests/fixtures/protocol-v1.json
 ```
 
-Expected: model preparation reports the exact pinned size/SHA and strict zero-key mismatch without network access; every real parity threshold passes; the CLI emits `ready`, nine `frameStarted`/`frameCompleted` pairs, one `windowCompleted` with `frameStart=0`/`frameEnd=8`, and `sessionCompleted`; the project contains nine depth/confidence/geometry sets and one valid non-empty CPC1 chunk with inclusive header bounds 0–8. The protocol fixture has no diff, the executable resolves under `worker/.venv`, and the socket/network-denial tests prove the worker opens only its passed Unix socket and no TCP socket.
+Expected: model preparation reports the exact pinned size/SHA and strict zero-key
+mismatch without network access; every real parity threshold passes; the CLI emits
+`ready`, nine `frameStarted`/`frameCompleted` pairs without CPC paths, one
+window-owned `windowCompleted` with inference/output bounds 0–8, and
+`sessionCompleted`; the project contains nine depth/confidence/geometry sets and one
+valid non-empty CPC1 chunk with inclusive header bounds 0–8. The protocol fixture
+has no diff, the executable resolves under `worker/.venv`, and process inspection
+proves `serve` uses only its inherited framed stdio and opens no Unix/TCP listener or
+network connection.
 
 - [ ] **Step 6: Commit the independently runnable worker**
 
@@ -990,4 +1174,4 @@ git add worker/src/cloudpoint_worker/cli.py worker/src/cloudpoint_worker/model_p
 git commit -m "feat(worker): ship CLI-testable MLX reconstruction worker"
 ```
 
-The resulting subproject is independently usable without the Swift app: native URLSession or the tester supplies the pinned checkpoint, `cloudpoint-model prepare --checkpoint` re-verifies and converts it, `cloudpoint-worker health` validates the converted directory, `cloudpoint-worker run` reconstructs ordered files into project artifacts, and `cloudpoint-worker serve` exposes the identical engine through protocol version 1.
+The resulting subproject is independently usable without the Swift app: native URLSession or the tester supplies the pinned checkpoint, `cloudpoint-model prepare --checkpoint` re-verifies and converts it, `cloudpoint-worker health` validates the converted directory, `cloudpoint-worker run` reconstructs ordered files into project artifacts, and `cloudpoint-worker serve --project ABSOLUTE_PATH --model ABSOLUTE_PATH` exposes the identical engine through framed-stdio protocol version 1.

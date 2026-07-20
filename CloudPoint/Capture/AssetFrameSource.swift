@@ -179,14 +179,13 @@ actor JPEGFramePersistence: FramePersistence {
 
     func persist(_ frame: CapturedFrame) async throws -> PersistedFrame {
         try Task.checkCancellation()
-        guard frame.index >= 0,
-              frame.index <= Int(UInt32.max),
+        guard let persistedIndex = UInt32(exactly: frame.index),
               frame.presentationTimestamp.isNumeric,
               CMTimeCompare(frame.presentationTimestamp, .zero) >= 0 else {
             throw FramePersistenceError.invalidFrame
         }
 
-        let filename = String(format: "%08u.jpg", UInt32(frame.index))
+        let filename = String(format: "%08u.jpg", persistedIndex)
         let partialName = filename + ".partial"
 
         let jpeg = try makeOrientedJPEG(frame)
@@ -249,7 +248,7 @@ actor JPEGFramePersistence: FramePersistence {
         }
 
         return PersistedFrame(
-            index: frame.index,
+            index: persistedIndex,
             sourceTimestamp: frame.presentationTimestamp.seconds,
             relativePath: "Frames/\(filename)"
         )
