@@ -11,15 +11,40 @@ enum WorkerProtocolError: Error, Sendable, Equatable {
     case invalidPayload(String)
 }
 
+private extension CodingUserInfoKey {
+    static let exactJSONNumberEncoding = CodingUserInfoKey(rawValue: "cloud.point.cloud.exactJSONNumberEncoding")!
+    static let exactJSONNumberDecodingPrefix = CodingUserInfoKey(rawValue: "cloud.point.cloud.exactJSONNumberDecodingPrefix")!
+}
+
+private final class ExactJSONNumberEncodingContext: @unchecked Sendable {
+    let prefix = "__CLOUDPOINT_JSON_NUMBER_\(UUID().uuidString)__:"
+    private(set) var replacements: [(placeholder: String, token: String)] = []
+
+    func placeholder(for token: String) -> String {
+        let placeholder = "\(prefix)\(replacements.count)"
+        replacements.append((placeholder, token))
+        return placeholder
+    }
+}
+
 enum JSONNumber: Codable, Sendable, Equatable, ExpressibleByIntegerLiteral {
     case signed(Int64)
     case unsigned(UInt64)
     case decimal(Decimal)
+    case raw(String)
 
     init(integerLiteral value: Int64) { self = .signed(value) }
 
     init(from decoder: Decoder) throws {
         let container = try decoder.singleValueContainer()
+        if let prefix = decoder.userInfo[.exactJSONNumberDecodingPrefix] as? String,
+           let placeholder = try? container.decode(String.self),
+           placeholder.hasPrefix(prefix) {
+            let token = String(placeholder.dropFirst(prefix.count))
+            guard Self.isValidToken(token) else { throw WorkerProtocolError.invalidPayload("invalid JSON number") }
+            self = .raw(token)
+            return
+        }
         if let value = try? container.decode(Int64.self) { self = .signed(value) }
         else if let value = try? container.decode(UInt64.self) { self = .unsigned(value) }
         else { self = .decimal(try container.decode(Decimal.self)) }
@@ -27,23 +52,40 @@ enum JSONNumber: Codable, Sendable, Equatable, ExpressibleByIntegerLiteral {
 
     func encode(to encoder: Encoder) throws {
         var container = encoder.singleValueContainer()
+        if let context = encoder.userInfo[.exactJSONNumberEncoding] as? ExactJSONNumberEncodingContext {
+            try container.encode(context.placeholder(for: try wireToken()))
+            return
+        }
         switch self {
         case let .signed(value): try container.encode(value)
         case let .unsigned(value): try container.encode(value)
         case let .decimal(value): try container.encode(value)
+        case .raw: throw WorkerProtocolError.invalidPayload("exact JSON number requires protocol codec")
         }
     }
 
     static func == (lhs: JSONNumber, rhs: JSONNumber) -> Bool {
-        lhs.decimalValue == rhs.decimalValue
+        guard let left = try? lhs.wireToken(), let right = try? rhs.wireToken() else { return false }
+        return left == right
     }
 
-    private var decimalValue: Decimal {
+    private func wireToken() throws -> String {
+        let token: String
         switch self {
-        case let .signed(value): Decimal(string: String(value), locale: Locale(identifier: "en_US_POSIX"))!
-        case let .unsigned(value): Decimal(string: String(value), locale: Locale(identifier: "en_US_POSIX"))!
-        case let .decimal(value): value
+        case let .signed(value): token = String(value)
+        case let .unsigned(value): token = String(value)
+        case let .decimal(value): token = NSDecimalNumber(decimal: value).stringValue
+        case let .raw(value): token = value
         }
+        guard Self.isValidToken(token) else { throw WorkerProtocolError.invalidPayload("invalid JSON number") }
+        return token
+    }
+
+    private static func isValidToken(_ token: String) -> Bool {
+        token.range(
+            of: #"^-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?$"#,
+            options: .regularExpression
+        ) != nil
     }
 }
 
@@ -482,13 +524,209 @@ struct WorkerEnvelope: Codable, Sendable, Equatable {
     }
 }
 
+private struct ExactJSONNumberDecodingRewriter {
+    private static let maximumExpansionFactor = 32
+
+    private let bytes: [UInt8]
+    private let prefix: String
+    private let maximumOutputBytes: Int
+    private var index = 0
+    private var output: [UInt8] = []
+    private(set) var hasPlaceholderCollision = false
+
+    init(payload: Data, prefix: String, maximumPayloadBytes: Int) {
+        bytes = Array(payload)
+        self.prefix = prefix
+        maximumOutputBytes = maximumPayloadBytes * Self.maximumExpansionFactor
+        output.reserveCapacity(min(payload.count * 2, maximumOutputBytes))
+    }
+
+    mutating func rewrite() throws -> Data {
+        try copyWhitespace()
+        try parseValue(preserveExactNumbers: false)
+        try copyWhitespace()
+        guard index == bytes.count else { throw WorkerProtocolError.malformedEnvelope }
+        return Data(output)
+    }
+
+    private mutating func parseValue(preserveExactNumbers: Bool) throws {
+        guard let byte = current else { throw WorkerProtocolError.malformedEnvelope }
+        switch byte {
+        case 0x7B: try parseObject(preserveExactNumbers: preserveExactNumbers)
+        case 0x5B: try parseArray(preserveExactNumbers: preserveExactNumbers)
+        case 0x22:
+            let range = try parseString()
+            if preserveExactNumbers,
+               let decoded = try? JSONDecoder().decode(String.self, from: Data(bytes[range])),
+               decoded.hasPrefix(prefix) {
+                hasPlaceholderCollision = true
+            }
+        case 0x74: try copyLiteral("true")
+        case 0x66: try copyLiteral("false")
+        case 0x6E: try copyLiteral("null")
+        case 0x2D, 0x30...0x39: try parseNumber(preserveExact: preserveExactNumbers)
+        default: throw WorkerProtocolError.malformedEnvelope
+        }
+    }
+
+    private mutating func parseObject(preserveExactNumbers: Bool) throws {
+        try copyExpected(0x7B)
+        try copyWhitespace()
+        if current == 0x7D {
+            try copyExpected(0x7D)
+            return
+        }
+        while true {
+            guard current == 0x22 else { throw WorkerProtocolError.malformedEnvelope }
+            let keyRange = try parseString()
+            let key: String
+            do { key = try JSONDecoder().decode(String.self, from: Data(bytes[keyRange])) }
+            catch { throw WorkerProtocolError.malformedEnvelope }
+            try copyWhitespace()
+            try copyExpected(0x3A)
+            try copyWhitespace()
+            try parseValue(preserveExactNumbers: preserveExactNumbers || key == "details")
+            try copyWhitespace()
+            if current == 0x7D {
+                try copyExpected(0x7D)
+                return
+            }
+            try copyExpected(0x2C)
+            try copyWhitespace()
+        }
+    }
+
+    private mutating func parseArray(preserveExactNumbers: Bool) throws {
+        try copyExpected(0x5B)
+        try copyWhitespace()
+        if current == 0x5D {
+            try copyExpected(0x5D)
+            return
+        }
+        while true {
+            try parseValue(preserveExactNumbers: preserveExactNumbers)
+            try copyWhitespace()
+            if current == 0x5D {
+                try copyExpected(0x5D)
+                return
+            }
+            try copyExpected(0x2C)
+            try copyWhitespace()
+        }
+    }
+
+    private mutating func parseString() throws -> Range<Int> {
+        let start = index
+        guard current == 0x22 else { throw WorkerProtocolError.malformedEnvelope }
+        index += 1
+        while let byte = current {
+            if byte == 0x22 {
+                index += 1
+                let range = start..<index
+                try append(bytes[range])
+                return range
+            }
+            if byte == 0x5C {
+                index += 1
+                guard let escape = current else { throw WorkerProtocolError.malformedEnvelope }
+                if escape == 0x75 {
+                    index += 1
+                    guard index + 4 <= bytes.count,
+                          bytes[index..<(index + 4)].allSatisfy(Self.isHexDigit) else {
+                        throw WorkerProtocolError.malformedEnvelope
+                    }
+                    index += 4
+                    continue
+                }
+                guard [0x22, 0x5C, 0x2F, 0x62, 0x66, 0x6E, 0x72, 0x74].contains(escape) else {
+                    throw WorkerProtocolError.malformedEnvelope
+                }
+                index += 1
+                continue
+            }
+            guard byte >= 0x20 else { throw WorkerProtocolError.malformedEnvelope }
+            index += 1
+        }
+        throw WorkerProtocolError.malformedEnvelope
+    }
+
+    private mutating func parseNumber(preserveExact: Bool) throws {
+        let start = index
+        if current == 0x2D { index += 1 }
+        guard let firstDigit = current else { throw WorkerProtocolError.malformedEnvelope }
+        if firstDigit == 0x30 {
+            index += 1
+            if let next = current, Self.isDigit(next) { throw WorkerProtocolError.malformedEnvelope }
+        } else if (0x31...0x39).contains(firstDigit) {
+            index += 1
+            while let byte = current, Self.isDigit(byte) { index += 1 }
+        } else {
+            throw WorkerProtocolError.malformedEnvelope
+        }
+        if current == 0x2E {
+            index += 1
+            guard let digit = current, Self.isDigit(digit) else { throw WorkerProtocolError.malformedEnvelope }
+            while let byte = current, Self.isDigit(byte) { index += 1 }
+        }
+        if current == 0x65 || current == 0x45 {
+            index += 1
+            if current == 0x2B || current == 0x2D { index += 1 }
+            guard let digit = current, Self.isDigit(digit) else { throw WorkerProtocolError.malformedEnvelope }
+            while let byte = current, Self.isDigit(byte) { index += 1 }
+        }
+        let range = start..<index
+        if preserveExact {
+            try append([0x22])
+            try append(prefix.utf8)
+            try append(bytes[range])
+            try append([0x22])
+        } else {
+            try append(bytes[range])
+        }
+    }
+
+    private mutating func copyLiteral(_ literal: StaticString) throws {
+        let literalBytes = Array(String(describing: literal).utf8)
+        guard index + literalBytes.count <= bytes.count,
+              Array(bytes[index..<(index + literalBytes.count)]) == literalBytes else {
+            throw WorkerProtocolError.malformedEnvelope
+        }
+        index += literalBytes.count
+        try append(literalBytes)
+    }
+
+    private mutating func copyWhitespace() throws {
+        let start = index
+        while let byte = current, [0x20, 0x09, 0x0A, 0x0D].contains(byte) { index += 1 }
+        try append(bytes[start..<index])
+    }
+
+    private mutating func copyExpected(_ expected: UInt8) throws {
+        guard current == expected else { throw WorkerProtocolError.malformedEnvelope }
+        index += 1
+        try append([expected])
+    }
+
+    private mutating func append<S: Sequence>(_ newBytes: S) throws where S.Element == UInt8 {
+        let collected = Array(newBytes)
+        guard output.count + collected.count <= maximumOutputBytes else {
+            throw WorkerProtocolError.payloadTooLarge(output.count + collected.count)
+        }
+        output.append(contentsOf: collected)
+    }
+
+    private var current: UInt8? { index < bytes.count ? bytes[index] : nil }
+    private static func isDigit(_ byte: UInt8) -> Bool { (0x30...0x39).contains(byte) }
+    private static func isHexDigit(_ byte: UInt8) -> Bool {
+        isDigit(byte) || (0x41...0x46).contains(byte) || (0x61...0x66).contains(byte)
+    }
+}
+
 enum LengthPrefixedJSONCodec {
     static let maximumPayloadBytes = 1_048_576
 
     static func encode(_ envelope: WorkerEnvelope) throws -> Data {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-        let payload = try encoder.encode(envelope)
+        let payload = try encodePayload(envelope)
         guard !payload.isEmpty else { throw WorkerProtocolError.zeroLengthPayload }
         guard payload.count <= maximumPayloadBytes else { throw WorkerProtocolError.payloadTooLarge(payload.count) }
 
@@ -497,6 +735,27 @@ enum LengthPrefixedJSONCodec {
         Swift.withUnsafeBytes(of: &length) { frame.append(contentsOf: $0) }
         frame.append(payload)
         return frame
+    }
+
+    private static func encodePayload(_ envelope: WorkerEnvelope) throws -> Data {
+        while true {
+            let context = ExactJSONNumberEncodingContext()
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+            encoder.userInfo[.exactJSONNumberEncoding] = context
+            let encoded = try encoder.encode(envelope)
+            guard var json = String(data: encoded, encoding: .utf8) else {
+                throw WorkerProtocolError.malformedEnvelope
+            }
+            let occurrenceCount = json.components(separatedBy: context.prefix).count - 1
+            guard occurrenceCount == context.replacements.count else { continue }
+            for replacement in context.replacements {
+                let placeholder = "\"\(replacement.placeholder)\""
+                guard json.range(of: placeholder) != nil else { throw WorkerProtocolError.malformedEnvelope }
+                json = json.replacingOccurrences(of: placeholder, with: replacement.token)
+            }
+            return Data(json.utf8)
+        }
     }
 
     struct Decoder: Sendable {
@@ -551,7 +810,12 @@ enum LengthPrefixedJSONCodec {
 
         private mutating func decodePayload() throws -> WorkerEnvelope {
             let envelope: WorkerEnvelope
-            do { envelope = try JSONDecoder().decode(WorkerEnvelope.self, from: payload) }
+            do {
+                let rewritten = try Self.rewriteExactNumbers(in: payload, maximumPayloadBytes: maxPayloadBytes)
+                let decoder = JSONDecoder()
+                decoder.userInfo[.exactJSONNumberDecodingPrefix] = rewritten.prefix
+                envelope = try decoder.decode(WorkerEnvelope.self, from: rewritten.payload)
+            }
             catch let error as WorkerProtocolError { throw error }
             catch { throw WorkerProtocolError.malformedEnvelope }
 
@@ -565,6 +829,22 @@ enum LengthPrefixedJSONCodec {
                 }
             }
             return envelope
+        }
+
+        private static func rewriteExactNumbers(
+            in payload: Data,
+            maximumPayloadBytes: Int
+        ) throws -> (payload: Data, prefix: String) {
+            while true {
+                let prefix = "__CLOUDPOINT_JSON_NUMBER_\(UUID().uuidString)__:"
+                var rewriter = ExactJSONNumberDecodingRewriter(
+                    payload: payload,
+                    prefix: prefix,
+                    maximumPayloadBytes: maximumPayloadBytes
+                )
+                let rewritten = try rewriter.rewrite()
+                if !rewriter.hasPlaceholderCollision { return (rewritten, prefix) }
+            }
         }
 
         private mutating func resetFrame() {

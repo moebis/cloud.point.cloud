@@ -58,6 +58,41 @@ final class WorkerProcessTests: XCTestCase {
         XCTAssertEqual(exits, [23])
     }
 
+    func testCrashAfterReadyCleansInheritedOutputDescendantAndTerminatesPromptly() async throws {
+        let worker = try await startWorker(
+            mode: "crash-after-ready",
+            environment: ["CLOUDPOINT_MOCK_SPAWN_CHILD": "1"]
+        )
+        var diagnostics = worker.diagnostics().makeAsyncIterator()
+        var childPID: pid_t?
+        while let line = await diagnostics.next() {
+            if line.hasPrefix("child-pid:"), let value = Int32(line.dropFirst("child-pid:".count)) {
+                childPID = value
+                break
+            }
+        }
+        let pid = try XCTUnwrap(childPID)
+        let terminalReached = expectation(description: "terminal event arrives despite inherited stdout")
+        let collection = Task { () -> [WorkerProcessEvent] in
+            var received: [WorkerProcessEvent] = []
+            do {
+                for try await event in worker.events() { received.append(event) }
+            } catch {}
+            terminalReached.fulfill()
+            return received
+        }
+
+        await fulfillment(of: [terminalReached], timeout: 1)
+        if kill(pid, 0) == 0 { _ = kill(pid, SIGKILL) }
+        let received = await collection.value
+        let exits: [Int32] = received.compactMap {
+            if case let .processExited(status) = $0 { status } else { nil }
+        }
+        XCTAssertEqual(exits, [23])
+        XCTAssertEqual(kill(pid, 0), -1)
+        XCTAssertEqual(errno, ESRCH)
+    }
+
     func testStderrDiagnosticsNeverEnterProtocolDecoder() async throws {
         let worker = try await startWorker(mode: "heartbeat")
         var events = worker.events().makeAsyncIterator()
@@ -143,6 +178,37 @@ final class WorkerProcessTests: XCTestCase {
             if case let .processExited(status) = event { exitStatus = status }
         }
         XCTAssertEqual(exitStatus, SIGKILL)
+    }
+
+    func testTerminateBeforeThirdHeartbeatCannotBecomeUnresponsive() async throws {
+        let clock = ManualWorkerProcessClock()
+        let worker = try await startWorker(mode: "ignore-term", clock: clock)
+        var events = worker.events().makeAsyncIterator()
+        XCTAssertReady(try await nextEnvelope(from: &events))
+
+        clock.advance(); clock.advance()
+        await worker.terminate()
+        clock.advance()
+        clock.advance(interval: .seconds(2))
+
+        var exitStatus: Int32?
+        while let event = try await events.next() {
+            if case let .processExited(status) = event { exitStatus = status }
+        }
+        XCTAssertEqual(exitStatus, SIGKILL)
+    }
+
+    func testRepeatedTerminateKeepsOriginalEscalationDeadline() async throws {
+        let clock = ManualWorkerProcessClock()
+        let worker = try await startWorker(mode: "ignore-term", clock: clock)
+        var events = worker.events().makeAsyncIterator()
+        XCTAssertReady(try await nextEnvelope(from: &events))
+
+        await worker.terminate()
+        await worker.terminate()
+        XCTAssertEqual(clock.requestCount(for: .seconds(2)), 1)
+        clock.advance(interval: .seconds(2))
+        while try await events.next() != nil {}
     }
 
     func testSaturatedInputQueueDoesNotBlockTerminationAndPendingWritesClose() async throws {
@@ -343,6 +409,9 @@ private final class ManualWorkerProcessClock: WorkerProcessClock, @unchecked Sen
     }
 
     func didRequest(_ interval: Duration) -> Bool { lock.withLock { requestedIntervals.contains(interval) } }
+    func requestCount(for interval: Duration) -> Int {
+        lock.withLock { requestedIntervals.filter { $0 == interval }.count }
+    }
 }
 
 private extension Array {

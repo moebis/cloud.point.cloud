@@ -218,6 +218,8 @@ actor WorkerProcess {
     private var isRunning = false
     private var acceptsWrites = false
     private var launcherReady = false
+    private var verifiedProcessGroupID: pid_t?
+    private var terminationRequested = false
     private var stdoutEnded = false
     private var processExitStatus: Int32?
     private var terminalFailure: WorkerProcessError?
@@ -293,10 +295,7 @@ actor WorkerProcess {
 
     var processIdentifier: pid_t { process.processIdentifier }
     var processGroupIdentifier: pid_t? {
-        let pid = process.processIdentifier
-        guard pid > 0 else { return nil }
-        let group = getpgid(pid)
-        return group >= 0 ? group : nil
+        verifiedProcessGroupID
     }
 
     func send(_ envelope: WorkerEnvelope) async throws {
@@ -308,10 +307,12 @@ actor WorkerProcess {
     }
 
     func terminate() async {
-        guard isRunning, !cleanupStarted else { return }
+        guard isRunning, !cleanupStarted, !terminationRequested else { return }
+        terminationRequested = true
         acceptsWrites = false
+        heartbeatTask?.cancel()
         await writer.close()
-        signalProcessGroup(SIGTERM)
+        signalVerifiedProcessGroup(SIGTERM)
         scheduleEscalation()
     }
 
@@ -439,6 +440,7 @@ actor WorkerProcess {
                 return
             }
             launcherReady = true
+            verifiedProcessGroupID = pid
             launcherWaiter?.resume()
             launcherWaiter = nil
         } else {
@@ -453,6 +455,8 @@ actor WorkerProcess {
         processExitStatus = status
         isRunning = false
         acceptsWrites = false
+        heartbeatTask?.cancel()
+        signalVerifiedProcessGroup(SIGKILL)
         if !launcherReady {
             launcherWaiter?.resume(throwing: WorkerProcessError.launchFailed("launcher exited with status \(status)"))
             launcherWaiter = nil
@@ -472,7 +476,7 @@ actor WorkerProcess {
     }
 
     private func heartbeatTick() async {
-        guard isRunning, !cleanupStarted else { return }
+        guard isRunning, !cleanupStarted, !terminationRequested else { return }
         missedHeartbeats += 1
         if missedHeartbeats >= Self.missedHeartbeatLimit { await initiateFailure(.unresponsive) }
     }
@@ -482,12 +486,12 @@ actor WorkerProcess {
         terminalFailure = error
         acceptsWrites = false
         await writer.close()
-        signalProcessGroup(SIGKILL)
+        signalVerifiedProcessGroup(SIGKILL)
         await beginCleanupIfReady()
     }
 
     private func scheduleEscalation() {
-        escalationTask?.cancel()
+        guard escalationTask == nil else { return }
         let ticks = clock.timer(interval: .seconds(2))
         escalationTask = Task { [weak self] in
             for await _ in ticks {
@@ -500,13 +504,12 @@ actor WorkerProcess {
 
     private func escalateIfNeeded() {
         guard isRunning, !cleanupStarted else { return }
-        signalProcessGroup(SIGKILL)
+        signalVerifiedProcessGroup(SIGKILL)
     }
 
-    private func signalProcessGroup(_ signal: Int32) {
-        let pid = process.processIdentifier
-        guard pid > 0, getpgid(pid) == pid else { return }
-        _ = Darwin.kill(-pid, signal)
+    private func signalVerifiedProcessGroup(_ signal: Int32) {
+        guard let processGroupID = verifiedProcessGroupID, processGroupID > 0 else { return }
+        _ = Darwin.kill(-processGroupID, signal)
     }
 
     private func beginCleanupIfReady() async {
@@ -580,7 +583,10 @@ actor WorkerProcess {
         isRunning = false
         launcherWaiter?.resume(throwing: WorkerProcessError.launchFailed("launch aborted"))
         launcherWaiter = nil
-        if process.isRunning { signalProcessGroup(SIGKILL) }
+        if process.isRunning {
+            if verifiedProcessGroupID != nil { signalVerifiedProcessGroup(SIGKILL) }
+            else { _ = Darwin.kill(process.processIdentifier, SIGKILL) }
+        }
         await writer.close()
         standardOutput.fileHandleForReading.closeFile()
         standardError.fileHandleForReading.closeFile()
@@ -604,9 +610,8 @@ actor WorkerProcess {
         escalationTask?.cancel()
         cleanupTask?.cancel()
         if process.isRunning {
-            let pid = process.processIdentifier
-            if getpgid(pid) == pid { _ = Darwin.kill(-pid, SIGKILL) }
-            else { _ = Darwin.kill(pid, SIGKILL) }
+            if let processGroupID = verifiedProcessGroupID { _ = Darwin.kill(-processGroupID, SIGKILL) }
+            else { _ = Darwin.kill(process.processIdentifier, SIGKILL) }
         }
         standardInput.fileHandleForWriting.closeFile()
         standardOutput.fileHandleForReading.closeFile()

@@ -115,6 +115,38 @@ final class WorkerProtocolTests: XCTestCase {
         XCTAssertEqual(try roundTrip(envelope), envelope)
     }
 
+    func testJSONDetailsPreserveArbitraryPrecisionNumberTokensWithoutStringifying() throws {
+        let positive = "12345678901234567890123456789012345678901234567890"
+        let negative = "-98765432109876543210987654321098765432109876543210"
+        let decimal = "0.12345678901234567890123456789012345678901234567890"
+        let exponent = "6.02214076000000000000000000000000000000000000000000e+123"
+        let json = #"{"id":"AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA","payload":{"code":"exact","details":{"nested":{"decimal":DECIMAL,"exponent":EXPONENT,"integers":{"negative":NEGATIVE,"positive":POSITIVE}}},"message":"numbers","recoverable":false},"projectId":"11111111-1111-1111-1111-111111111111","protocolVersion":1,"type":"warning"}"#
+            .replacingOccurrences(of: "POSITIVE", with: positive)
+            .replacingOccurrences(of: "NEGATIVE", with: negative)
+            .replacingOccurrences(of: "DECIMAL", with: decimal)
+            .replacingOccurrences(of: "EXPONENT", with: exponent)
+
+        let decoded = try decodeOne(json)
+        let firstFrame = try LengthPrefixedJSONCodec.encode(decoded)
+        let secondFrame = try LengthPrefixedJSONCodec.encode(decoded)
+        let encoded = String(decoding: firstFrame.dropFirst(4), as: UTF8.self)
+
+        XCTAssertEqual(firstFrame, secondFrame)
+        for token in [positive, negative, decimal, exponent] {
+            XCTAssertTrue(encoded.contains(token), "Missing exact numeric token \(token) in \(encoded)")
+            XCTAssertFalse(encoded.contains("\"\(token)\""), "Numeric token was stringified")
+        }
+        XCTAssertEqual(try decodeOne(encoded), decoded)
+    }
+
+    func testDecoderRejectsInvalidJSONNumberGrammar() {
+        for invalid in ["+1", "01", "1.", ".1", "1e", "1e+", "--1", "NaN", "Infinity"] {
+            let json = #"{"id":"AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA","payload":{"code":"invalid","details":{"value":NUMBER},"message":"number","recoverable":false},"projectId":"11111111-1111-1111-1111-111111111111","protocolVersion":1,"type":"warning"}"#
+                .replacingOccurrences(of: "NUMBER", with: invalid)
+            XCTAssertThrowsError(try decodeOne(json), "Accepted invalid JSON number \(invalid)")
+        }
+    }
+
     func testDecoderRejectsUnknownEnvelopeAndPayloadKeys() {
         let unknownEnvelopeKey = #"{"extra":true,"id":"AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA","payload":{},"projectId":"11111111-1111-1111-1111-111111111111","protocolVersion":1,"type":"pause"}"#
         let unknownEmptyPayloadKey = #"{"id":"AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA","payload":{"extra":true},"projectId":"11111111-1111-1111-1111-111111111111","protocolVersion":1,"type":"pause"}"#
