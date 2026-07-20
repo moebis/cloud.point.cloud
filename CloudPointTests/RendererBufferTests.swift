@@ -90,6 +90,62 @@ final class RendererBufferTests: XCTestCase {
         XCTAssertEqual(renderer.cameraState, .default)
     }
 
+    func testLargeTargetCloseZoomObliqueOrbitAndSubnormalAspectRemainFinite() throws {
+        let renderer = try makeRenderer(displayLimit: 10)
+
+        renderer.zoom(by: 10_000)
+        renderer.orbit(deltaX: .pi / 0.005 / 4, deltaY: 0)
+        for _ in 0..<15 {
+            renderer.pan(deltaX: 10_000, deltaY: 10_000)
+        }
+        renderer.zoom(by: -10_000)
+        renderer.orbit(
+            deltaX: 0,
+            deltaY: asin(1 / sqrt(Float(3))) / 0.005
+        )
+
+        XCTAssertEqual(renderer.cameraState.distance, 0.05)
+        XCTAssertEqual(renderer.cameraState.target.x, -1_000_000)
+        XCTAssertEqual(renderer.cameraState.target.y, 1_000_000)
+        XCTAssertEqual(renderer.cameraState.target.z, 1_000_000)
+        XCTAssertTrue(renderer.viewProjectionMatrix(aspectRatio: 1).allFinite)
+        XCTAssertTrue(
+            renderer.viewProjectionMatrix(aspectRatio: .leastNonzeroMagnitude).allFinite
+        )
+    }
+
+    func testSpatialCompactionHandlesExtremeFiniteCoordinatesWithoutCollapsing() throws {
+        let chunk = try makeChunk(points: [
+            SIMD3<Float>(-.greatestFiniteMagnitude, 0, 0),
+            .zero,
+            SIMD3<Float>(.greatestFiniteMagnitude, 0, 0),
+        ])
+        let first = try makeRenderer(displayLimit: 2)
+        let second = try makeRenderer(displayLimit: 2)
+
+        try first.append(chunk)
+        try second.append(chunk)
+
+        XCTAssertEqual(first.displayedPointCount, 2)
+        XCTAssertEqual(first.displayedSourceIndices, second.displayedSourceIndices)
+        XCTAssertEqual(first.displayedSourceIndices, [0, 1])
+    }
+
+    func testPointCloudViewUpdateRebindsGestureRendererAndDevice() throws {
+        let firstRenderer = try makeRenderer(displayLimit: 10)
+        let replacementRenderer = try makeRenderer(displayLimit: 10)
+        let view = InteractivePointCloudView(frame: .zero, device: firstRenderer.device)
+        view.pointRenderer = firstRenderer
+        view.delegate = firstRenderer
+        view.device = nil
+
+        PointCloudView.configure(view, for: replacementRenderer)
+
+        XCTAssertTrue(view.pointRenderer === replacementRenderer)
+        XCTAssertTrue((view.delegate as AnyObject?) === replacementRenderer)
+        XCTAssertEqual(view.device?.registryID, replacementRenderer.device.registryID)
+    }
+
     private func makeRenderer(displayLimit: Int) throws -> PointCloudRenderer {
         let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
         return try PointCloudRenderer(

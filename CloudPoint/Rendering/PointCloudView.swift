@@ -7,8 +7,7 @@ struct PointCloudView: NSViewRepresentable {
 
     func makeNSView(context: Context) -> MTKView {
         let view = InteractivePointCloudView(frame: .zero, device: renderer.device)
-        view.pointRenderer = renderer
-        view.delegate = renderer
+        Self.configure(view, for: renderer)
         view.colorPixelFormat = .bgra8Unorm
         view.depthStencilPixelFormat = .depth32Float
         view.clearColor = MTLClearColor(red: 0.025, green: 0.03, blue: 0.04, alpha: 1)
@@ -19,12 +18,21 @@ struct PointCloudView: NSViewRepresentable {
     }
 
     func updateNSView(_ view: MTKView, context: Context) {
+        Self.configure(view, for: renderer)
+    }
+
+    static func configure(_ view: MTKView, for renderer: PointCloudRenderer) {
+        if view.device?.registryID != renderer.device.registryID {
+            view.delegate = nil
+            view.device = renderer.device
+        }
         view.delegate = renderer
+        (view as? InteractivePointCloudView)?.pointRenderer = renderer
     }
 }
 
 @MainActor
-private final class InteractivePointCloudView: MTKView {
+final class InteractivePointCloudView: MTKView {
     weak var pointRenderer: PointCloudRenderer?
     private var lastDragLocation: CGPoint?
 

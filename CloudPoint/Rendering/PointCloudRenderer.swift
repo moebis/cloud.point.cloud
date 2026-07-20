@@ -186,15 +186,25 @@ final class PointCloudRenderer: NSObject, MTKViewDelegate {
     }
 
     func viewProjectionMatrix(aspectRatio: Float) -> simd_float4x4 {
-        let safeAspect = aspectRatio.isFinite && aspectRatio > 0 ? aspectRatio : 1
+        let safeAspect: Float
+        if aspectRatio.isFinite, aspectRatio > 0 {
+            safeAspect = min(max(aspectRatio, 0.000_1), 10_000)
+        } else {
+            safeAspect = 1
+        }
         let cosPitch = cos(cameraState.pitch)
-        let offset = SIMD3<Float>(
-            sin(cameraState.yaw) * cosPitch,
-            sin(cameraState.pitch),
-            cos(cameraState.yaw) * cosPitch
-        ) * cameraState.distance
-        let eye = cameraState.target + offset
-        let view = Self.lookAt(eye: eye, target: cameraState.target)
+        let backward = simd_normalize(
+            SIMD3<Float>(
+                sin(cameraState.yaw) * cosPitch,
+                sin(cameraState.pitch),
+                cos(cameraState.yaw) * cosPitch
+            )
+        )
+        let view = Self.lookAt(
+            target: cameraState.target,
+            backward: backward,
+            distance: cameraState.distance
+        )
         let projection = Self.perspective(
             verticalFieldOfView: .pi / 3,
             aspectRatio: safeAspect,
@@ -330,15 +340,23 @@ final class PointCloudRenderer: NSObject, MTKViewDelegate {
         return value.truncatingRemainder(dividingBy: 2 * .pi)
     }
 
-    private static func lookAt(eye: SIMD3<Float>, target: SIMD3<Float>) -> simd_float4x4 {
-        let backward = simd_normalize(eye - target)
+    private static func lookAt(
+        target: SIMD3<Float>,
+        backward: SIMD3<Float>,
+        distance: Float
+    ) -> simd_float4x4 {
         let right = simd_normalize(simd_cross(SIMD3<Float>(0, 1, 0), backward))
         let up = simd_cross(backward, right)
         return simd_float4x4(
             SIMD4(right.x, up.x, backward.x, 0),
             SIMD4(right.y, up.y, backward.y, 0),
             SIMD4(right.z, up.z, backward.z, 0),
-            SIMD4(-simd_dot(right, eye), -simd_dot(up, eye), -simd_dot(backward, eye), 1)
+            SIMD4(
+                -simd_dot(right, target),
+                -simd_dot(up, target),
+                -simd_dot(backward, target) - distance,
+                1
+            )
         )
     }
 
@@ -379,12 +397,17 @@ private struct SpatialSelection {
 
 private enum SpatialPointCompactor {
     private struct Bounds {
-        var minimum = SIMD3<Float>(repeating: .greatestFiniteMagnitude)
-        var maximum = SIMD3<Float>(repeating: -.greatestFiniteMagnitude)
+        var minimum = SIMD3<Double>(repeating: .greatestFiniteMagnitude)
+        var maximum = SIMD3<Double>(repeating: -.greatestFiniteMagnitude)
 
         mutating func include(_ point: SIMD3<Float>) {
-            minimum = simd_min(minimum, point)
-            maximum = simd_max(maximum, point)
+            let widened = SIMD3<Double>(
+                Double(point.x),
+                Double(point.y),
+                Double(point.z)
+            )
+            minimum = simd_min(minimum, widened)
+            maximum = simd_max(maximum, widened)
         }
     }
 
@@ -426,7 +449,10 @@ private enum SpatialPointCompactor {
         }
         let extents = bounds.maximum - bounds.minimum
         let largestExtent = max(extents.x, max(extents.y, extents.z))
-        let activeThreshold = max(largestExtent * Float.ulpOfOne * 8, Float.leastNormalMagnitude)
+        let activeThreshold = max(
+            largestExtent * Double.ulpOfOne * 8,
+            Double.leastNormalMagnitude
+        )
         let activeAxes = [extents.x, extents.y, extents.z].filter { $0 > activeThreshold }.count
         var side: Int
         if activeAxes == 0 {
@@ -449,9 +475,9 @@ private enum SpatialPointCompactor {
         for (chunkIndex, chunk) in chunks.enumerated() {
             chunk.forEachVertex { pointIndex, vertex in
                 let voxel = Voxel(
-                    x: bin(vertex.position.x, minimum: bounds.minimum.x, extent: extents.x, count: bins.x),
-                    y: bin(vertex.position.y, minimum: bounds.minimum.y, extent: extents.y, count: bins.y),
-                    z: bin(vertex.position.z, minimum: bounds.minimum.z, extent: extents.z, count: bins.z)
+                    x: bin(Double(vertex.position.x), minimum: bounds.minimum.x, extent: extents.x, count: bins.x),
+                    y: bin(Double(vertex.position.y), minimum: bounds.minimum.y, extent: extents.y, count: bins.y),
+                    z: bin(Double(vertex.position.z), minimum: bounds.minimum.z, extent: extents.z, count: bins.z)
                 )
                 if representatives[voxel] == nil {
                     representatives[voxel] = PointReference(
@@ -467,9 +493,9 @@ private enum SpatialPointCompactor {
         return SpatialSelection(references: references)
     }
 
-    private static func bin(_ value: Float, minimum: Float, extent: Float, count: Int) -> Int {
+    private static func bin(_ value: Double, minimum: Double, extent: Double, count: Int) -> Int {
         guard count > 1, extent > 0 else { return 0 }
-        let normalized = Double(value - minimum) / Double(extent)
+        let normalized = (value - minimum) / extent
         return min(count - 1, max(0, Int(floor(normalized * Double(count)))))
     }
 
