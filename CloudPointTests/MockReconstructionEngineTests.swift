@@ -41,7 +41,7 @@ final class MockReconstructionEngineTests: XCTestCase {
         XCTAssertEqual(Self.float32(data, at: 36), -1.26, accuracy: 0.000_001)
         XCTAssertEqual(Self.float32(data, at: 40), 0.07, accuracy: 0.000_001)
         XCTAssertEqual(Array(data[44..<48]), [115, 167, 71, 255])
-        XCTAssertEqual(Self.littleEndianUInt16(data, at: 48), 0x3C00)
+        XCTAssertEqual(Self.littleEndianUInt16(data, at: 48), Float16(2).bitPattern)
         XCTAssertEqual(Self.littleEndianUInt16(data, at: 50), 0)
         XCTAssertEqual(Self.littleEndianUInt32(data, at: 52), 7)
     }
@@ -228,6 +228,27 @@ final class MockReconstructionEngineTests: XCTestCase {
                 atPath: package.url.appending(path: result.pointChunkPath).path
             )
         )
+    }
+
+    func testMockChunkConfidenceIsVisibleAtTheDefaultRendererThreshold() async throws {
+        let package = try TemporaryProjectPackage.make()
+        let engine = MockReconstructionEngine(clock: .immediate)
+        try await engine.prepare(configuration: .fixture())
+        try await engine.begin(project: .fixture(packageURL: package.url))
+        let events = engine.events()
+
+        try await engine.enqueue(.fixture(index: 15))
+        try await engine.finishInput()
+
+        let received = try await Self.collect(events)
+        let result = try XCTUnwrap(received.compactMap { event -> FrameResult? in
+            guard case let .frameCompleted(result) = event else { return nil }
+            return result
+        }.first)
+        let data = try Data(contentsOf: package.url.appending(path: result.pointChunkPath))
+        let confidence = Float(Float16(bitPattern: Self.littleEndianUInt16(data, at: 48)))
+
+        XCTAssertGreaterThanOrEqual(confidence, EngineConfiguration.fixture().confidenceThreshold)
     }
 
     private static func littleEndianUInt16(_ data: Data, at offset: Int) -> UInt16 {

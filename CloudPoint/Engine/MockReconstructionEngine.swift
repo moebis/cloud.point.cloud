@@ -167,7 +167,7 @@ private enum MockCPCWriter {
                 data.appendLittleEndian((Float(row) - halfDimension) * 0.04)
                 data.appendLittleEndian(z)
                 data.append(contentsOf: [color.red, color.green, color.blue, 255])
-                data.appendLittleEndian(Float16(1).bitPattern)
+                data.appendLittleEndian(Float16(2).bitPattern)
                 data.appendLittleEndian(UInt16(0))
                 data.appendLittleEndian(sourceFrame)
             }
