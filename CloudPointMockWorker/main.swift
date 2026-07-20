@@ -1,3 +1,132 @@
+import Darwin
 import Foundation
 
-print("CloudPointMockWorker")
+enum MockWorkerMode: String {
+    case normal
+    case heartbeat
+    case crashAfterReady = "crash-after-ready"
+    case silent
+}
+
+nonisolated(unsafe) private var spawnedChildPID: pid_t = -1
+
+private func terminationSignalHandler(_ signalNumber: Int32) {
+    if spawnedChildPID > 0 {
+        _ = Darwin.kill(spawnedChildPID, SIGTERM)
+        var status: Int32 = 0
+        while waitpid(spawnedChildPID, &status, 0) == -1, errno == EINTR {}
+    }
+    _exit(128 + signalNumber)
+}
+
+let arguments = CommandLine.arguments
+let modeIndex = arguments.firstIndex(of: "--mode")
+let modeName = modeIndex.flatMap { arguments.indices.contains($0 + 1) ? arguments[$0 + 1] : nil } ?? "normal"
+guard let mode = MockWorkerMode(rawValue: modeName) else {
+    FileHandle.standardError.write(Data("unknown mode: \(modeName)\n".utf8))
+    exit(64)
+}
+
+_ = setpgid(0, 0)
+Darwin.signal(SIGTERM, terminationSignalHandler)
+let projectID = UUID(uuidString: "11111111-1111-1111-1111-111111111111")!
+let outputQueue = DispatchQueue(label: "cloud.point.cloud.mock-worker.stdout")
+
+func writeEnvelope(_ envelope: WorkerEnvelope) {
+    do {
+        let frame = try LengthPrefixedJSONCodec.encode(envelope)
+        outputQueue.sync { FileHandle.standardOutput.write(frame) }
+    } catch {
+        FileHandle.standardError.write(Data("encode failed: \(error)\n".utf8))
+        exit(70)
+    }
+}
+
+FileHandle.standardError.write(Data("mode=\(mode.rawValue)\n".utf8))
+
+if ProcessInfo.processInfo.environment["CLOUDPOINT_MOCK_SPAWN_CHILD"] == "1" {
+    var pid: pid_t = 0
+    let executable = strdup("/bin/sleep")!
+    let argumentZero = strdup("sleep")!
+    let argumentOne = strdup("60")!
+    var childArguments: [UnsafeMutablePointer<CChar>?] = [argumentZero, argumentOne, nil]
+    var childEnvironment: [UnsafeMutablePointer<CChar>?] = ProcessInfo.processInfo.environment.map {
+        strdup("\($0.key)=\($0.value)")
+    }
+    childEnvironment.append(nil)
+    let spawnResult = childArguments.withUnsafeMutableBufferPointer { argumentsBuffer in
+        childEnvironment.withUnsafeMutableBufferPointer { environmentBuffer in
+            posix_spawn(&pid, executable, nil, nil, argumentsBuffer.baseAddress!, environmentBuffer.baseAddress!)
+        }
+    }
+    free(executable)
+    free(argumentZero)
+    free(argumentOne)
+    childEnvironment.dropLast().forEach { free($0) }
+    guard spawnResult == 0 else {
+        FileHandle.standardError.write(Data("child spawn failed: \(spawnResult)\n".utf8))
+        exit(71)
+    }
+    spawnedChildPID = pid
+    FileHandle.standardError.write(Data("child-pid:\(pid)\n".utf8))
+}
+
+if mode != .silent {
+    writeEnvelope(.event(.ready(
+        engineVersion: "mock-1.0",
+        modelIdentifier: "mock-depth",
+        modelRevision: "test",
+        convertedWeightsSHA256: String(repeating: "0", count: 64)
+    ), projectId: projectID))
+}
+
+if mode == .crashAfterReady { exit(23) }
+
+var heartbeatTimer: DispatchSourceTimer?
+if mode == .heartbeat {
+    func heartbeat() {
+        writeEnvelope(.event(.heartbeat(
+            busy: false,
+            monotonicSeconds: ProcessInfo.processInfo.systemUptime,
+            queuedFrames: 0,
+            processedFrames: 0,
+            currentWindow: nil
+        ), projectId: projectID))
+    }
+    heartbeat()
+    let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global())
+    timer.schedule(deadline: .now() + 5, repeating: 5)
+    timer.setEventHandler(handler: heartbeat)
+    timer.resume()
+    heartbeatTimer = timer
+}
+
+var decoder = LengthPrefixedJSONCodec.Decoder()
+while true {
+    let data = FileHandle.standardInput.availableData
+    guard !data.isEmpty else { break }
+    do {
+        for envelope in try decoder.append(data) {
+            guard let command = envelope.command else { continue }
+            let commandName: String
+            switch command {
+            case .hello: commandName = "hello"
+            case .configure: commandName = "configure"
+            case .beginSession: commandName = "beginSession"
+            case .enqueueFrame: commandName = "enqueueFrame"
+            case .finishInput: commandName = "finishInput"
+            case .pause: commandName = "pause"
+            case .resume: commandName = "resume"
+            case .cancel: commandName = "cancel"
+            case .shutdown: commandName = "shutdown"
+            }
+            writeEnvelope(.event(.ack(commandId: envelope.id, command: commandName), projectId: envelope.projectId))
+            if case .shutdown = command { exit(0) }
+        }
+    } catch {
+        FileHandle.standardError.write(Data("decode failed: \(error)\n".utf8))
+        exit(65)
+    }
+}
+
+heartbeatTimer?.cancel()
