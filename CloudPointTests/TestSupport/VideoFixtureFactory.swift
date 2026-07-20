@@ -30,9 +30,15 @@ enum VideoFixtureFactory {
         .init(red: 230, green: 230, blue: 230),
     ]
 
-    static func makeVFRMovie(in directory: URL) async throws -> VideoFixture {
-        let url = directory.appending(path: "vfr-\(UUID().uuidString).mov")
-        let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
+    static func makeVFRMovie(
+        in directory: URL,
+        fileType: AVFileType = .mov,
+        filenameExtension: String = "mov"
+    ) async throws -> VideoFixture {
+        let url = directory
+            .appending(path: "vfr-\(UUID().uuidString)")
+            .appendingPathExtension(filenameExtension)
+        let writer = try AVAssetWriter(outputURL: url, fileType: fileType)
         let input = AVAssetWriterInput(
             mediaType: .video,
             outputSettings: [

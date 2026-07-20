@@ -1,5 +1,6 @@
 import XCTest
 @testable import CloudPoint
+import UniformTypeIdentifiers
 
 @MainActor
 final class WorkspaceViewModelTests: XCTestCase {
@@ -23,5 +24,17 @@ final class WorkspaceViewModelTests: XCTestCase {
 #endif
         XCTAssertFalse(WorkspaceViewModel.shouldUseMockEngine(arguments: ["CloudPoint"]))
         XCTAssertFalse(WorkspaceViewModel.shouldUseMockEngine(arguments: ["CloudPoint", "--mock-engine-extra"]))
+    }
+
+    func testRecordingPickerAcceptsMovMp4AndM4v() throws {
+        for filenameExtension in ["mov", "mp4", "m4v"] {
+            let fileType = try XCTUnwrap(UTType(filenameExtension: filenameExtension))
+            XCTAssertTrue(
+                WorkspaceViewModel.recordingContentTypes.contains {
+                    fileType.conforms(to: $0)
+                },
+                "Expected .\(filenameExtension) to be accepted by the recording picker"
+            )
+        }
     }
 }

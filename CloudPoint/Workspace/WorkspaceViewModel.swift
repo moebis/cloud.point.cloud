@@ -6,6 +6,12 @@ import UniformTypeIdentifiers
 
 @MainActor
 final class WorkspaceViewModel: ObservableObject {
+    static let recordingContentTypes: [UTType] = [
+        .movie,
+        .quickTimeMovie,
+        .mpeg4Movie,
+    ]
+
     @Published private(set) var snapshot: WorkspaceSnapshot
     @Published private(set) var cameras: [CameraDescriptor] = []
     @Published var selectedCameraID: String?
@@ -129,7 +135,7 @@ final class WorkspaceViewModel: ObservableObject {
         let panel = NSOpenPanel()
         panel.title = "Open Recording"
         panel.prompt = "Open Recording"
-        panel.allowedContentTypes = [.movie, .quickTimeMovie, .mpeg4Movie]
+        panel.allowedContentTypes = Self.recordingContentTypes
         panel.allowsMultipleSelection = false
         panel.canChooseDirectories = false
         guard panel.runModal() == .OK, let url = panel.url else { return }

@@ -6,6 +6,30 @@ import XCTest
 @testable import CloudPoint
 
 final class AssetFrameSourceTests: XCTestCase {
+    func testMovMp4AndM4vContainersDecodeVideoFrames() async throws {
+        let containers: [(fileType: AVFileType, filenameExtension: String)] = [
+            (.mov, "mov"),
+            (.mp4, "mp4"),
+            (AVFileType(rawValue: "com.apple.m4v-video"), "m4v"),
+        ]
+
+        for container in containers {
+            let directory = try makeTemporaryDirectory()
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let fixture = try await VideoFixtureFactory.makeVFRMovie(
+                in: directory,
+                fileType: container.fileType,
+                filenameExtension: container.filenameExtension
+            )
+            let source = AssetFrameSource(assetURL: fixture.url)
+
+            let frames = try await Self.collect(source.frames(at: [.zero]))
+
+            XCTAssertEqual(frames.count, 1, "Expected .\(container.filenameExtension) to decode")
+            XCTAssertEqual(frames.first?.presentationTimestamp, .zero)
+        }
+    }
+
     func testVFRSamplingChoosesNearestUniqueFramesWithEarlierTieBreak() async throws {
         let directory = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
