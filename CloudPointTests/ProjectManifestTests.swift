@@ -42,6 +42,7 @@ final class ProjectManifestTests: XCTestCase {
         XCTAssertEqual(CloudPointDocument.readableContentTypes, [.cloudPointProject])
     }
 
+    @MainActor
     func testDocumentPackageWrapperCreatesTheRequiredDirectories() throws {
         let wrapper = try CloudPointDocument.packageWrapper(for: .fixture())
 
@@ -49,6 +50,78 @@ final class ProjectManifestTests: XCTestCase {
             Set(wrapper.fileWrappers?.keys.map { $0 } ?? []),
             ["Manifest.json", "Frames", "Predictions", "Points", "Logs"]
         )
+    }
+
+    @MainActor
+    func testDocumentSaveRetainsExistingPayloadFiles() throws {
+        let package = try TemporaryProjectPackage.make()
+        let original = ProjectManifest.fixture()
+        try original.writeAtomically(to: package.url)
+        let payloads = [
+            "Frames/existing.jpg": Data("frame".utf8),
+            "Predictions/existing.depth-f16": Data("depth".utf8),
+            "Points/window-0.cpc": Data("points".utf8),
+            "Logs/worker.log": Data("log".utf8),
+        ]
+
+        for (relativePath, contents) in payloads {
+            XCTAssertTrue(
+                FileManager.default.createFile(
+                    atPath: package.url.appending(path: relativePath).path,
+                    contents: contents
+                )
+            )
+        }
+
+        var updated = original
+        updated.frames = [PersistedFrame(index: 1, sourceTimestamp: 0.2, relativePath: "Frames/existing.jpg")]
+        let existingPackage = try FileWrapper(url: package.url, options: .immediate)
+        let wrapper = try CloudPointDocument.packageWrapper(for: updated, preserving: existingPackage)
+        try wrapper.write(
+            to: package.url,
+            options: FileWrapper.WritingOptions.atomic,
+            originalContentsURL: package.url
+        )
+
+        XCTAssertEqual(try ProjectManifest.load(from: package.url).frames, updated.frames)
+        for (relativePath, contents) in payloads {
+            XCTAssertEqual(try Data(contentsOf: package.url.appending(path: relativePath)), contents)
+        }
+    }
+
+    func testLoadRejectsAnUnsupportedFormatVersion() throws {
+        let package = try TemporaryProjectPackage.make()
+        var unsupported = ProjectManifest.fixture()
+        unsupported.formatVersion = 2
+        try ProjectManifest.encode(unsupported).write(to: package.url.appending(path: "Manifest.json"))
+
+        XCTAssertThrowsError(try ProjectManifest.load(from: package.url)) { error in
+            XCTAssertEqual(error as? ProjectManifestError, .unsupportedFormatVersion(2))
+        }
+    }
+
+    @MainActor
+    func testDocumentReadRejectsAnUnsupportedFormatVersion() throws {
+        var unsupported = ProjectManifest.fixture()
+        unsupported.formatVersion = 2
+        let packageWrapper = FileWrapper(directoryWithFileWrappers: [
+            "Manifest.json": FileWrapper(regularFileWithContents: try ProjectManifest.encode(unsupported)),
+        ])
+
+        XCTAssertThrowsError(try CloudPointDocument.loadManifest(from: packageWrapper)) { error in
+            XCTAssertEqual(error as? ProjectManifestError, .unsupportedFormatVersion(2))
+        }
+    }
+
+    func testAtomicWriteRejectsAnUnsupportedFormatVersion() throws {
+        let package = try TemporaryProjectPackage.make()
+        var unsupported = ProjectManifest.fixture()
+        unsupported.formatVersion = 2
+
+        XCTAssertThrowsError(try unsupported.writeAtomically(to: package.url)) { error in
+            XCTAssertEqual(error as? ProjectManifestError, .unsupportedFormatVersion(2))
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: package.url.appending(path: "Manifest.json").path))
     }
 
     func testApplicationExportsTheCloudPointPackageType() {

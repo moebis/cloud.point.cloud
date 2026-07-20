@@ -36,24 +36,19 @@ struct ProjectManifest: Codable, Sendable, Equatable {
     static func load(from packageURL: URL) throws -> ProjectManifest {
         try removeStalePartials(beneath: packageURL)
         let data = try Data(contentsOf: manifestURL(in: packageURL))
-        let manifest = try decode(data)
-
-        guard manifest.formatVersion == currentFormatVersion else {
-            throw ProjectManifestError.unsupportedFormatVersion(manifest.formatVersion)
-        }
-
-        return manifest
+        return try decode(data)
     }
 
     func writeAtomically(to packageURL: URL, fileManager: FileManager = .default) throws {
+        _ = try Self.validate(self)
         let manifestURL = Self.manifestURL(in: packageURL)
         let partialURL = packageURL.appending(path: "Manifest.json.partial")
         let data = try Self.encode(self)
 
         try data.write(to: partialURL, options: .atomic)
         let partialHandle = try FileHandle(forWritingTo: partialURL)
+        defer { try? partialHandle.close() }
         try partialHandle.synchronize()
-        try partialHandle.close()
 
         if fileManager.fileExists(atPath: manifestURL.path) {
             _ = try fileManager.replaceItemAt(manifestURL, withItemAt: partialURL)
@@ -72,7 +67,15 @@ struct ProjectManifest: Codable, Sendable, Equatable {
     static func decode(_ data: Data) throws -> ProjectManifest {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        return try decoder.decode(ProjectManifest.self, from: data)
+        return try validate(decoder.decode(ProjectManifest.self, from: data))
+    }
+
+    static func validate(_ manifest: ProjectManifest) throws -> ProjectManifest {
+        guard manifest.formatVersion == currentFormatVersion else {
+            throw ProjectManifestError.unsupportedFormatVersion(manifest.formatVersion)
+        }
+
+        return manifest
     }
 
     private static func manifestURL(in packageURL: URL) -> URL {

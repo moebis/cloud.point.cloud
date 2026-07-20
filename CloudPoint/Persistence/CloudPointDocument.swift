@@ -8,7 +8,8 @@ extension UTType {
     )
 }
 
-final class CloudPointDocument: ReferenceFileDocument, @unchecked Sendable {
+@MainActor
+final class CloudPointDocument: @preconcurrency ReferenceFileDocument {
     typealias Snapshot = ProjectManifest
 
     static var readableContentTypes: [UTType] {
@@ -22,11 +23,15 @@ final class CloudPointDocument: ReferenceFileDocument, @unchecked Sendable {
     }
 
     required init(configuration: ReadConfiguration) throws {
-        guard let manifestData = configuration.file.fileWrappers?["Manifest.json"]?.regularFileContents else {
+        manifest = try Self.loadManifest(from: configuration.file)
+    }
+
+    static func loadManifest(from package: FileWrapper) throws -> ProjectManifest {
+        guard let manifestData = package.fileWrappers?["Manifest.json"]?.regularFileContents else {
             throw CocoaError(.fileReadCorruptFile)
         }
 
-        manifest = try ProjectManifest.decode(manifestData)
+        return try ProjectManifest.decode(manifestData)
     }
 
     func snapshot(contentType: UTType) throws -> ProjectManifest {
@@ -37,18 +42,22 @@ final class CloudPointDocument: ReferenceFileDocument, @unchecked Sendable {
         snapshot: ProjectManifest,
         configuration: WriteConfiguration
     ) throws -> FileWrapper {
-        try Self.packageWrapper(for: snapshot)
+        try Self.packageWrapper(for: snapshot, preserving: configuration.existingFile)
     }
 
-    static func packageWrapper(for manifest: ProjectManifest) throws -> FileWrapper {
-        let manifestWrapper = FileWrapper(regularFileWithContents: try ProjectManifest.encode(manifest))
-        let packageDirectories = ["Frames", "Predictions", "Points", "Logs"].reduce(
-            into: [String: FileWrapper]()
-        ) { directories, name in
-            directories[name] = FileWrapper(directoryWithFileWrappers: [:])
+    static func packageWrapper(
+        for manifest: ProjectManifest,
+        preserving existingPackage: FileWrapper? = nil
+    ) throws -> FileWrapper {
+        var packageContents = existingPackage?.fileWrappers ?? [:]
+
+        for name in ["Frames", "Predictions", "Points", "Logs"] where packageContents[name] == nil {
+            packageContents[name] = FileWrapper(directoryWithFileWrappers: [:])
         }
-        var packageContents = packageDirectories
-        packageContents["Manifest.json"] = manifestWrapper
+
+        packageContents["Manifest.json"] = FileWrapper(
+            regularFileWithContents: try ProjectManifest.encode(manifest)
+        )
 
         return FileWrapper(directoryWithFileWrappers: packageContents)
     }
