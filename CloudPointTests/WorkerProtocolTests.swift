@@ -40,6 +40,17 @@ final class WorkerProtocolTests: XCTestCase {
         }
     }
 
+    func testOversizedHeaderRejectsBeforeAdmittingFollowingBodyBytes() {
+        var decoder = LengthPrefixedJSONCodec.Decoder(maxPayloadBytes: 16)
+        var bytes = Data([0, 0, 0, 17])
+        bytes.append(Data(repeating: 0x61, count: 3 * 1_048_576))
+
+        XCTAssertThrowsError(try decoder.append(bytes)) {
+            XCTAssertEqual($0 as? WorkerProtocolError, .payloadTooLarge(17))
+        }
+        XCTAssertLessThanOrEqual(decoder.bufferedByteCount, 4)
+    }
+
     func testCodecRejectsTruncatedFrameOnFinish() throws {
         let frame = try LengthPrefixedJSONCodec.encode(
             WorkerEnvelope.command(.pause, projectId: projectID)
@@ -87,6 +98,57 @@ final class WorkerProtocolTests: XCTestCase {
             let frame = try LengthPrefixedJSONCodec.encode(envelope)
             XCTAssertTrue(String(decoding: frame.dropFirst(4), as: UTF8.self).contains(expectedField))
         }
+    }
+
+    func testJSONDetailsRoundTripIntegersBeyondDoublePrecisionLosslessly() throws {
+        let value: UInt64 = 9_007_199_254_740_993
+        let payload = WorkerErrorPayload(
+            code: "largeInteger",
+            message: "preserve exact JSON",
+            recoverable: false,
+            details: ["nested": .object(["value": .number(.unsigned(value))])]
+        )
+        let envelope = WorkerEnvelope.event(.warning(payload), projectId: projectID)
+        let frame = try LengthPrefixedJSONCodec.encode(envelope)
+
+        XCTAssertTrue(String(decoding: frame.dropFirst(4), as: UTF8.self).contains("9007199254740993"))
+        XCTAssertEqual(try roundTrip(envelope), envelope)
+    }
+
+    func testDecoderRejectsUnknownEnvelopeAndPayloadKeys() {
+        let unknownEnvelopeKey = #"{"extra":true,"id":"AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA","payload":{},"projectId":"11111111-1111-1111-1111-111111111111","protocolVersion":1,"type":"pause"}"#
+        let unknownEmptyPayloadKey = #"{"id":"AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA","payload":{"extra":true},"projectId":"11111111-1111-1111-1111-111111111111","protocolVersion":1,"type":"pause"}"#
+        let unknownTypedPayloadKey = #"{"id":"AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA","payload":{"clientVersion":"native","extra":true,"supportedProtocolVersions":[1]},"projectId":"11111111-1111-1111-1111-111111111111","protocolVersion":1,"type":"hello"}"#
+
+        for json in [unknownEnvelopeKey, unknownEmptyPayloadKey, unknownTypedPayloadKey] {
+            XCTAssertThrowsError(try decodeOne(json)) {
+                guard case .invalidPayload? = $0 as? WorkerProtocolError else {
+                    return XCTFail("Unexpected error: \($0)")
+                }
+            }
+        }
+    }
+
+    func testDecoderRejectsMissingNullableKeys() {
+        let missingResumeIndex = #"{"id":"AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA","payload":{},"projectId":"11111111-1111-1111-1111-111111111111","protocolVersion":1,"type":"beginSession"}"#
+        let missingErrorCommandID = #"{"id":"AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA","payload":{"code":"worker","details":{},"message":"failed","recoverable":false},"projectId":"11111111-1111-1111-1111-111111111111","protocolVersion":1,"type":"error"}"#
+        let missingCurrentWindow = #"{"id":"AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA","payload":{"busy":false,"monotonicSeconds":1,"processedFrames":0,"queuedFrames":0},"projectId":"11111111-1111-1111-1111-111111111111","protocolVersion":1,"type":"heartbeat"}"#
+
+        for json in [missingResumeIndex, missingErrorCommandID, missingCurrentWindow] {
+            XCTAssertThrowsError(try decodeOne(json))
+        }
+    }
+
+    func testDuplicateCommandIDWindowEvictsOldestAfter4096Entries() throws {
+        let oldestID = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
+        var decoder = LengthPrefixedJSONCodec.Decoder()
+        _ = try decoder.append(LengthPrefixedJSONCodec.encode(.command(.pause, id: oldestID, projectId: projectID)))
+        for value in 2...4_097 {
+            let id = UUID(uuidString: String(format: "00000000-0000-0000-0000-%012X", value))!
+            _ = try decoder.append(LengthPrefixedJSONCodec.encode(.command(.pause, id: id, projectId: projectID)))
+        }
+
+        XCTAssertNoThrow(try decoder.append(LengthPrefixedJSONCodec.encode(.command(.pause, id: oldestID, projectId: projectID))))
     }
 
     func testDecoderRejectsUnknownVersionAndType() {

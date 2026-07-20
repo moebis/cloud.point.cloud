@@ -16,5 +16,7 @@
     <string>$(PRODUCT_BUNDLE_PACKAGE_TYPE)</string>
     <key>CloudPointMockWorkerExecutable</key>
     <string>$(BUILT_PRODUCTS_DIR)/CloudPointMockWorker</string>
+    <key>CloudPointWorkerLauncherExecutable</key>
+    <string>$(BUILT_PRODUCTS_DIR)/CloudPointWorkerLauncher</string>
 </dict>
 </plist>

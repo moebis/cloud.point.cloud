@@ -11,10 +11,46 @@ enum WorkerProtocolError: Error, Sendable, Equatable {
     case invalidPayload(String)
 }
 
+enum JSONNumber: Codable, Sendable, Equatable, ExpressibleByIntegerLiteral {
+    case signed(Int64)
+    case unsigned(UInt64)
+    case decimal(Decimal)
+
+    init(integerLiteral value: Int64) { self = .signed(value) }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if let value = try? container.decode(Int64.self) { self = .signed(value) }
+        else if let value = try? container.decode(UInt64.self) { self = .unsigned(value) }
+        else { self = .decimal(try container.decode(Decimal.self)) }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        switch self {
+        case let .signed(value): try container.encode(value)
+        case let .unsigned(value): try container.encode(value)
+        case let .decimal(value): try container.encode(value)
+        }
+    }
+
+    static func == (lhs: JSONNumber, rhs: JSONNumber) -> Bool {
+        lhs.decimalValue == rhs.decimalValue
+    }
+
+    private var decimalValue: Decimal {
+        switch self {
+        case let .signed(value): Decimal(string: String(value), locale: Locale(identifier: "en_US_POSIX"))!
+        case let .unsigned(value): Decimal(string: String(value), locale: Locale(identifier: "en_US_POSIX"))!
+        case let .decimal(value): value
+        }
+    }
+}
+
 enum JSONValue: Codable, Sendable, Equatable {
     case null
     case bool(Bool)
-    case number(Double)
+    case number(JSONNumber)
     case string(String)
     case array([JSONValue])
     case object([String: JSONValue])
@@ -23,7 +59,7 @@ enum JSONValue: Codable, Sendable, Equatable {
         let container = try decoder.singleValueContainer()
         if container.decodeNil() { self = .null }
         else if let value = try? container.decode(Bool.self) { self = .bool(value) }
-        else if let value = try? container.decode(Double.self) { self = .number(value) }
+        else if let value = try? container.decode(JSONNumber.self) { self = .number(value) }
         else if let value = try? container.decode(String.self) { self = .string(value) }
         else if let value = try? container.decode([JSONValue].self) { self = .array(value) }
         else if let value = try? container.decode([String: JSONValue].self) { self = .object(value) }
@@ -35,9 +71,7 @@ enum JSONValue: Codable, Sendable, Equatable {
         switch self {
         case .null: try container.encodeNil()
         case let .bool(value): try container.encode(value)
-        case let .number(value):
-            guard value.isFinite else { throw WorkerProtocolError.invalidPayload("nonfinite JSON number") }
-            try container.encode(value)
+        case let .number(value): try container.encode(value)
         case let .string(value): try container.encode(value)
         case let .array(value): try container.encode(value)
         case let .object(value): try container.encode(value)
@@ -158,6 +192,13 @@ struct WorkerEnvelope: Codable, Sendable, Equatable {
         case protocolVersion, id, projectId, type, commandId, payload
     }
 
+    private struct AnyCodingKey: CodingKey {
+        let stringValue: String
+        let intValue: Int? = nil
+        init?(stringValue: String) { self.stringValue = stringValue }
+        init?(intValue: Int) { return nil }
+    }
+
     private struct EmptyPayload: Codable, Equatable {}
     private struct HelloPayload: Codable { let clientVersion: String; let supportedProtocolVersions: [Int] }
     private struct ConfigurePayload: Codable {
@@ -236,19 +277,21 @@ struct WorkerEnvelope: Codable, Sendable, Equatable {
         id = try container.decode(UUID.self, forKey: .id)
         projectId = try container.decode(UUID.self, forKey: .projectId)
         let type = try container.decode(String.self, forKey: .type)
+        let topLevelKeys = ["protocolVersion", "id", "projectId", "type", "payload"] + (["ack", "error"].contains(type) ? ["commandId"] : [])
+        try Self.requireExactKeys(topLevelKeys, in: decoder, context: "envelope")
 
         switch type {
         case "hello":
-            let payload = try container.decode(HelloPayload.self, forKey: .payload)
+            let payload = try Self.decodePayload(HelloPayload.self, keys: ["clientVersion", "supportedProtocolVersions"], from: container)
             message = .command(.hello(clientVersion: payload.clientVersion, supportedProtocolVersions: payload.supportedProtocolVersions))
         case "configure":
-            let p = try container.decode(ConfigurePayload.self, forKey: .payload)
+            let p = try Self.decodePayload(ConfigurePayload.self, keys: ["scaleFrames", "windowSize", "windowOverlap", "keyframeInterval", "cameraRefinementIterations", "confidenceThreshold"], from: container)
             message = .command(.configure(scaleFrames: p.scaleFrames, windowSize: p.windowSize, windowOverlap: p.windowOverlap, keyframeInterval: p.keyframeInterval, cameraRefinementIterations: p.cameraRefinementIterations, confidenceThreshold: p.confidenceThreshold))
         case "beginSession":
-            let p = try container.decode(BeginSessionPayload.self, forKey: .payload)
+            let p = try Self.decodePayload(BeginSessionPayload.self, keys: ["resumeAfterFrameIndex"], from: container)
             message = .command(.beginSession(resumeAfterFrameIndex: p.resumeAfterFrameIndex))
         case "enqueueFrame":
-            let p = try container.decode(EnqueueFramePayload.self, forKey: .payload)
+            let p = try Self.decodePayload(EnqueueFramePayload.self, keys: ["frameIndex", "sourceTimestamp", "relativePath"], from: container)
             message = .command(.enqueueFrame(frameIndex: p.frameIndex, sourceTimestamp: p.sourceTimestamp, relativePath: p.relativePath))
         case "finishInput": message = try Self.decodeEmpty(.finishInput, from: container)
         case "pause": message = try Self.decodeEmpty(.pause, from: container)
@@ -256,38 +299,38 @@ struct WorkerEnvelope: Codable, Sendable, Equatable {
         case "cancel": message = try Self.decodeEmpty(.cancel, from: container)
         case "shutdown": message = try Self.decodeEmpty(.shutdown, from: container)
         case "ack":
-            let p = try container.decode(AckPayload.self, forKey: .payload)
+            let p = try Self.decodePayload(AckPayload.self, keys: ["command"], from: container)
             message = .event(.ack(commandId: try container.decode(UUID.self, forKey: .commandId), command: p.command))
         case "error":
-            let p = try container.decode(WorkerErrorPayload.self, forKey: .payload)
+            let p = try Self.decodePayload(WorkerErrorPayload.self, keys: ["code", "message", "recoverable", "details"], from: container)
             message = .event(.error(commandId: try container.decode(UUID?.self, forKey: .commandId), p))
         case "ready":
-            let p = try container.decode(ReadyPayload.self, forKey: .payload)
+            let p = try Self.decodePayload(ReadyPayload.self, keys: ["engineVersion", "modelIdentifier", "modelRevision", "convertedWeightsSHA256"], from: container)
             message = .event(.ready(engineVersion: p.engineVersion, modelIdentifier: p.modelIdentifier, modelRevision: p.modelRevision, convertedWeightsSHA256: p.convertedWeightsSHA256))
         case "modelProgress":
-            let p = try container.decode(ModelProgressPayload.self, forKey: .payload)
+            let p = try Self.decodePayload(ModelProgressPayload.self, keys: ["phase", "completed", "total"], from: container)
             message = .event(.modelProgress(phase: p.phase, completed: p.completed, total: p.total))
         case "frameStarted":
-            let p = try container.decode(FrameStartedPayload.self, forKey: .payload)
+            let p = try Self.decodePayload(FrameStartedPayload.self, keys: ["frameIndex", "windowIndex"], from: container)
             message = .event(.frameStarted(frameIndex: p.frameIndex, windowIndex: p.windowIndex))
         case "frameCompleted":
-            let p = try container.decode(FrameCompletedPayload.self, forKey: .payload)
+            let p = try Self.decodePayload(FrameCompletedPayload.self, keys: ["frameIndex", "windowIndex", "depthPath", "confidencePath", "geometryPath", "pointChunkPath", "durationSeconds"], from: container)
             message = .event(.frameCompleted(frameIndex: p.frameIndex, windowIndex: p.windowIndex, depthPath: p.depthPath, confidencePath: p.confidencePath, geometryPath: p.geometryPath, pointChunkPath: p.pointChunkPath, durationSeconds: p.durationSeconds))
         case "windowCompleted":
-            let p = try container.decode(WindowCompletedPayload.self, forKey: .payload)
+            let p = try Self.decodePayload(WindowCompletedPayload.self, keys: ["windowIndex", "frameStart", "frameEnd", "pointChunkPath", "alignmentTransform", "lastProcessedFrameIndex", "inlierCount", "durationSeconds"], from: container)
             message = .event(.windowCompleted(windowIndex: p.windowIndex, frameStart: p.frameStart, frameEnd: p.frameEnd, pointChunkPath: p.pointChunkPath, alignmentTransform: p.alignmentTransform, lastProcessedFrameIndex: p.lastProcessedFrameIndex, inlierCount: p.inlierCount, durationSeconds: p.durationSeconds))
         case "sessionCompleted":
-            let p = try container.decode(SessionCompletedPayload.self, forKey: .payload)
+            let p = try Self.decodePayload(SessionCompletedPayload.self, keys: ["processedFrames", "windowCount", "durationSeconds"], from: container)
             message = .event(.sessionCompleted(processedFrames: p.processedFrames, windowCount: p.windowCount, durationSeconds: p.durationSeconds))
         case "paused":
-            let p = try container.decode(PausedPayload.self, forKey: .payload)
+            let p = try Self.decodePayload(PausedPayload.self, keys: ["queuedFrames", "processedFrames"], from: container)
             message = .event(.paused(queuedFrames: p.queuedFrames, processedFrames: p.processedFrames))
         case "cancelled":
-            let p = try container.decode(CancelledPayload.self, forKey: .payload)
+            let p = try Self.decodePayload(CancelledPayload.self, keys: ["lastCompletedWindowIndex"], from: container)
             message = .event(.cancelled(lastCompletedWindowIndex: p.lastCompletedWindowIndex))
-        case "warning": message = .event(.warning(try container.decode(WorkerErrorPayload.self, forKey: .payload)))
+        case "warning": message = .event(.warning(try Self.decodePayload(WorkerErrorPayload.self, keys: ["code", "message", "recoverable", "details"], from: container)))
         case "heartbeat":
-            let p = try container.decode(HeartbeatPayload.self, forKey: .payload)
+            let p = try Self.decodePayload(HeartbeatPayload.self, keys: ["busy", "monotonicSeconds", "queuedFrames", "processedFrames", "currentWindow"], from: container)
             message = .event(.heartbeat(busy: p.busy, monotonicSeconds: p.monotonicSeconds, queuedFrames: p.queuedFrames, processedFrames: p.processedFrames, currentWindow: p.currentWindow))
         default: throw WorkerProtocolError.unknownMessageType(type)
         }
@@ -309,8 +352,26 @@ struct WorkerEnvelope: Codable, Sendable, Equatable {
     }
 
     private static func decodeEmpty(_ command: WorkerCommand, from container: KeyedDecodingContainer<CodingKeys>) throws -> Message {
-        _ = try container.decode(EmptyPayload.self, forKey: .payload)
+        _ = try decodePayload(EmptyPayload.self, keys: [], from: container)
         return .command(command)
+    }
+
+    private static func decodePayload<T: Decodable>(
+        _ type: T.Type,
+        keys: [String],
+        from container: KeyedDecodingContainer<CodingKeys>
+    ) throws -> T {
+        let decoder = try container.superDecoder(forKey: .payload)
+        try requireExactKeys(keys, in: decoder, context: "payload")
+        return try T(from: decoder)
+    }
+
+    private static func requireExactKeys(_ expected: [String], in decoder: Decoder, context: String) throws {
+        let container = try decoder.container(keyedBy: AnyCodingKey.self)
+        let actual = Set(container.allKeys.map(\.stringValue))
+        guard actual == Set(expected) else {
+            throw WorkerProtocolError.invalidPayload("unexpected \(context) keys")
+        }
     }
 
     private func encode(_ command: WorkerCommand, into c: inout KeyedEncodingContainer<CodingKeys>) throws {
@@ -440,48 +501,76 @@ enum LengthPrefixedJSONCodec {
 
     struct Decoder: Sendable {
         private let maxPayloadBytes: Int
-        private var buffer = Data()
+        private var header: [UInt8] = []
+        private var expectedPayloadBytes: Int?
+        private var payload = Data()
         private var recentCommandIDs: [UUID] = []
         private var recentCommandIDSet: Set<UUID> = []
+
+        var bufferedByteCount: Int { header.count + payload.count }
 
         init(maxPayloadBytes: Int = LengthPrefixedJSONCodec.maximumPayloadBytes) {
             self.maxPayloadBytes = maxPayloadBytes
         }
 
         mutating func append<S: DataProtocol>(_ bytes: S) throws -> [WorkerEnvelope] {
-            buffer.append(contentsOf: bytes)
             var envelopes: [WorkerEnvelope] = []
 
-            while buffer.count >= 4 {
-                let length = buffer.prefix(4).reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
-                guard length > 0 else { throw WorkerProtocolError.zeroLengthPayload }
-                guard length <= maxPayloadBytes else { throw WorkerProtocolError.payloadTooLarge(Int(length)) }
-                let frameLength = 4 + Int(length)
-                guard buffer.count >= frameLength else { break }
-
-                let payload = buffer.subdata(in: 4..<frameLength)
-                let envelope: WorkerEnvelope
-                do { envelope = try JSONDecoder().decode(WorkerEnvelope.self, from: payload) }
-                catch let error as WorkerProtocolError { throw error }
-                catch { throw WorkerProtocolError.malformedEnvelope }
-
-                if envelope.command != nil {
-                    guard recentCommandIDSet.insert(envelope.id).inserted else {
-                        throw WorkerProtocolError.duplicateCommandID(envelope.id)
+            for byte in bytes {
+                if expectedPayloadBytes == nil {
+                    header.append(byte)
+                    guard header.count == 4 else { continue }
+                    let length = header.reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
+                    if length == 0 {
+                        resetFrame()
+                        throw WorkerProtocolError.zeroLengthPayload
                     }
-                    recentCommandIDs.append(envelope.id)
-                    if recentCommandIDs.count > 4_096 {
-                        recentCommandIDSet.remove(recentCommandIDs.removeFirst())
+                    if length > maxPayloadBytes {
+                        resetFrame()
+                        throw WorkerProtocolError.payloadTooLarge(Int(length))
                     }
+                    expectedPayloadBytes = Int(length)
+                    payload.reserveCapacity(Int(length))
+                    continue
                 }
+
+                payload.append(byte)
+                guard payload.count == expectedPayloadBytes else { continue }
+                let envelope = try decodePayload()
                 envelopes.append(envelope)
-                buffer = Data(buffer.dropFirst(frameLength))
+                resetFrame()
             }
             return envelopes
         }
 
         func finish() throws {
-            guard buffer.isEmpty else { throw WorkerProtocolError.truncatedFrame }
+            guard header.isEmpty, expectedPayloadBytes == nil, payload.isEmpty else {
+                throw WorkerProtocolError.truncatedFrame
+            }
+        }
+
+        private mutating func decodePayload() throws -> WorkerEnvelope {
+            let envelope: WorkerEnvelope
+            do { envelope = try JSONDecoder().decode(WorkerEnvelope.self, from: payload) }
+            catch let error as WorkerProtocolError { throw error }
+            catch { throw WorkerProtocolError.malformedEnvelope }
+
+            if envelope.command != nil {
+                guard recentCommandIDSet.insert(envelope.id).inserted else {
+                    throw WorkerProtocolError.duplicateCommandID(envelope.id)
+                }
+                recentCommandIDs.append(envelope.id)
+                if recentCommandIDs.count > 4_096 {
+                    recentCommandIDSet.remove(recentCommandIDs.removeFirst())
+                }
+            }
+            return envelope
+        }
+
+        private mutating func resetFrame() {
+            header.removeAll(keepingCapacity: true)
+            expectedPayloadBytes = nil
+            payload.removeAll(keepingCapacity: true)
         }
     }
 }

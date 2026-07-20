@@ -20,6 +20,18 @@ targets:
     configFiles:
       Debug: Config/Base.xcconfig
       Release: Config/Base.xcconfig
+    dependencies:
+      - target: CloudPointWorkerLauncher
+        embed: false
+    postBuildScripts:
+      - name: Embed Worker Launcher
+        script: |
+          mkdir -p "${TARGET_BUILD_DIR}/${CONTENTS_FOLDER_PATH}/Helpers"
+          cp "${BUILT_PRODUCTS_DIR}/CloudPointWorkerLauncher" "${TARGET_BUILD_DIR}/${CONTENTS_FOLDER_PATH}/Helpers/CloudPointWorkerLauncher"
+        inputFiles:
+          - "$(BUILT_PRODUCTS_DIR)/CloudPointWorkerLauncher"
+        outputFiles:
+          - "$(TARGET_BUILD_DIR)/$(CONTENTS_FOLDER_PATH)/Helpers/CloudPointWorkerLauncher"
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: cloud.point.cloud.CloudPoint
@@ -40,6 +52,7 @@ targets:
     dependencies:
       - target: CloudPoint
       - target: CloudPointMockWorker
+      - target: CloudPointWorkerLauncher
     configFiles:
       Debug: Config/Base.xcconfig
       Release: Config/Base.xcconfig
@@ -68,6 +81,21 @@ targets:
         SWIFT_VERSION: "6.0"
         SWIFT_STRICT_CONCURRENCY: complete
 
+  CloudPointWorkerLauncher:
+    type: tool
+    platform: macOS
+    sources:
+      - path: CloudPointWorkerLauncher
+    configFiles:
+      Debug: Config/Base.xcconfig
+      Release: Config/Base.xcconfig
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: cloud.point.cloud.CloudPointWorkerLauncher
+        MACOSX_DEPLOYMENT_TARGET: "15.0"
+        SWIFT_VERSION: "6.0"
+        SWIFT_STRICT_CONCURRENCY: complete
+
 schemes:
   CloudPoint:
     build:
@@ -87,3 +115,7 @@ schemes:
     build:
       targets:
         CloudPointMockWorker: all
+  CloudPointWorkerLauncher:
+    build:
+      targets:
+        CloudPointWorkerLauncher: all

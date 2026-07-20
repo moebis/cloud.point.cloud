@@ -5,6 +5,8 @@ enum WorkerProcessError: Error, Sendable, Equatable {
     case executableNotFound(String)
     case launchFailed(String)
     case notRunning
+    case inputQueueFull
+    case eventBufferOverflow
     case unresponsive
     case protocolFailure(WorkerProtocolError)
 }
@@ -38,173 +40,425 @@ struct ContinuousWorkerProcessClock: WorkerProcessClock {
 
 private actor WorkerFrameDecoder {
     private var decoder = LengthPrefixedJSONCodec.Decoder()
+    func append(_ data: Data) throws -> [WorkerEnvelope] { try decoder.append(data) }
+    func finish() throws { try decoder.finish() }
+}
 
-    func append(_ data: Data) throws -> [WorkerEnvelope] {
-        try decoder.append(data)
+private actor BoundedWorkerInputWriter {
+    private struct Write: @unchecked Sendable {
+        let data: Data
+        let continuation: CheckedContinuation<Void, Error>
     }
 
-    func finish() throws {
-        try decoder.finish()
+    private let handle: FileHandle
+    private let cancellationReadHandle: FileHandle
+    private let cancellationWriteHandle: FileHandle
+    private let maximumQueuedBytes: Int
+    private var queue: [Write] = []
+    private var queuedBytes = 0
+    private var consumer: CheckedContinuation<Write?, Never>?
+    private var terminalError: WorkerProcessError?
+    private var task: Task<Void, Never>?
+
+    init(handle: FileHandle, maximumQueuedBytes: Int) throws {
+        self.handle = handle
+        self.maximumQueuedBytes = maximumQueuedBytes
+        var cancellationDescriptors: [Int32] = [0, 0]
+        guard Darwin.pipe(&cancellationDescriptors) == 0 else {
+            throw WorkerProcessError.launchFailed(String(cString: strerror(errno)))
+        }
+        cancellationReadHandle = FileHandle(fileDescriptor: cancellationDescriptors[0], closeOnDealloc: true)
+        cancellationWriteHandle = FileHandle(fileDescriptor: cancellationDescriptors[1], closeOnDealloc: true)
+        guard fcntl(handle.fileDescriptor, F_SETNOSIGPIPE, 1) == 0,
+              Self.setNonBlocking(handle.fileDescriptor),
+              Self.setNonBlocking(cancellationReadHandle.fileDescriptor),
+              Self.setNonBlocking(cancellationWriteHandle.fileDescriptor) else {
+            throw WorkerProcessError.launchFailed(String(cString: strerror(errno)))
+        }
+    }
+
+    func start() {
+        guard task == nil else { return }
+        let cancellationDescriptor = cancellationReadHandle.fileDescriptor
+        task = Task.detached(priority: .userInitiated) { [weak self, handle, cancellationDescriptor] in
+            defer { handle.closeFile() }
+            while let write = await self?.next() {
+                do {
+                    try Self.writeAll(
+                        write.data,
+                        to: handle.fileDescriptor,
+                        cancellationDescriptor: cancellationDescriptor
+                    )
+                    write.continuation.resume()
+                } catch {
+                    write.continuation.resume(throwing: WorkerProcessError.notRunning)
+                    await self?.close(with: .notRunning)
+                    return
+                }
+            }
+        }
+    }
+
+    func enqueue(_ data: Data) async throws {
+        if let terminalError { throw terminalError }
+        guard data.count <= maximumQueuedBytes, queuedBytes + data.count <= maximumQueuedBytes else {
+            throw WorkerProcessError.inputQueueFull
+        }
+        try await withCheckedThrowingContinuation { continuation in
+            let write = Write(data: data, continuation: continuation)
+            if let consumer {
+                self.consumer = nil
+                consumer.resume(returning: write)
+            } else {
+                queue.append(write)
+                queuedBytes += data.count
+            }
+        }
+    }
+
+    func close(with error: WorkerProcessError = .notRunning) {
+        guard terminalError == nil else { return }
+        terminalError = error
+        let pending = queue
+        queue.removeAll()
+        queuedBytes = 0
+        pending.forEach { $0.continuation.resume(throwing: error) }
+        consumer?.resume(returning: nil)
+        consumer = nil
+        var byte: UInt8 = 1
+        _ = Darwin.write(cancellationWriteHandle.fileDescriptor, &byte, 1)
+    }
+
+    func join() async {
+        task?.cancel()
+        _ = await task?.value
+        task = nil
+        handle.closeFile()
+        cancellationReadHandle.closeFile()
+        cancellationWriteHandle.closeFile()
+    }
+
+    private func next() async -> Write? {
+        if !queue.isEmpty {
+            let next = queue.removeFirst()
+            queuedBytes -= next.data.count
+            return next
+        }
+        if terminalError != nil { return nil }
+        return await withCheckedContinuation { consumer = $0 }
+    }
+
+    private nonisolated static func setNonBlocking(_ descriptor: Int32) -> Bool {
+        let flags = fcntl(descriptor, F_GETFL)
+        return flags >= 0 && fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) == 0
+    }
+
+    private nonisolated static func writeAll(
+        _ data: Data,
+        to descriptor: Int32,
+        cancellationDescriptor: Int32
+    ) throws {
+        try data.withUnsafeBytes { rawBuffer in
+            guard let baseAddress = rawBuffer.baseAddress else { return }
+            var offset = 0
+            while offset < rawBuffer.count {
+                var descriptors = [
+                    pollfd(fd: descriptor, events: Int16(POLLOUT), revents: 0),
+                    pollfd(fd: cancellationDescriptor, events: Int16(POLLIN), revents: 0),
+                ]
+                let pollResult = Darwin.poll(&descriptors, nfds_t(descriptors.count), -1)
+                if pollResult < 0 {
+                    if errno == EINTR { continue }
+                    throw WorkerProcessError.notRunning
+                }
+                if descriptors[1].revents != 0 { throw WorkerProcessError.notRunning }
+                guard descriptors[0].revents & Int16(POLLOUT) != 0 else {
+                    throw WorkerProcessError.notRunning
+                }
+                let written = Darwin.write(descriptor, baseAddress.advanced(by: offset), rawBuffer.count - offset)
+                if written > 0 {
+                    offset += written
+                } else if written < 0, errno == EINTR || errno == EAGAIN {
+                    continue
+                } else {
+                    throw WorkerProcessError.notRunning
+                }
+            }
+        }
     }
 }
 
 actor WorkerProcess {
     static let heartbeatInterval: Duration = .seconds(5)
     static let missedHeartbeatLimit = 3
+    static let maximumPendingInputBytes = 2 * 1_048_576
+    static let maximumDiagnosticChunkBytes = 4_096
 
     nonisolated private let eventStream: AsyncThrowingStream<WorkerProcessEvent, Error>
     nonisolated private let diagnosticStream: AsyncStream<String>
     private let eventContinuation: AsyncThrowingStream<WorkerProcessEvent, Error>.Continuation
     private let diagnosticContinuation: AsyncStream<String>.Continuation
-    private let process: Process
-    private let standardInput: Pipe
-    private let standardOutput: Pipe
-    private let standardError: Pipe
+    private let process = Process()
+    private let standardInput = Pipe()
+    private let standardOutput = Pipe()
+    private let standardError = Pipe()
     private let decoder = WorkerFrameDecoder()
     private let clock: any WorkerProcessClock
+    private let writer: BoundedWorkerInputWriter
+
+    private var stdoutTask: Task<Void, Never>?
+    private var stderrTask: Task<Void, Never>?
     private var heartbeatTask: Task<Void, Never>?
     private var escalationTask: Task<Void, Never>?
+    private var cleanupTask: Task<Void, Never>?
+    private var launcherWaiter: CheckedContinuation<Void, Error>?
+    private var terminalWaiters: [CheckedContinuation<Int32, Error>] = []
+    private var terminalResult: Result<Int32, WorkerProcessError>?
     private var diagnosticBuffer = Data()
     private var isRunning = false
+    private var acceptsWrites = false
+    private var launcherReady = false
+    private var stdoutEnded = false
+    private var processExitStatus: Int32?
+    private var terminalFailure: WorkerProcessError?
+    private var cleanupStarted = false
     private var didEmitTerminal = false
     private var missedHeartbeats = 0
-    private var processGroupID: pid_t?
 
-    private init(clock: any WorkerProcessClock) {
-        let events = AsyncThrowingStream.makeStream(of: WorkerProcessEvent.self)
+    private init(clock: any WorkerProcessClock) throws {
+        let events = AsyncThrowingStream.makeStream(
+            of: WorkerProcessEvent.self,
+            bufferingPolicy: .bufferingOldest(256)
+        )
         eventStream = events.stream
         eventContinuation = events.continuation
-        let diagnostics = AsyncStream.makeStream(of: String.self)
+        let diagnostics = AsyncStream.makeStream(
+            of: String.self,
+            bufferingPolicy: .bufferingOldest(128)
+        )
         diagnosticStream = diagnostics.stream
         diagnosticContinuation = diagnostics.continuation
-        process = Process()
-        standardInput = Pipe()
-        standardOutput = Pipe()
-        standardError = Pipe()
         self.clock = clock
+        writer = try BoundedWorkerInputWriter(
+            handle: standardInput.fileHandleForWriting,
+            maximumQueuedBytes: Self.maximumPendingInputBytes
+        )
     }
 
     static func start(
         executable: URL,
         arguments: [String] = [],
         environment: [String: String] = [:],
+        launcherExecutable: URL? = nil,
         clock: any WorkerProcessClock = ContinuousWorkerProcessClock()
     ) async throws -> WorkerProcess {
+        try validateExecutable(executable)
+        let resolvedLauncher = try launcherExecutable ?? bundledLauncherExecutable()
+        try validateExecutable(resolvedLauncher)
+        let worker = try WorkerProcess(clock: clock)
+        do {
+            try await worker.launch(
+                executable: executable,
+                arguments: arguments,
+                environment: environment,
+                launcherExecutable: resolvedLauncher
+            )
+            try await worker.waitForLauncher()
+            return worker
+        } catch {
+            await worker.abortLaunch()
+            throw error
+        }
+    }
+
+    private static func validateExecutable(_ executable: URL) throws {
         guard executable.isFileURL,
               executable.path.hasPrefix("/"),
               FileManager.default.isExecutableFile(atPath: executable.path) else {
             throw WorkerProcessError.executableNotFound(executable.path)
         }
-        let worker = WorkerProcess(clock: clock)
-        try await worker.launch(executable: executable, arguments: arguments, environment: environment)
-        return worker
+    }
+
+    private static func bundledLauncherExecutable() throws -> URL {
+        let executable = Bundle.main.bundleURL
+            .appendingPathComponent("Contents/Helpers/CloudPointWorkerLauncher", isDirectory: false)
+        guard FileManager.default.isExecutableFile(atPath: executable.path) else {
+            throw WorkerProcessError.executableNotFound("CloudPointWorkerLauncher")
+        }
+        return executable
     }
 
     nonisolated func events() -> AsyncThrowingStream<WorkerProcessEvent, Error> { eventStream }
     nonisolated func diagnostics() -> AsyncStream<String> { diagnosticStream }
 
-    func send(_ envelope: WorkerEnvelope) throws {
-        guard isRunning, process.isRunning else { throw WorkerProcessError.notRunning }
-        do {
-            try standardInput.fileHandleForWriting.write(contentsOf: LengthPrefixedJSONCodec.encode(envelope))
-        } catch let error as WorkerProtocolError {
-            throw WorkerProcessError.protocolFailure(error)
-        } catch {
-            throw WorkerProcessError.notRunning
-        }
+    var processIdentifier: pid_t { process.processIdentifier }
+    var processGroupIdentifier: pid_t? {
+        let pid = process.processIdentifier
+        guard pid > 0 else { return nil }
+        let group = getpgid(pid)
+        return group >= 0 ? group : nil
     }
 
-    func terminate() {
-        guard isRunning else { return }
+    func send(_ envelope: WorkerEnvelope) async throws {
+        guard acceptsWrites, isRunning, process.isRunning else { throw WorkerProcessError.notRunning }
+        let frame: Data
+        do { frame = try LengthPrefixedJSONCodec.encode(envelope) }
+        catch let error as WorkerProtocolError { throw WorkerProcessError.protocolFailure(error) }
+        try await writer.enqueue(frame)
+    }
+
+    func terminate() async {
+        guard isRunning, !cleanupStarted else { return }
+        acceptsWrites = false
+        await writer.close()
         signalProcessGroup(SIGTERM)
         scheduleEscalation()
     }
 
-    func shutdown() {
-        terminate()
+    func shutdown() async { await terminate() }
+
+    func waitForTermination() async throws -> Int32 {
+        if let terminalResult { return try terminalResult.get() }
+        return try await withCheckedThrowingContinuation { terminalWaiters.append($0) }
     }
 
-    private func launch(executable: URL, arguments: [String], environment: [String: String]) throws {
-        process.executableURL = executable
-        process.arguments = arguments
+    private func launch(
+        executable: URL,
+        arguments: [String],
+        environment: [String: String],
+        launcherExecutable: URL
+    ) async throws {
+        process.executableURL = launcherExecutable
+        process.arguments = [executable.path] + arguments
         process.environment = ProcessInfo.processInfo.environment.merging(environment) { _, supplied in supplied }
         process.standardInput = standardInput
         process.standardOutput = standardOutput
         process.standardError = standardError
-
-        standardOutput.fileHandleForReading.readabilityHandler = { [weak self] handle in
-            let data = handle.availableData
-            Task { await self?.receiveStandardOutput(data) }
-        }
-        standardError.fileHandleForReading.readabilityHandler = { [weak self] handle in
-            let data = handle.availableData
-            Task { await self?.receiveStandardError(data) }
-        }
         process.terminationHandler = { [weak self] process in
             let status = process.terminationStatus
             Task { await self?.processTerminated(status: status) }
         }
 
-        do {
-            try process.run()
-        } catch {
-            closeResources()
-            throw WorkerProcessError.launchFailed(error.localizedDescription)
-        }
+        do { try process.run() }
+        catch { throw WorkerProcessError.launchFailed(error.localizedDescription) }
+
         isRunning = true
-        let pid = process.processIdentifier
-        if setpgid(pid, pid) == 0 || getpgid(pid) == pid { processGroupID = pid }
+        acceptsWrites = true
         standardInput.fileHandleForReading.closeFile()
         standardOutput.fileHandleForWriting.closeFile()
         standardError.fileHandleForWriting.closeFile()
+        await writer.start()
+        startReaders()
         startHeartbeatSupervision()
     }
 
+    private func startReaders() {
+        let stdout = standardOutput.fileHandleForReading
+        stdoutTask = Task.detached(priority: .userInitiated) { [weak self, stdout] in
+            while !Task.isCancelled {
+                let data = stdout.availableData
+                if data.isEmpty {
+                    await self?.stdoutDidEnd()
+                    return
+                }
+                await self?.receiveStandardOutput(data)
+            }
+        }
+        let stderr = standardError.fileHandleForReading
+        stderrTask = Task.detached(priority: .utility) { [weak self, stderr] in
+            while !Task.isCancelled {
+                let data = stderr.availableData
+                if data.isEmpty {
+                    await self?.stderrDidEnd()
+                    return
+                }
+                await self?.receiveStandardError(data)
+            }
+        }
+    }
+
+    private func waitForLauncher() async throws {
+        if launcherReady { return }
+        if let processExitStatus { throw WorkerProcessError.launchFailed("launcher exited with status \(processExitStatus)") }
+        try await withCheckedThrowingContinuation { launcherWaiter = $0 }
+    }
+
     private func receiveStandardOutput(_ data: Data) async {
-        guard !didEmitTerminal else { return }
-        guard !data.isEmpty else { return }
+        guard !cleanupStarted else { return }
         do {
             for envelope in try await decoder.append(data) {
                 if case .heartbeat? = envelope.event { missedHeartbeats = 0 }
-                eventContinuation.yield(.envelope(envelope))
+                switch eventContinuation.yield(.envelope(envelope)) {
+                case .enqueued: break
+                case .dropped, .terminated: await initiateFailure(.eventBufferOverflow)
+                @unknown default: await initiateFailure(.eventBufferOverflow)
+                }
             }
         } catch let error as WorkerProtocolError {
-            fail(.protocolFailure(error))
+            await initiateFailure(.protocolFailure(error))
         } catch {
-            fail(.protocolFailure(.malformedEnvelope))
+            await initiateFailure(.protocolFailure(.malformedEnvelope))
         }
     }
 
-    private func receiveStandardError(_ data: Data) {
-        guard !didEmitTerminal else { return }
-        guard !data.isEmpty else { return }
-        diagnosticBuffer.append(data)
-        while let newline = diagnosticBuffer.firstIndex(of: 0x0A) {
-            let lineData = diagnosticBuffer[..<newline]
-            diagnosticContinuation.yield(String(decoding: lineData, as: UTF8.self))
-            diagnosticBuffer = Data(diagnosticBuffer[diagnosticBuffer.index(after: newline)...])
-        }
-    }
-
-    private func processTerminated(status: Int32) async {
-        guard !didEmitTerminal else { return }
+    private func stdoutDidEnd() async {
+        guard !stdoutEnded else { return }
         do { try await decoder.finish() }
         catch let error as WorkerProtocolError {
-            fail(.protocolFailure(error))
-            return
-        } catch {
-            fail(.protocolFailure(.malformedEnvelope))
-            return
+            if terminalFailure == nil { terminalFailure = .protocolFailure(error) }
         }
+        catch {
+            if terminalFailure == nil { terminalFailure = .protocolFailure(.malformedEnvelope) }
+        }
+        stdoutEnded = true
+        await beginCleanupIfReady()
+    }
 
-        didEmitTerminal = true
+    private func receiveStandardError(_ data: Data) async {
+        for byte in data {
+            if byte == 0x0A {
+                await emitDiagnosticBuffer()
+            } else {
+                diagnosticBuffer.append(byte)
+                if diagnosticBuffer.count == Self.maximumDiagnosticChunkBytes {
+                    await emitDiagnosticBuffer()
+                }
+            }
+        }
+    }
+
+    private func emitDiagnosticBuffer() async {
+        guard !diagnosticBuffer.isEmpty else { return }
+        let line = String(decoding: diagnosticBuffer, as: UTF8.self)
+        diagnosticBuffer.removeAll(keepingCapacity: true)
+        if line.hasPrefix("CLOUDPOINT_LAUNCHER_READY:") {
+            guard let pid = pid_t(line.dropFirst("CLOUDPOINT_LAUNCHER_READY:".count)),
+                  pid == process.processIdentifier,
+                  getpgid(pid) == pid else {
+                await initiateFailure(.launchFailed("launcher did not establish the worker process group"))
+                return
+            }
+            launcherReady = true
+            launcherWaiter?.resume()
+            launcherWaiter = nil
+        } else {
+            _ = diagnosticContinuation.yield(line)
+        }
+    }
+
+    private func stderrDidEnd() async { await emitDiagnosticBuffer() }
+
+    private func processTerminated(status: Int32) async {
+        guard processExitStatus == nil else { return }
+        processExitStatus = status
         isRunning = false
-        cancelTasks()
-        flushDiagnostics()
-        closeResources()
-        eventContinuation.yield(.processExited(status: status))
-        eventContinuation.finish()
-        diagnosticContinuation.finish()
+        acceptsWrites = false
+        if !launcherReady {
+            launcherWaiter?.resume(throwing: WorkerProcessError.launchFailed("launcher exited with status \(status)"))
+            launcherWaiter = nil
+        }
+        await writer.close()
+        await beginCleanupIfReady()
     }
 
     private func startHeartbeatSupervision() {
@@ -217,75 +471,143 @@ actor WorkerProcess {
         }
     }
 
-    private func heartbeatTick() {
-        guard isRunning, !didEmitTerminal else { return }
+    private func heartbeatTick() async {
+        guard isRunning, !cleanupStarted else { return }
         missedHeartbeats += 1
-        if missedHeartbeats >= Self.missedHeartbeatLimit { fail(.unresponsive) }
+        if missedHeartbeats >= Self.missedHeartbeatLimit { await initiateFailure(.unresponsive) }
     }
 
-    private func fail(_ error: WorkerProcessError) {
-        guard !didEmitTerminal else { return }
-        didEmitTerminal = true
-        isRunning = false
-        cancelTasks()
+    private func initiateFailure(_ error: WorkerProcessError) async {
+        guard terminalFailure == nil, !cleanupStarted else { return }
+        terminalFailure = error
+        acceptsWrites = false
+        await writer.close()
         signalProcessGroup(SIGKILL)
-        flushDiagnostics()
-        closeResources()
-        eventContinuation.finish(throwing: error)
-        diagnosticContinuation.finish()
+        await beginCleanupIfReady()
     }
 
     private func scheduleEscalation() {
         escalationTask?.cancel()
+        let ticks = clock.timer(interval: .seconds(2))
         escalationTask = Task { [weak self] in
-            do { try await ContinuousClock().sleep(for: .seconds(2)) } catch { return }
-            guard !Task.isCancelled else { return }
-            await self?.escalateIfNeeded()
+            for await _ in ticks {
+                guard !Task.isCancelled else { return }
+                await self?.escalateIfNeeded()
+                return
+            }
         }
     }
 
     private func escalateIfNeeded() {
-        guard isRunning, !didEmitTerminal else { return }
+        guard isRunning, !cleanupStarted else { return }
         signalProcessGroup(SIGKILL)
     }
 
     private func signalProcessGroup(_ signal: Int32) {
-        if let processGroupID { _ = Darwin.kill(-processGroupID, signal) }
-        else if process.isRunning { _ = Darwin.kill(process.processIdentifier, signal) }
+        let pid = process.processIdentifier
+        guard pid > 0, getpgid(pid) == pid else { return }
+        _ = Darwin.kill(-pid, signal)
     }
 
-    private func cancelTasks() {
+    private func beginCleanupIfReady() async {
+        guard processExitStatus != nil, stdoutEnded, !cleanupStarted else { return }
+        cleanupStarted = true
         heartbeatTask?.cancel()
-        heartbeatTask = nil
         escalationTask?.cancel()
-        escalationTask = nil
-    }
-
-    private func flushDiagnostics() {
-        if !diagnosticBuffer.isEmpty {
-            diagnosticContinuation.yield(String(decoding: diagnosticBuffer, as: UTF8.self))
-            diagnosticBuffer.removeAll()
+        await writer.close()
+        standardOutput.fileHandleForReading.closeFile()
+        standardError.fileHandleForReading.closeFile()
+        stdoutTask?.cancel()
+        stderrTask?.cancel()
+        let stdoutTask = self.stdoutTask
+        let stderrTask = self.stderrTask
+        let heartbeatTask = self.heartbeatTask
+        let escalationTask = self.escalationTask
+        cleanupTask = Task { [weak self] in
+            _ = await stdoutTask?.value
+            _ = await stderrTask?.value
+            _ = await heartbeatTask?.value
+            _ = await escalationTask?.value
+            await self?.writer.join()
+            await self?.completeTerminal()
         }
     }
 
-    private func closeResources() {
-        standardOutput.fileHandleForReading.readabilityHandler = nil
-        standardError.fileHandleForReading.readabilityHandler = nil
-        standardInput.fileHandleForWriting.closeFile()
+    private func completeTerminal() {
+        guard !didEmitTerminal else { return }
+        didEmitTerminal = true
+        process.terminationHandler = nil
+        stdoutTask = nil
+        stderrTask = nil
+        heartbeatTask = nil
+        escalationTask = nil
+        cleanupTask = nil
+        if !diagnosticBuffer.isEmpty {
+            _ = diagnosticContinuation.yield(String(decoding: diagnosticBuffer, as: UTF8.self))
+        }
+        diagnosticBuffer.removeAll()
+        diagnosticContinuation.finish()
+        if let terminalFailure {
+            terminalResult = .failure(terminalFailure)
+            terminalWaiters.forEach { $0.resume(throwing: terminalFailure) }
+            terminalWaiters.removeAll()
+            eventContinuation.finish(throwing: terminalFailure)
+        }
+        else {
+            let status = processExitStatus ?? -1
+            switch eventContinuation.yield(.processExited(status: status)) {
+            case .enqueued:
+                terminalResult = .success(status)
+                terminalWaiters.forEach { $0.resume(returning: status) }
+                terminalWaiters.removeAll()
+                eventContinuation.finish()
+            case .dropped, .terminated:
+                terminalResult = .failure(.eventBufferOverflow)
+                terminalWaiters.forEach { $0.resume(throwing: WorkerProcessError.eventBufferOverflow) }
+                terminalWaiters.removeAll()
+                eventContinuation.finish(throwing: WorkerProcessError.eventBufferOverflow)
+            @unknown default:
+                terminalResult = .failure(.eventBufferOverflow)
+                terminalWaiters.forEach { $0.resume(throwing: WorkerProcessError.eventBufferOverflow) }
+                terminalWaiters.removeAll()
+                eventContinuation.finish(throwing: WorkerProcessError.eventBufferOverflow)
+            }
+        }
+    }
+
+    private func abortLaunch() async {
+        acceptsWrites = false
+        isRunning = false
+        launcherWaiter?.resume(throwing: WorkerProcessError.launchFailed("launch aborted"))
+        launcherWaiter = nil
+        if process.isRunning { signalProcessGroup(SIGKILL) }
+        await writer.close()
         standardOutput.fileHandleForReading.closeFile()
         standardError.fileHandleForReading.closeFile()
-        process.terminationHandler = nil
+        stdoutTask?.cancel()
+        stderrTask?.cancel()
+        heartbeatTask?.cancel()
+        escalationTask?.cancel()
+        _ = await stdoutTask?.value
+        _ = await stderrTask?.value
+        _ = await heartbeatTask?.value
+        _ = await escalationTask?.value
+        await writer.join()
+        eventContinuation.finish()
+        diagnosticContinuation.finish()
     }
 
     deinit {
+        stdoutTask?.cancel()
+        stderrTask?.cancel()
         heartbeatTask?.cancel()
         escalationTask?.cancel()
+        cleanupTask?.cancel()
         if process.isRunning {
-            if let processGroupID { _ = Darwin.kill(-processGroupID, SIGKILL) }
-            else { _ = Darwin.kill(process.processIdentifier, SIGKILL) }
+            let pid = process.processIdentifier
+            if getpgid(pid) == pid { _ = Darwin.kill(-pid, SIGKILL) }
+            else { _ = Darwin.kill(pid, SIGKILL) }
         }
-        standardOutput.fileHandleForReading.readabilityHandler = nil
-        standardError.fileHandleForReading.readabilityHandler = nil
         standardInput.fileHandleForWriting.closeFile()
         standardOutput.fileHandleForReading.closeFile()
         standardError.fileHandleForReading.closeFile()

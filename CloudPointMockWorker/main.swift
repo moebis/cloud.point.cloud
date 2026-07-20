@@ -5,18 +5,9 @@ enum MockWorkerMode: String {
     case normal
     case heartbeat
     case crashAfterReady = "crash-after-ready"
+    case fragmentedFinal = "fragmented-final"
+    case ignoreTerm = "ignore-term"
     case silent
-}
-
-nonisolated(unsafe) private var spawnedChildPID: pid_t = -1
-
-private func terminationSignalHandler(_ signalNumber: Int32) {
-    if spawnedChildPID > 0 {
-        _ = Darwin.kill(spawnedChildPID, SIGTERM)
-        var status: Int32 = 0
-        while waitpid(spawnedChildPID, &status, 0) == -1, errno == EINTR {}
-    }
-    _exit(128 + signalNumber)
 }
 
 let arguments = CommandLine.arguments
@@ -27,8 +18,7 @@ guard let mode = MockWorkerMode(rawValue: modeName) else {
     exit(64)
 }
 
-_ = setpgid(0, 0)
-Darwin.signal(SIGTERM, terminationSignalHandler)
+if mode == .ignoreTerm { Darwin.signal(SIGTERM, SIG_IGN) }
 let projectID = UUID(uuidString: "11111111-1111-1111-1111-111111111111")!
 let outputQueue = DispatchQueue(label: "cloud.point.cloud.mock-worker.stdout")
 
@@ -43,6 +33,9 @@ func writeEnvelope(_ envelope: WorkerEnvelope) {
 }
 
 FileHandle.standardError.write(Data("mode=\(mode.rawValue)\n".utf8))
+if let count = ProcessInfo.processInfo.environment["CLOUDPOINT_MOCK_STDERR_BYTES"].flatMap(Int.init), count > 0 {
+    FileHandle.standardError.write(Data(repeating: 0x64, count: count))
+}
 
 if ProcessInfo.processInfo.environment["CLOUDPOINT_MOCK_SPAWN_CHILD"] == "1" {
     var pid: pid_t = 0
@@ -67,7 +60,6 @@ if ProcessInfo.processInfo.environment["CLOUDPOINT_MOCK_SPAWN_CHILD"] == "1" {
         FileHandle.standardError.write(Data("child spawn failed: \(spawnResult)\n".utf8))
         exit(71)
     }
-    spawnedChildPID = pid
     FileHandle.standardError.write(Data("child-pid:\(pid)\n".utf8))
 }
 
@@ -81,6 +73,28 @@ if mode != .silent {
 }
 
 if mode == .crashAfterReady { exit(23) }
+if mode == .fragmentedFinal {
+    let payload = WorkerErrorPayload(code: "finalFragment", message: "final frame", recoverable: false, details: [:])
+    let frame = try LengthPrefixedJSONCodec.encode(.event(.warning(payload), projectId: projectID))
+    FileHandle.standardOutput.write(frame.prefix(3))
+    FileHandle.standardOutput.write(frame.dropFirst(3))
+    exit(0)
+}
+
+if let count = ProcessInfo.processInfo.environment["CLOUDPOINT_MOCK_EVENT_COUNT"].flatMap(Int.init), count > 0 {
+    for index in 0..<count {
+        writeEnvelope(.event(.heartbeat(
+            busy: false,
+            monotonicSeconds: Double(index),
+            queuedFrames: 0,
+            processedFrames: index,
+            currentWindow: nil
+        ), projectId: projectID))
+    }
+    FileHandle.standardError.write(Data("flood-complete\n".utf8))
+}
+
+if mode == .silent || mode == .ignoreTerm { dispatchMain() }
 
 var heartbeatTimer: DispatchSourceTimer?
 if mode == .heartbeat {
