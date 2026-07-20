@@ -129,6 +129,107 @@ final class MockReconstructionEngineTests: XCTestCase {
         XCTAssertEqual(received, [.ready, .sessionCompleted])
     }
 
+    func testWriteFailureFailsTheStreamAndRejectsFurtherLifecycleCalls() async throws {
+        let package = try TemporaryProjectPackage.make()
+        let pointsURL = package.url.appending(path: "Points")
+        try FileManager.default.removeItem(at: pointsURL)
+        XCTAssertTrue(FileManager.default.createFile(atPath: pointsURL.path, contents: Data()))
+
+        let engine = MockReconstructionEngine(clock: .immediate)
+        try await engine.prepare(configuration: .fixture())
+        try await engine.begin(project: .fixture(packageURL: package.url))
+        let events = engine.events()
+
+        try await engine.pause()
+        try await engine.enqueue(.fixture(index: 12))
+        var writeFailed = false
+        do {
+            try await engine.resume()
+            XCTFail("Expected the Points file to reject the CPC write")
+        } catch {
+            writeFailed = true
+        }
+        if writeFailed {
+            // The unfixed engine still accepts finishInput; close that stream so the
+            // behavioral assertion below can demonstrate the defect deterministically.
+            try? await engine.finishInput()
+        }
+
+        let streamFailure = await Self.collectFailure(events)
+        XCTAssertNotNil(streamFailure.error)
+        XCTAssertFalse(streamFailure.events.contains(.sessionCompleted))
+
+        await Self.assertLifecycleError("finishInput") {
+            try await engine.finishInput()
+        }
+        await Self.assertLifecycleError("enqueue") {
+            try await engine.enqueue(.fixture(index: 13))
+        }
+        await Self.assertLifecycleError("resume") {
+            try await engine.resume()
+        }
+    }
+
+    func testPointsSymlinkToExternalDirectoryIsRejectedWithoutWritingOutsidePackage() async throws {
+        let package = try TemporaryProjectPackage.make()
+        let externalDirectory = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: externalDirectory) }
+        try FileManager.default.createDirectory(at: externalDirectory, withIntermediateDirectories: true)
+
+        let pointsURL = package.url.appending(path: "Points")
+        try FileManager.default.removeItem(at: pointsURL)
+        try FileManager.default.createSymbolicLink(at: pointsURL, withDestinationURL: externalDirectory)
+
+        let engine = MockReconstructionEngine(clock: .immediate)
+        try await engine.prepare(configuration: .fixture())
+        try await engine.begin(project: .fixture(packageURL: package.url))
+        let events = engine.events()
+
+        var rejected = false
+        do {
+            try await engine.enqueue(.fixture(index: 14))
+        } catch {
+            rejected = true
+        }
+        if !rejected {
+            try await engine.finishInput()
+        }
+
+        XCTAssertTrue(rejected, "Expected a package Points symlink to be rejected")
+        let streamFailure = await Self.collectFailure(events)
+        XCTAssertNotNil(streamFailure.error)
+        XCTAssertFalse(streamFailure.events.contains(.sessionCompleted))
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: externalDirectory.appending(path: "frame-00000014.cpc").path
+            )
+        )
+    }
+
+    func testMaximumUInt32FrameIndexUsesAnUnsignedPackageRelativeFilename() async throws {
+        let package = try TemporaryProjectPackage.make()
+        let engine = MockReconstructionEngine(clock: .immediate)
+        try await engine.prepare(configuration: .fixture())
+        try await engine.begin(project: .fixture(packageURL: package.url))
+        let events = engine.events()
+        let maximumFrameIndex = Int(UInt32.max)
+
+        try await engine.enqueue(.fixture(index: maximumFrameIndex))
+        try await engine.finishInput()
+
+        let received = try await Self.collect(events)
+        let result = try XCTUnwrap(received.compactMap { event -> FrameResult? in
+            guard case let .frameCompleted(result) = event else { return nil }
+            return result
+        }.first)
+        XCTAssertEqual(result.pointChunkPath, "Points/frame-4294967295.cpc")
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: package.url.appending(path: result.pointChunkPath).path
+            )
+        )
+    }
+
     private static func littleEndianUInt16(_ data: Data, at offset: Int) -> UInt16 {
         data[offset..<(offset + 2)].enumerated().reduce(0) { value, byte in
             value | (UInt16(byte.element) << (byte.offset * 8))
@@ -159,6 +260,20 @@ final class MockReconstructionEngineTests: XCTestCase {
             events.append(event)
         }
         return events
+    }
+
+    private static func collectFailure(
+        _ stream: AsyncThrowingStream<EngineEvent, Error>
+    ) async -> (events: [EngineEvent], error: Error?) {
+        var events: [EngineEvent] = []
+        do {
+            for try await event in stream {
+                events.append(event)
+            }
+            return (events, nil)
+        } catch {
+            return (events, error)
+        }
     }
 
     private static func assertLifecycleError(

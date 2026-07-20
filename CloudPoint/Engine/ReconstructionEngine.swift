@@ -75,4 +75,5 @@ enum EngineEvent: Sendable, Equatable {
 enum ReconstructionEngineError: Error, Sendable, Equatable {
     case invalidLifecycle(operation: String)
     case invalidFrameIndex(Int)
+    case unsafeOutputPath
 }

@@ -11,6 +11,7 @@ actor MockReconstructionEngine: ReconstructionEngine {
         case acceptingInput
         case inputFinished
         case completed
+        case failed
         case cancelled
         case shutdown
     }
@@ -88,7 +89,7 @@ actor MockReconstructionEngine: ReconstructionEngine {
     }
 
     func cancel() async {
-        guard lifecycle != .completed, lifecycle != .cancelled, lifecycle != .shutdown else { return }
+        guard lifecycle != .completed, lifecycle != .failed, lifecycle != .cancelled, lifecycle != .shutdown else { return }
         lifecycle = .cancelled
         pendingFrames.removeAll()
         continuation.yield(.cancelled)
@@ -113,8 +114,15 @@ actor MockReconstructionEngine: ReconstructionEngine {
             let frame = pendingFrames.removeFirst()
             continuation.yield(.frameStarted(frameIndex: frame.index))
 
-            let result = try MockCPCWriter.write(frame: frame, beneath: project.packageURL)
-            continuation.yield(.frameCompleted(result))
+            do {
+                let result = try MockCPCWriter.write(frame: frame, beneath: project.packageURL)
+                continuation.yield(.frameCompleted(result))
+            } catch {
+                lifecycle = .failed
+                pendingFrames.removeAll()
+                continuation.finish(throwing: error)
+                throw error
+            }
         }
     }
 
@@ -131,14 +139,13 @@ private enum MockCPCWriter {
     private static let vertexStride = 24
 
     static func write(frame: PersistedFrame, beneath packageURL: URL) throws -> FrameResult {
+        guard let sourceFrame = UInt32(exactly: frame.index) else {
+            throw ReconstructionEngineError.invalidFrameIndex(frame.index)
+        }
         let pointCount = planeDimension * planeDimension
-        let relativePath = String(format: "Points/frame-%08d.cpc", frame.index)
-        let chunkURL = packageURL.appending(path: relativePath)
-
-        try FileManager.default.createDirectory(
-            at: chunkURL.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
+        let filename = String(format: "frame-%08u.cpc", sourceFrame)
+        let relativePath = "Points/\(filename)"
+        let chunkURL = try outputURL(packageURL: packageURL, filename: filename)
 
         var data = Data()
         data.reserveCapacity(32 + (pointCount * vertexStride))
@@ -146,8 +153,8 @@ private enum MockCPCWriter {
         data.appendLittleEndian(UInt16(1))
         data.appendLittleEndian(UInt16(vertexStride))
         data.appendLittleEndian(UInt64(pointCount))
-        data.appendLittleEndian(UInt32(frame.index))
-        data.appendLittleEndian(UInt32(frame.index))
+        data.appendLittleEndian(sourceFrame)
+        data.appendLittleEndian(sourceFrame)
         data.append(contentsOf: repeatElement(0, count: 8))
 
         let color = color(for: frame.index)
@@ -162,7 +169,7 @@ private enum MockCPCWriter {
                 data.append(contentsOf: [color.red, color.green, color.blue, 255])
                 data.appendLittleEndian(Float16(1).bitPattern)
                 data.appendLittleEndian(UInt16(0))
-                data.appendLittleEndian(UInt32(frame.index))
+                data.appendLittleEndian(sourceFrame)
             }
         }
 
@@ -180,6 +187,49 @@ private enum MockCPCWriter {
             UInt8(truncatingIfNeeded: frameIndex &* 97),
             UInt8(truncatingIfNeeded: frameIndex &* 193)
         )
+    }
+
+    private static func outputURL(packageURL: URL, filename: String) throws -> URL {
+        let fileManager = FileManager.default
+        let standardizedPackageURL = packageURL.standardizedFileURL
+        let resolvedPackageURL = standardizedPackageURL.resolvingSymlinksInPath().standardizedFileURL
+        guard standardizedPackageURL.path == resolvedPackageURL.path else {
+            throw ReconstructionEngineError.unsafeOutputPath
+        }
+
+        var isDirectory = ObjCBool(false)
+        guard fileManager.fileExists(atPath: resolvedPackageURL.path, isDirectory: &isDirectory), isDirectory.boolValue else {
+            throw ReconstructionEngineError.unsafeOutputPath
+        }
+
+        let pointsURL = resolvedPackageURL.appending(path: "Points")
+        guard (try? fileManager.destinationOfSymbolicLink(atPath: pointsURL.path)) == nil else {
+            throw ReconstructionEngineError.unsafeOutputPath
+        }
+        if fileManager.fileExists(atPath: pointsURL.path) {
+            var isPointsDirectory = ObjCBool(false)
+            guard fileManager.fileExists(atPath: pointsURL.path, isDirectory: &isPointsDirectory), isPointsDirectory.boolValue else {
+                throw ReconstructionEngineError.unsafeOutputPath
+            }
+        } else {
+            try fileManager.createDirectory(at: pointsURL, withIntermediateDirectories: true)
+        }
+
+        let resolvedPointsURL = pointsURL.resolvingSymlinksInPath().standardizedFileURL
+        guard resolvedPointsURL.path == pointsURL.path,
+              resolvedPointsURL.deletingLastPathComponent().path == resolvedPackageURL.path else {
+            throw ReconstructionEngineError.unsafeOutputPath
+        }
+
+        let chunkURL = pointsURL.appending(path: filename)
+        guard (try? fileManager.destinationOfSymbolicLink(atPath: chunkURL.path)) == nil else {
+            throw ReconstructionEngineError.unsafeOutputPath
+        }
+        let resolvedChunkURL = chunkURL.resolvingSymlinksInPath().standardizedFileURL
+        guard resolvedChunkURL.deletingLastPathComponent().path == resolvedPointsURL.path else {
+            throw ReconstructionEngineError.unsafeOutputPath
+        }
+        return chunkURL
     }
 }
 
