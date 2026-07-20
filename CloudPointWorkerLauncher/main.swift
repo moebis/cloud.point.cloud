@@ -40,7 +40,7 @@ var environment: [UnsafeMutablePointer<CChar>?] = ProcessInfo.processInfo.enviro
 }
 environment.append(nil)
 
-arguments.withUnsafeMutableBufferPointer { argumentsBuffer in
+_ = arguments.withUnsafeMutableBufferPointer { argumentsBuffer in
     environment.withUnsafeMutableBufferPointer { environmentBuffer in
         execve(executable, argumentsBuffer.baseAddress!, environmentBuffer.baseAddress!)
     }

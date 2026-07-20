@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 enum ProjectManifestError: Error, Equatable, Sendable {
@@ -53,18 +54,29 @@ struct ProjectManifest: Codable, Sendable, Equatable {
     func writeAtomically(to packageURL: URL, fileManager: FileManager = .default) throws {
         _ = try Self.validate(self)
         let manifestURL = Self.manifestURL(in: packageURL)
-        let partialURL = packageURL.appending(path: "Manifest.json.partial")
+        let partialURL = packageURL.appending(
+            path: ".Manifest.json.\(UUID().uuidString.lowercased()).partial"
+        )
         let data = try Self.encode(self)
+        defer { try? fileManager.removeItem(at: partialURL) }
 
-        try data.write(to: partialURL, options: .atomic)
+        try data.write(to: partialURL, options: .withoutOverwriting)
         let partialHandle = try FileHandle(forWritingTo: partialURL)
-        defer { try? partialHandle.close() }
-        try partialHandle.synchronize()
+        do {
+            try partialHandle.synchronize()
+            try partialHandle.close()
+        } catch {
+            try? partialHandle.close()
+            throw error
+        }
 
-        if fileManager.fileExists(atPath: manifestURL.path) {
-            _ = try fileManager.replaceItemAt(manifestURL, withItemAt: partialURL)
-        } else {
-            try fileManager.moveItem(at: partialURL, to: manifestURL)
+        let renameResult = partialURL.path.withCString { sourcePath in
+            manifestURL.path.withCString { destinationPath in
+                Darwin.rename(sourcePath, destinationPath)
+            }
+        }
+        guard renameResult == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
     }
 
@@ -102,7 +114,8 @@ struct ProjectManifest: Codable, Sendable, Equatable {
         do { try manifest.engineConfiguration.validate() }
         catch { throw ProjectManifestError.invalidConfiguration }
         guard manifest.sessionState.processedCount <= manifest.sessionState.queuedCount,
-              manifest.sessionState.queuedCount <= manifest.sessionState.capturedCount else {
+              manifest.sessionState.queuedCount <= manifest.sessionState.capturedCount,
+              UInt64(exactly: manifest.frames.count) == manifest.sessionState.capturedCount else {
             throw ProjectManifestError.invalidSessionState
         }
 
@@ -123,6 +136,7 @@ struct ProjectManifest: Codable, Sendable, Equatable {
 
         var previousWindowIndex: UInt32?
         var previousOutputEnd: UInt32?
+        var committedArtifactCount: UInt64 = 0
         for window in manifest.completedWindows {
             guard window.inferenceFrameStart <= window.frameStart,
                   window.frameStart <= window.frameEnd,
@@ -158,6 +172,12 @@ struct ProjectManifest: Codable, Sendable, Equatable {
                 }
                 previousArtifactIndex = artifact.frameIndex
             }
+            let (nextArtifactCount, artifactCountOverflow) = committedArtifactCount
+                .addingReportingOverflow(UInt64(window.frameArtifacts.count))
+            guard !artifactCountOverflow else {
+                throw ProjectManifestError.invalidSessionState
+            }
+            committedArtifactCount = nextArtifactCount
             guard window.frameArtifacts.first?.frameIndex == window.frameStart,
                   window.frameArtifacts.last?.frameIndex == window.frameEnd,
                   Array(manifest.frames
@@ -169,6 +189,10 @@ struct ProjectManifest: Codable, Sendable, Equatable {
 
             previousWindowIndex = window.index
             previousOutputEnd = window.frameEnd
+        }
+
+        guard committedArtifactCount == manifest.sessionState.processedCount else {
+            throw ProjectManifestError.invalidSessionState
         }
 
         return manifest

@@ -2,6 +2,30 @@ import XCTest
 @testable import CloudPoint
 
 final class ProjectManifestTests: XCTestCase {
+    func testManifestEnforcesDurableAndCommittedCounterOwnership() throws {
+        var capturedMismatch = ProjectManifest.fixture()
+        capturedMismatch.frames = [.fixture(index: 0)]
+        XCTAssertThrowsError(try ProjectManifest.validate(capturedMismatch)) {
+            XCTAssertEqual($0 as? ProjectManifestError, .invalidSessionState)
+        }
+
+        var processedMismatch = ProjectManifest.fixture()
+        processedMismatch.frames = [.fixture(index: 0)]
+        processedMismatch.completedWindows = [.fixture(index: 0)]
+        processedMismatch.sessionState = SessionState(
+            phase: .processing,
+            capturedCount: 1,
+            queuedCount: 1,
+            processedCount: 0
+        )
+        XCTAssertThrowsError(try ProjectManifest.validate(processedMismatch)) {
+            XCTAssertEqual($0 as? ProjectManifestError, .invalidSessionState)
+        }
+
+        processedMismatch.sessionState.processedCount = 1
+        XCTAssertNoThrow(try ProjectManifest.validate(processedMismatch))
+    }
+
     func testFractionalManifestDatesRoundTripExactlyAsRFC3339Strings() throws {
         var manifest = ProjectManifest.fixture()
         manifest.createdAt = Date(timeIntervalSince1970: 1_700_000_000.123_456_7)
@@ -93,6 +117,12 @@ final class ProjectManifestTests: XCTestCase {
         var manifest = ProjectManifest.fixture()
         manifest.frames = [.fixture(index: 0)]
         manifest.completedWindows = [.fixture(index: 0)]
+        manifest.sessionState = SessionState(
+            phase: .completed,
+            capturedCount: 1,
+            queuedCount: 1,
+            processedCount: 1
+        )
 
         try manifest.writeAtomically(to: package.url)
         FileManager.default.createFile(
@@ -116,12 +146,41 @@ final class ProjectManifestTests: XCTestCase {
         try manifest.writeAtomically(to: package.url)
 
         manifest.frames = [PersistedFrame(index: 3, sourceTimestamp: 0.6, relativePath: "Frames/00000003.jpg")]
+        manifest.sessionState = SessionState(phase: .processing, capturedCount: 1)
         try manifest.writeAtomically(to: package.url)
 
         let loaded = try ProjectManifest.load(from: package.url)
         XCTAssertEqual(loaded.frames, manifest.frames)
         XCTAssertTrue(FileManager.default.fileExists(atPath: package.url.appending(path: "Manifest.json").path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: package.url.appending(path: "Manifest.json.partial").path))
+    }
+
+    func testConcurrentAtomicWritesUseIndependentStagingFiles() async throws {
+        let package = try TemporaryProjectPackage.make()
+        let packageURL = package.url
+        let manifests = (0..<32).map { ordinal in
+            var manifest = ProjectManifest.fixture()
+            manifest.projectID = UUID()
+            manifest.updatedAt = Date(timeIntervalSinceReferenceDate: Double(ordinal))
+            return manifest
+        }
+
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            for manifest in manifests {
+                group.addTask {
+                    try manifest.writeAtomically(to: packageURL)
+                }
+            }
+            try await group.waitForAll()
+        }
+
+        let loaded = try ProjectManifest.load(from: packageURL)
+        XCTAssertTrue(manifests.contains(loaded))
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(atPath: packageURL.path)
+                .filter { $0.hasSuffix(".partial") },
+            []
+        )
     }
 
     @MainActor
@@ -137,6 +196,40 @@ final class ProjectManifestTests: XCTestCase {
             Set(wrapper.fileWrappers?.keys.map { $0 } ?? []),
             ["Manifest.json", "Frames", "Predictions", "Points", "Logs"]
         )
+    }
+
+    @MainActor
+    func testDocumentAdoptsControllerManifestForLaterSnapshotsAndSaves() throws {
+        let document = CloudPointDocument()
+        var committed = ProjectManifest.fixture()
+        committed.frames = [.fixture(index: 0)]
+        committed.sessionState = SessionState(
+            phase: .processing,
+            capturedCount: 1,
+            queuedCount: 1
+        )
+
+        document.adoptCommittedManifest(committed)
+        let snapshot = try document.snapshot(contentType: .cloudPointProject)
+        let wrapper = try CloudPointDocument.packageWrapper(for: snapshot)
+        let reloaded = try CloudPointDocument.loadManifest(from: wrapper)
+
+        XCTAssertEqual(document.manifest, committed)
+        XCTAssertEqual(snapshot, committed)
+        XCTAssertEqual(reloaded, committed)
+    }
+
+    func testDocumentSnapshotIsSafeOnSerializationExecutor() async throws {
+        let document = CloudPointDocument()
+        var committed = ProjectManifest.fixture()
+        committed.updatedAt = Date(timeIntervalSinceReferenceDate: 42)
+        document.adoptCommittedManifest(committed)
+
+        let snapshot = try await Task.detached {
+            try document.snapshot(contentType: .cloudPointProject)
+        }.value
+
+        XCTAssertEqual(snapshot, committed)
     }
 
     @MainActor
@@ -162,6 +255,7 @@ final class ProjectManifestTests: XCTestCase {
 
         var updated = original
         updated.frames = [PersistedFrame(index: 1, sourceTimestamp: 0.2, relativePath: "Frames/existing.jpg")]
+        updated.sessionState = SessionState(phase: .processing, capturedCount: 1)
         let existingPackage = try FileWrapper(url: package.url, options: .immediate)
         let wrapper = try CloudPointDocument.packageWrapper(for: updated, preserving: existingPackage)
         try wrapper.write(

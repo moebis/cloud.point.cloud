@@ -98,7 +98,7 @@ final class CameraEventChannelTests: XCTestCase {
         guard case let .persisted(frame)? = await iterator.next() else {
             return XCTFail("Expected the retained persisted event")
         }
-        XCTAssertEqual(frame.index, 7)
+        XCTAssertEqual(frame.frame.index, 7)
         channel.finish()
     }
 
@@ -124,7 +124,7 @@ final class CameraEventChannelTests: XCTestCase {
             guard case let .persisted(frame)? = await iterator.next() else {
                 return XCTFail("Authoritative persisted event was lost")
             }
-            indexes.append(frame.index)
+            indexes.append(frame.frame.index)
         }
         await sender.value
         channel.finish()
@@ -481,6 +481,46 @@ final class CameraFrameSourceTests: XCTestCase {
         XCTAssertEqual(persisted, [])
     }
 
+    func testPersistenceFailureEmitsOrderedLifecycleFailureAfterDurableFrames() async throws {
+        let persistence = FailAfterPersistenceProbe(successfulCallCount: 1)
+        let session = SyntheticCameraCaptureSession(deviceIDs: ["camera-a"])
+        let source = CameraFrameSource(
+            persistence: persistence,
+            authority: FixedCameraAuthority(.authorized),
+            captureSession: session
+        )
+        let stream = source.events()
+        await source.start(deviceID: "camera-a", sampleRate: 5)
+
+        session.emit(try makeFrame(sequence: 0, timestamp: .zero))
+        try await eventually { await persistence.callCount == 1 }
+        session.emit(try makeFrame(sequence: 1, timestamp: CMTime(value: 1, timescale: 5)))
+
+        try await eventually { await source.state == .failed(.persistenceFailed) }
+        await source.shutdown()
+
+        var iterator = stream.makeAsyncIterator()
+        guard case let .persisted(persisted)? = await iterator.next() else {
+            return XCTFail("Expected the durable frame before the failure event")
+        }
+        XCTAssertEqual(persisted.lifecycleID, 1)
+        XCTAssertEqual(persisted.sequence, 0)
+        XCTAssertEqual(persisted.frame.index, 0)
+        guard case let .failed(failure)? = await iterator.next() else {
+            return XCTFail("Expected the persistence failure event")
+        }
+        XCTAssertEqual(
+            failure,
+            CameraFrameSourceFailureEvent(
+                lifecycleID: 1,
+                sequence: 1,
+                failure: .persistenceFailed
+            )
+        )
+        let terminal = await iterator.next()
+        XCTAssertNil(terminal)
+    }
+
     func testAuthorizationDenialFailsWithoutConnectingHardware() async {
         let session = SyntheticCameraCaptureSession(deviceIDs: ["camera-a"])
         let source = CameraFrameSource(
@@ -591,6 +631,50 @@ final class CameraFrameSourceTests: XCTestCase {
         for _ in 0..<20 { await Task.yield() }
         let persistedCount = await collector.persisted.count
         XCTAssertEqual(persistedCount, 1)
+    }
+
+    func testDisconnectFailureIsRetainedAfterFullBufferAndDurableOverflow() async throws {
+        let persistence = PersistenceProbe()
+        let session = SyntheticCameraCaptureSession(deviceIDs: ["camera-a"])
+        let source = CameraFrameSource(
+            persistence: persistence,
+            authority: FixedCameraAuthority(.authorized),
+            captureSession: session
+        )
+        let stream = source.events()
+        await source.start(deviceID: "camera-a", sampleRate: 5)
+        try await fillAuthoritativeEventCapacity(
+            source: source,
+            session: session,
+            persistence: persistence
+        )
+
+        session.disconnect()
+        try await eventually { await source.state == .failed(.cameraDisconnected) }
+        await source.shutdown()
+
+        var iterator = stream.makeAsyncIterator()
+        for expectedIndex in 0..<17 {
+            guard case let .persisted(persisted)? = await iterator.next() else {
+                return XCTFail("Expected durable frame \(expectedIndex) before disconnect")
+            }
+            XCTAssertEqual(persisted.lifecycleID, 1)
+            XCTAssertEqual(persisted.sequence, UInt64(expectedIndex))
+            XCTAssertEqual(persisted.frame.index, UInt32(expectedIndex))
+        }
+        guard case let .failed(failure)? = await iterator.next() else {
+            return XCTFail("Expected disconnect after every durable frame event")
+        }
+        XCTAssertEqual(
+            failure,
+            CameraFrameSourceFailureEvent(
+                lifecycleID: 1,
+                sequence: 17,
+                failure: .cameraDisconnected
+            )
+        )
+        let terminal = await iterator.next()
+        XCTAssertNil(terminal)
     }
 
     func testStopRemovesDisconnectObservation() async {
@@ -905,6 +989,52 @@ final class CameraFrameSourceTests: XCTestCase {
         XCTAssertEqual(indexes, Array(0..<17))
     }
 
+    func testStopReturnsExactLifecycleDrainForBufferedPlusOverflowWithoutConsumer() async throws {
+        let persistence = PersistenceProbe()
+        let session = SyntheticCameraCaptureSession(deviceIDs: ["camera-a"])
+        let source = CameraFrameSource(
+            persistence: persistence,
+            authority: FixedCameraAuthority(.authorized),
+            captureSession: session
+        )
+        let stream = source.events()
+        await source.start(deviceID: "camera-a", sampleRate: 5)
+        try await fillAuthoritativeEventCapacity(
+            source: source,
+            session: session,
+            persistence: persistence
+        )
+
+        let didStop = CompletionProbe()
+        let stop = Task {
+            let completion = await source.stop()
+            didStop.markComplete()
+            return completion
+        }
+        defer { stop.cancel() }
+        try await eventually { didStop.isComplete }
+        let completion = await stop.value
+
+        XCTAssertEqual(completion.lifecycleID, 1)
+        XCTAssertEqual(completion.durablePersistedEventCount, 17)
+        XCTAssertNil(completion.terminalFailure)
+        XCTAssertEqual(
+            completion.durablePersistedEvents.map(\.sequence),
+            (0..<17).map(UInt64.init)
+        )
+        await source.shutdown()
+        var iterator = stream.makeAsyncIterator()
+        var events: [CameraPersistedFrame] = []
+        while let event = await iterator.next() {
+            guard case let .persisted(frame) = event else { continue }
+            events.append(frame)
+        }
+        XCTAssertEqual(events.map(\.lifecycleID), Array(repeating: 1, count: 17))
+        XCTAssertEqual(events.map(\.sequence), (0..<17).map(UInt64.init))
+        XCTAssertEqual(events.map(\.frame.index), (0..<17).map(UInt32.init))
+        XCTAssertEqual(completion.durablePersistedEvents, events)
+    }
+
     func testRestartRetainsDurableEventBlockedBehindFullEventChannel() async throws {
         let persistence = PersistenceProbe()
         let session = SyntheticCameraCaptureSession(deviceIDs: ["camera-a", "camera-b"])
@@ -959,10 +1089,10 @@ final class CameraFrameSourceTests: XCTestCase {
         try await eventually { await persistence.durableFrames.count == 18 }
         await source.shutdown()
 
-        var indexes = [firstFrame.index]
+        var indexes = [firstFrame.frame.index]
         while let event = await iterator.next() {
             guard case let .persisted(frame) = event else { continue }
-            indexes.append(frame.index)
+            indexes.append(frame.frame.index)
         }
         XCTAssertEqual(indexes, Array(0..<17) + [0])
     }
@@ -1197,6 +1327,25 @@ private actor PersistenceProbe: FramePersistence {
     func resumeOne() {
         guard !continuations.isEmpty else { return }
         continuations.removeFirst().resume()
+    }
+}
+
+private actor FailAfterPersistenceProbe: FramePersistence {
+    private let successfulCallCount: Int
+    private(set) var callCount = 0
+
+    init(successfulCallCount: Int) {
+        self.successfulCallCount = successfulCallCount
+    }
+
+    func persist(_ frame: CapturedFrame) async throws -> PersistedFrame {
+        callCount += 1
+        guard callCount <= successfulCallCount else { throw ProbeError.writeFailed }
+        return PersistedFrame(
+            index: UInt32(frame.index),
+            sourceTimestamp: frame.presentationTimestamp.seconds,
+            relativePath: String(format: "Frames/%08d.jpg", frame.index)
+        )
     }
 }
 
@@ -1613,8 +1762,9 @@ private actor EventStorage {
 
     func append(_ event: CameraFrameSourceEvent) {
         switch event {
-        case let .persisted(frame): persisted.append(frame)
+        case let .persisted(frame): persisted.append(frame.frame)
         case let .dropped(frame): drops.append(frame)
+        case .failed: break
         }
     }
 }
@@ -1625,10 +1775,14 @@ private protocol FrameEmittingCameraCaptureSession: CameraCaptureSession, AnyObj
 
 private func persistedEvent(index: Int) -> CameraFrameSourceEvent {
     .persisted(
-        PersistedFrame(
-            index: UInt32(index),
-            sourceTimestamp: Double(index),
-            relativePath: String(format: "Frames/%08d.jpg", index)
+        CameraPersistedFrame(
+            lifecycleID: 0,
+            sequence: UInt64(index),
+            frame: PersistedFrame(
+                index: UInt32(index),
+                sourceTimestamp: Double(index),
+                relativePath: String(format: "Frames/%08d.jpg", index)
+            )
         )
     )
 }
@@ -1646,7 +1800,7 @@ private func persistedIndexesUntilFinished(from stream: CameraFrameSourceEvents)
     var indexes: [UInt32] = []
     while let event = await iterator.next() {
         guard case let .persisted(frame) = event else { continue }
-        indexes.append(frame.index)
+        indexes.append(frame.frame.index)
     }
     return indexes
 }

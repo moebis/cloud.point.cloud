@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "$#" -ne 1 ]]; then
+  echo "usage: scripts/test-recording-smoke /absolute/path/to/video.mov" >&2
+  exit 64
+fi
+
+source_video="$1"
+if [[ "$source_video" != /* || ! -r "$source_video" || ! -f "$source_video" ]]; then
+  echo "recording must be an absolute path to a readable file: $source_video" >&2
+  exit 66
+fi
+
+source_fingerprint_before="$({
+  /usr/bin/stat -f '%d:%i:%z:%m:%p' "$source_video"
+  /usr/bin/shasum -a 256 "$source_video" | /usr/bin/awk '{print $1}'
+})"
+
+cd "$(dirname "$0")/.."
+
+# CloudPointTests is hosted by the sandboxed app. Stage the caller-selected
+# fixture inside its container so AVFoundation receives a readable local URL.
+container_tmp="${HOME}/Library/Containers/cloud.point.cloud.CloudPoint/Data/tmp"
+mkdir -p "$container_tmp"
+staging_dir="$(mktemp -d "${container_tmp}/cloudpoint-smoke.XXXXXX")"
+
+cleanup() {
+  case "$staging_dir" in
+    "$container_tmp"/cloudpoint-smoke.*) rm -rf -- "$staging_dir" ;;
+    *) echo "refusing to remove unexpected smoke directory: $staging_dir" >&2 ;;
+  esac
+}
+trap cleanup EXIT
+
+staged_video="${staging_dir}/recording.mov"
+cp "$source_video" "$staged_video"
+chmod 0444 "$staged_video"
+
+xcode_status=0
+xcodebuild test -quiet \
+  -project CloudPoint.xcodeproj \
+  -scheme CloudPoint \
+  -destination 'platform=macOS,arch=arm64' \
+  CLOUDPOINT_SMOKE_VIDEO="$staged_video" \
+  -only-testing:CloudPointTests/RealRecordingSmokeTests || xcode_status=$?
+
+source_fingerprint_after="$({
+  /usr/bin/stat -f '%d:%i:%z:%m:%p' "$source_video"
+  /usr/bin/shasum -a 256 "$source_video" | /usr/bin/awk '{print $1}'
+})"
+if [[ "$source_fingerprint_after" != "$source_fingerprint_before" ]]; then
+  echo "source recording changed during smoke; refusing to report success: $source_video" >&2
+  exit 74
+fi
+
+exit "$xcode_status"

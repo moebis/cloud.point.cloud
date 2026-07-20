@@ -106,6 +106,8 @@ schemes:
     test:
       targets:
         - CloudPointTests
+      environmentVariables:
+        CLOUDPOINT_SMOKE_VIDEO: "$(CLOUDPOINT_SMOKE_VIDEO)"
   CloudPointTests:
     build:
       targets:

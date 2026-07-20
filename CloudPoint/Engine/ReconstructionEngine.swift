@@ -7,8 +7,12 @@ protocol ReconstructionEngine: Sendable {
     func finishInput() async throws
     func pause() async throws
     func resume() async throws
+    /// May be called concurrently with any suspended startup operation and must
+    /// promptly unblock it. CPU-bound preparation belongs in a cancellable child
+    /// task or worker process rather than monopolizing actor isolation.
     func cancel() async
     func events() -> AsyncThrowingStream<EngineEvent, Error>
+    /// Has the same concurrent-startup guarantee as `cancel()` and is idempotent.
     func shutdown() async
 }
 

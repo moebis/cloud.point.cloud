@@ -8,22 +8,34 @@ extension UTType {
     )
 }
 
-@MainActor
-final class CloudPointDocument: @preconcurrency ReferenceFileDocument {
+final class CloudPointDocument: ReferenceFileDocument, @unchecked Sendable {
     typealias Snapshot = ProjectManifest
 
     static var readableContentTypes: [UTType] {
         [.cloudPointProject]
     }
 
-    var manifest: ProjectManifest
+    private let manifestLock = NSLock()
+    private var storedManifest: ProjectManifest
+
+    var manifest: ProjectManifest {
+        manifestLock.withLock { storedManifest }
+    }
 
     init() {
-        manifest = ProjectManifest()
+        storedManifest = ProjectManifest()
     }
 
     required init(configuration: ReadConfiguration) throws {
-        manifest = try Self.loadManifest(from: configuration.file)
+        storedManifest = try Self.loadManifest(from: configuration.file)
+    }
+
+    /// Mirrors a manifest transaction that the active SessionController has
+    /// already committed to disk. This deliberately does not publish
+    /// `objectWillChange`: doing so would schedule a stale second writer through
+    /// SwiftUI document autosave.
+    func adoptCommittedManifest(_ committed: ProjectManifest) {
+        manifestLock.withLock { storedManifest = committed }
     }
 
     static func loadManifest(from package: FileWrapper) throws -> ProjectManifest {

@@ -207,7 +207,13 @@ final class MockReconstructionEngineTests: XCTestCase {
             projectID: projectID,
             engineConfiguration: .fixture(),
             frames: [frame],
-            completedWindows: [completed]
+            completedWindows: [completed],
+            sessionState: SessionState(
+                phase: .processing,
+                capturedCount: 1,
+                queuedCount: 1,
+                processedCount: 1
+            )
         )
         try manifest.writeAtomically(to: package.url)
         let checkpoint = try XCTUnwrap(manifest.resumeCheckpoint())
@@ -288,7 +294,13 @@ final class MockReconstructionEngineTests: XCTestCase {
         let manifest = ProjectManifest(
             projectID: projectID,
             frames: [replayFrame],
-            completedWindows: [completed]
+            completedWindows: [completed],
+            sessionState: SessionState(
+                phase: .processing,
+                capturedCount: 1,
+                queuedCount: 1,
+                processedCount: 1
+            )
         )
         try manifest.writeAtomically(to: package.url)
         let checkpoint = try XCTUnwrap(manifest.resumeCheckpoint())

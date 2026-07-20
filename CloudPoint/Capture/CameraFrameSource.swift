@@ -178,9 +178,41 @@ struct CameraDroppedFrame: Sendable, Equatable {
     let reason: CameraFrameDropReason
 }
 
+struct CameraPersistedFrame: Sendable, Equatable {
+    let lifecycleID: UInt64
+    let sequence: UInt64
+    let frame: PersistedFrame
+}
+
+struct CameraFrameSourceFailureEvent: Sendable, Equatable {
+    let lifecycleID: UInt64
+    let sequence: UInt64
+    let failure: CameraFrameSourceFailure
+}
+
+struct CameraLifecycleCompletion: Sendable, Equatable {
+    let lifecycleID: UInt64
+    let durablePersistedEventCount: UInt64
+    let terminalFailure: CameraFrameSourceFailure?
+    let durablePersistedEvents: [CameraPersistedFrame]
+
+    init(
+        lifecycleID: UInt64,
+        durablePersistedEventCount: UInt64,
+        terminalFailure: CameraFrameSourceFailure?,
+        durablePersistedEvents: [CameraPersistedFrame] = []
+    ) {
+        self.lifecycleID = lifecycleID
+        self.durablePersistedEventCount = durablePersistedEventCount
+        self.terminalFailure = terminalFailure
+        self.durablePersistedEvents = durablePersistedEvents
+    }
+}
+
 enum CameraFrameSourceEvent: Sendable, Equatable {
-    case persisted(PersistedFrame)
+    case persisted(CameraPersistedFrame)
     case dropped(CameraDroppedFrame)
+    case failed(CameraFrameSourceFailureEvent)
 }
 
 struct CameraFrameSourceMetrics: Sendable, Equatable {
@@ -212,10 +244,22 @@ actor CameraFrameSource {
 
     private struct DetachedCapture: Sendable {
         let ingress: CameraFrameIngress?
-        let persistenceTask: Task<Void, Never>?
+        let lifecycleID: UInt64?
+        let persistenceTask: Task<CameraLifecycleCompletion, Never>?
+        let terminalFailure: CameraFrameSourceFailure?
 
         var needsSessionStop: Bool {
             ingress != nil || persistenceTask != nil
+        }
+
+        var fallbackCompletion: CameraLifecycleCompletion? {
+            lifecycleID.map {
+                CameraLifecycleCompletion(
+                    lifecycleID: $0,
+                    durablePersistedEventCount: 0,
+                    terminalFailure: terminalFailure
+                )
+            }
         }
     }
 
@@ -226,12 +270,15 @@ actor CameraFrameSource {
     private let authority: any CameraAuthorizing
     private let captureSession: any CameraCaptureSession
     private let previewObserver: any CameraPreviewObserving
+    private let startingFrameIndex: Int
     private nonisolated let eventChannel = CameraEventChannel(capacity: 16)
 
     private var ingress: CameraFrameIngress?
-    private var persistenceTask: Task<Void, Never>?
+    private var persistenceTask: Task<CameraLifecycleCompletion, Never>?
     private var lastMetrics = CameraFrameSourceMetrics()
-    private var lifecycleID = 0
+    private var lifecycleID: UInt64 = 0
+    private var activeLifecycleID: UInt64?
+    private var lastCompletion: CameraLifecycleCompletion?
     private var activeConfiguration: ActiveConfiguration?
     private var shutdownState = ShutdownState.active
     private var shutdownWaiters: [CheckedContinuation<Void, Never>] = []
@@ -241,12 +288,14 @@ actor CameraFrameSource {
         persistence: any FramePersistence,
         authority: any CameraAuthorizing = SystemCameraAuthority(),
         captureSession: any CameraCaptureSession = AVCameraCaptureSession(),
-        previewObserver: any CameraPreviewObserving = NoopCameraPreviewObserver()
+        previewObserver: any CameraPreviewObserving = NoopCameraPreviewObserver(),
+        startingFrameIndex: UInt32 = 0
     ) {
         self.persistence = persistence
         self.authority = authority
         self.captureSession = captureSession
         self.previewObserver = previewObserver
+        self.startingFrameIndex = Int(startingFrameIndex)
         previewSession = captureSession.previewSession
     }
 
@@ -275,23 +324,26 @@ actor CameraFrameSource {
         let currentLifecycle = lifecycleID
         activeConfiguration = nil
         let previousCapture = detachCapture()
+        activeLifecycleID = currentLifecycle
         state = .starting
 
         let gate: CameraSampleGate
         do {
             gate = try CameraSampleGate(rate: sampleRate)
         } catch {
-            await retire(previousCapture)
+            recordCompletion(await retire(previousCapture))
             guard currentLifecycle == lifecycleID else { return }
+            recordEarlyFailure(.invalidSampleRate, lifecycleID: currentLifecycle)
             state = .failed(.invalidSampleRate)
             return
         }
 
-        await retire(previousCapture)
+        recordCompletion(await retire(previousCapture))
         guard currentLifecycle == lifecycleID else { return }
 
         guard await authority.requestAccess() == .authorized else {
             guard currentLifecycle == lifecycleID else { return }
+            recordEarlyFailure(.authorizationDenied, lifecycleID: currentLifecycle)
             state = .failed(.authorizationDenied)
             return
         }
@@ -305,7 +357,8 @@ actor CameraFrameSource {
             gate: gate,
             continuation: stream.continuation,
             eventChannel: eventChannel,
-            previewObserver: previewObserver
+            previewObserver: previewObserver,
+            startingFrameIndex: startingFrameIndex
         )
         self.ingress = ingress
         lastMetrics = CameraFrameSourceMetrics()
@@ -339,24 +392,27 @@ actor CameraFrameSource {
         }
     }
 
-    func stop() async {
+    func stop() async -> CameraLifecycleCompletion {
         switch shutdownState {
         case .shuttingDown:
             await waitForShutdown()
-            return
+            return lastCompletion ?? emptyCompletion()
         case .shutDown:
-            return
+            return lastCompletion ?? emptyCompletion()
         case .active:
             break
         }
-        if case .stopped = state { return }
+        if case .stopped = state { return lastCompletion ?? emptyCompletion() }
         lifecycleID += 1
         let stoppedLifecycle = lifecycleID
         activeConfiguration = nil
         let capture = detachCapture()
-        await retire(capture)
-        guard stoppedLifecycle == lifecycleID else { return }
+        recordCompletion(await retire(capture))
+        guard stoppedLifecycle == lifecycleID else {
+            return lastCompletion ?? emptyCompletion()
+        }
         state = .stopped
+        return lastCompletion ?? emptyCompletion()
     }
 
     func shutdown() async {
@@ -378,10 +434,11 @@ actor CameraFrameSource {
         let shutdownTask = Task {
             await previousRetirement?.value
             await captureSession.shutdown()
-            await capture.persistenceTask?.value
+            _ = await capture.persistenceTask?.value
         }
         retirementBarrier = shutdownTask
         await shutdownTask.value
+        recordCompletion(await completion(for: capture))
         eventChannel.finish()
         state = .stopped
         shutdownState = .shutDown
@@ -392,68 +449,123 @@ actor CameraFrameSource {
 
     private func makePersistenceTask(
         stream: AsyncStream<CapturedFrame>,
-        lifecycleID: Int
-    ) -> Task<Void, Never> {
+        lifecycleID: UInt64
+    ) -> Task<CameraLifecycleCompletion, Never> {
         let persistence = self.persistence
         let eventProducer = eventChannel.makeProducer()
         return Task { [weak self] in
             defer { eventProducer.finish() }
+            var durablePersistedEventCount: UInt64 = 0
+            var durablePersistedEvents: [CameraPersistedFrame] = []
             do {
                 for await frame in stream {
                     try Task.checkCancellation()
-                    guard await eventProducer.prepareForPersistence() else { return }
+                    guard await eventProducer.prepareForPersistence() else {
+                        return CameraLifecycleCompletion(
+                            lifecycleID: lifecycleID,
+                            durablePersistedEventCount: durablePersistedEventCount,
+                            terminalFailure: nil,
+                            durablePersistedEvents: durablePersistedEvents
+                        )
+                    }
                     do {
                         let persisted = try await persistence.persist(frame)
-                        await eventProducer.send(.persisted(persisted))
+                        let event = CameraPersistedFrame(
+                            lifecycleID: lifecycleID,
+                            sequence: durablePersistedEventCount,
+                            frame: persisted
+                        )
+                        await eventProducer.send(.persisted(event))
+                        durablePersistedEvents.append(event)
+                        durablePersistedEventCount += 1
                     } catch {
                         eventProducer.cancelPersistencePermit()
                         throw error
                     }
                 }
             } catch is CancellationError {
-                return
+                return CameraLifecycleCompletion(
+                    lifecycleID: lifecycleID,
+                    durablePersistedEventCount: durablePersistedEventCount,
+                    terminalFailure: nil,
+                    durablePersistedEvents: durablePersistedEvents
+                )
             } catch {
                 Task { [weak self] in
                     await self?.persistenceFailed(lifecycleID: lifecycleID)
                 }
+                return CameraLifecycleCompletion(
+                    lifecycleID: lifecycleID,
+                    durablePersistedEventCount: durablePersistedEventCount,
+                    terminalFailure: .persistenceFailed,
+                    durablePersistedEvents: durablePersistedEvents
+                )
             }
+            return CameraLifecycleCompletion(
+                lifecycleID: lifecycleID,
+                durablePersistedEventCount: durablePersistedEventCount,
+                terminalFailure: nil,
+                durablePersistedEvents: durablePersistedEvents
+            )
         }
     }
 
-    private func persistenceFailed(lifecycleID: Int) async {
+    private func persistenceFailed(lifecycleID: UInt64) async {
         guard lifecycleID == self.lifecycleID else { return }
         self.lifecycleID += 1
         let failedLifecycle = self.lifecycleID
         activeConfiguration = nil
-        let capture = detachCapture()
-        await retire(capture)
+        let capture = detachCapture(terminalFailure: .persistenceFailed)
+        let completion = await retire(capture)
+        recordCompletion(completion)
         guard failedLifecycle == self.lifecycleID else { return }
+        publishRuntimeFailure(.persistenceFailed, completion: completion)
         state = .failed(.persistenceFailed)
     }
 
-    private func cameraDisconnected(lifecycleID: Int) async {
+    private func cameraDisconnected(lifecycleID: UInt64) async {
         guard lifecycleID == self.lifecycleID else { return }
         self.lifecycleID += 1
         let failedLifecycle = self.lifecycleID
         activeConfiguration = nil
-        let capture = detachCapture()
-        await retire(capture)
+        let capture = detachCapture(terminalFailure: .cameraDisconnected)
+        let completion = await retire(capture)
+        recordCompletion(completion)
         guard failedLifecycle == self.lifecycleID else { return }
+        publishRuntimeFailure(.cameraDisconnected, completion: completion)
         state = .failed(.cameraDisconnected)
     }
 
-    private func fail(_ failure: CameraFrameSourceFailure, lifecycleID: Int) async {
+    private func publishRuntimeFailure(
+        _ failure: CameraFrameSourceFailure,
+        completion: CameraLifecycleCompletion?
+    ) {
+        guard let completion else { return }
+        eventChannel.offerDurableTerminal(
+            .failed(
+                CameraFrameSourceFailureEvent(
+                    lifecycleID: completion.lifecycleID,
+                    sequence: completion.durablePersistedEventCount,
+                    failure: failure
+                )
+            )
+        )
+    }
+
+    private func fail(_ failure: CameraFrameSourceFailure, lifecycleID: UInt64) async {
         guard lifecycleID == self.lifecycleID else { return }
         self.lifecycleID += 1
         let failedLifecycle = self.lifecycleID
         activeConfiguration = nil
-        let capture = detachCapture()
-        await retire(capture)
+        let capture = detachCapture(terminalFailure: failure)
+        recordCompletion(await retire(capture))
         guard failedLifecycle == self.lifecycleID else { return }
         state = .failed(failure)
     }
 
-    private func detachCapture() -> DetachedCapture {
+    private func detachCapture(
+        terminalFailure: CameraFrameSourceFailure? = nil
+    ) -> DetachedCapture {
         let currentIngress = ingress
         if let currentIngress {
             lastMetrics = currentIngress.metrics
@@ -462,27 +574,69 @@ actor CameraFrameSource {
         }
         let capture = DetachedCapture(
             ingress: currentIngress,
-            persistenceTask: persistenceTask
+            lifecycleID: activeLifecycleID,
+            persistenceTask: persistenceTask,
+            terminalFailure: terminalFailure
         )
+        activeLifecycleID = nil
         persistenceTask = nil
         capture.persistenceTask?.cancel()
         return capture
     }
 
-    private func retire(_ capture: DetachedCapture) async {
+    private func retire(_ capture: DetachedCapture) async -> CameraLifecycleCompletion? {
         let previousRetirement = retirementBarrier
         guard capture.needsSessionStop else {
             await previousRetirement?.value
-            return
+            return capture.fallbackCompletion
         }
         let captureSession = self.captureSession
         let retirement = Task {
             await previousRetirement?.value
             await captureSession.stopRunning()
-            await capture.persistenceTask?.value
+            _ = await capture.persistenceTask?.value
         }
         retirementBarrier = retirement
         await retirement.value
+        return await completion(for: capture)
+    }
+
+    private func completion(
+        for capture: DetachedCapture
+    ) async -> CameraLifecycleCompletion? {
+        let base = await capture.persistenceTask?.value ?? capture.fallbackCompletion
+        guard let base, let terminalFailure = capture.terminalFailure else { return base }
+        return CameraLifecycleCompletion(
+            lifecycleID: base.lifecycleID,
+            durablePersistedEventCount: base.durablePersistedEventCount,
+            terminalFailure: terminalFailure,
+            durablePersistedEvents: base.durablePersistedEvents
+        )
+    }
+
+    private func recordCompletion(_ completion: CameraLifecycleCompletion?) {
+        guard let completion else { return }
+        lastCompletion = completion
+    }
+
+    private func recordEarlyFailure(
+        _ failure: CameraFrameSourceFailure,
+        lifecycleID: UInt64
+    ) {
+        activeLifecycleID = nil
+        lastCompletion = CameraLifecycleCompletion(
+            lifecycleID: lifecycleID,
+            durablePersistedEventCount: 0,
+            terminalFailure: failure
+        )
+    }
+
+    private func emptyCompletion() -> CameraLifecycleCompletion {
+        CameraLifecycleCompletion(
+            lifecycleID: lifecycleID,
+            durablePersistedEventCount: 0,
+            terminalFailure: nil
+        )
     }
 
     private func waitForShutdown() async {
@@ -503,19 +657,21 @@ private final class CameraFrameIngress: @unchecked Sendable {
     private var continuation: AsyncStream<CapturedFrame>.Continuation?
     private let eventChannel: CameraEventChannel
     private let previewObserver: any CameraPreviewObserving
-    private var nextFrameIndex = 0
+    private var nextFrameIndex: Int
     private var currentMetrics = CameraFrameSourceMetrics()
 
     init(
         gate: CameraSampleGate,
         continuation: AsyncStream<CapturedFrame>.Continuation,
         eventChannel: CameraEventChannel,
-        previewObserver: any CameraPreviewObserving
+        previewObserver: any CameraPreviewObserving,
+        startingFrameIndex: Int = 0
     ) {
         self.gate = gate
         self.continuation = continuation
         self.eventChannel = eventChannel
         self.previewObserver = previewObserver
+        nextFrameIndex = startingFrameIndex
     }
 
     var metrics: CameraFrameSourceMetrics {
@@ -596,9 +752,9 @@ struct CameraFrameSourceEvents: AsyncSequence, Sendable {
 }
 
 final class CameraEventChannel: @unchecked Sendable {
-    // The bounded buffer may have one channel-owned overflow event. A
-    // persistence permit prevents a replacement lifecycle from creating a
-    // second durable overflow before the first one drains.
+    // The bounded buffer may have one channel-owned overflow event and one
+    // lifecycle-terminal event behind it. A persistence permit prevents a
+    // replacement lifecycle from overtaking either durable tail event.
     private struct PendingSend {
         let id: UUID
         let event: CameraFrameSourceEvent
@@ -620,6 +776,7 @@ final class CameraEventChannel: @unchecked Sendable {
     private let capacity: Int
     private var buffer: [CameraFrameSourceEvent] = []
     private var pendingSend: PendingSend?
+    private var durableTerminal: CameraFrameSourceEvent?
     private var waitingConsumer: WaitingConsumer?
     private var activeSubscriptionID: UUID?
     private var activeProducerIDs = Set<UUID>()
@@ -659,12 +816,37 @@ final class CameraEventChannel: @unchecked Sendable {
     func offerTelemetry(_ event: CameraFrameSourceEvent) {
         var consumer: CheckedContinuation<CameraFrameSourceEvent?, Never>?
         lock.withLock {
-            guard !finishRequested, activeSubscriptionID != nil else { return }
+            guard !finishRequested,
+                  durableTerminal == nil,
+                  activeSubscriptionID != nil else { return }
             if let waitingConsumer {
                 self.waitingConsumer = nil
                 consumer = waitingConsumer.continuation
             } else if buffer.count < capacity {
                 buffer.append(event)
+            }
+        }
+        consumer?.resume(returning: event)
+    }
+
+    /// Retains the one terminal event for a failed lifecycle after every
+    /// buffered and overflow durable event, including across channel finish.
+    func offerDurableTerminal(_ event: CameraFrameSourceEvent) {
+        guard case .failed = event else {
+            preconditionFailure("Only camera failures may occupy the terminal slot")
+        }
+        var consumer: CheckedContinuation<CameraFrameSourceEvent?, Never>?
+        lock.withLock {
+            guard !finishRequested else { return }
+            precondition(
+                durableTerminal == nil,
+                "A camera lifecycle may publish exactly one terminal failure"
+            )
+            if buffer.isEmpty, pendingSend == nil, let waitingConsumer {
+                self.waitingConsumer = nil
+                consumer = waitingConsumer.continuation
+            } else {
+                durableTerminal = event
             }
         }
         consumer?.resume(returning: event)
@@ -717,6 +899,10 @@ final class CameraEventChannel: @unchecked Sendable {
                         pendingSend = nil
                         result = .some(pending.event)
                         sender = pending.continuation
+                        permitWaiter = promotePersistencePermitLocked()
+                    } else if let terminal = durableTerminal {
+                        durableTerminal = nil
+                        result = .some(terminal)
                         permitWaiter = promotePersistencePermitLocked()
                     } else if isTerminalLocked {
                         result = .some(nil)
@@ -785,6 +971,7 @@ final class CameraEventChannel: @unchecked Sendable {
                         return false
                     }
                     guard pendingSend == nil,
+                          durableTerminal == nil,
                           persistencePermitProducerID == nil else {
                         precondition(
                             waitingPersistencePermit == nil,
@@ -905,6 +1092,7 @@ final class CameraEventChannel: @unchecked Sendable {
     private func promotePersistencePermitLocked() -> CheckedContinuation<Bool, Never>? {
         guard !finishRequested,
               pendingSend == nil,
+              durableTerminal == nil,
               persistencePermitProducerID == nil,
               let waitingPersistencePermit,
               activeProducerIDs.contains(waitingPersistencePermit.producerID) else {
@@ -916,7 +1104,11 @@ final class CameraEventChannel: @unchecked Sendable {
     }
 
     private var isTerminalLocked: Bool {
-        finishRequested && activeProducerIDs.isEmpty && buffer.isEmpty && pendingSend == nil
+        finishRequested
+            && activeProducerIDs.isEmpty
+            && buffer.isEmpty
+            && pendingSend == nil
+            && durableTerminal == nil
     }
 }
 

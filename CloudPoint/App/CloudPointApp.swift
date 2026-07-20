@@ -3,8 +3,11 @@ import SwiftUI
 @main
 struct CloudPointApp: App {
     var body: some Scene {
-        WindowGroup("CloudPoint") {
-            WorkspaceView()
+        DocumentGroup(newDocument: { CloudPointDocument() }) { configuration in
+            WorkspaceView(
+                document: configuration.document,
+                packageURL: configuration.fileURL
+            )
         }
     }
 }

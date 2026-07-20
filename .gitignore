@@ -1,7 +1,7 @@
 .DS_Store
 DerivedData/
 build/
-CloudPoint.xcodeproj/
+CloudPoint*.xcodeproj/
 .tools/
 *.xcuserstate
 xcuserdata/

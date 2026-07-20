@@ -193,6 +193,7 @@ final class WorkerProcessTests: XCTestCase {
         let input = Pipe()
         let output = Pipe()
         let diagnostics = Pipe()
+        let diagnosticRecorder = WorkerProcessDiagnosticRecorder()
         process.executableURL = try launcherURL()
         process.arguments = [try mockWorkerURL().path, "--mode", "immediate-exit"]
         process.environment = ProcessInfo.processInfo.environment.merging([
@@ -201,6 +202,7 @@ final class WorkerProcessTests: XCTestCase {
         process.standardInput = input
         process.standardOutput = output
         process.standardError = diagnostics
+        diagnosticRecorder.start(reading: diagnostics.fileHandleForReading)
 
         try process.run()
         let pid = process.processIdentifier
@@ -208,6 +210,7 @@ final class WorkerProcessTests: XCTestCase {
         output.fileHandleForWriting.closeFile()
         diagnostics.fileHandleForWriting.closeFile()
         defer {
+            diagnosticRecorder.stop(reading: diagnostics.fileHandleForReading)
             _ = kill(-pid, SIGKILL)
             _ = kill(pid, SIGKILL)
             input.fileHandleForWriting.closeFile()
@@ -215,27 +218,46 @@ final class WorkerProcessTests: XCTestCase {
             diagnostics.fileHandleForReading.closeFile()
         }
 
-        let ready = String(decoding: diagnostics.fileHandleForReading.availableData, as: UTF8.self)
-        XCTAssertTrue(ready.contains("CLOUDPOINT_LAUNCHER_READY:\(pid)"))
-        let acknowledgementDeadline = ContinuousClock.now + .milliseconds(200)
-        while ContinuousClock.now < acknowledgementDeadline,
-              !FileManager.default.fileExists(atPath: marker.path) {
-            await Task.yield()
+        let readyToken = "CLOUDPOINT_LAUNCHER_READY:\(pid)"
+        let sawReady = await waitUntil(timeout: .seconds(1)) {
+            diagnosticRecorder.text.contains(readyToken)
         }
-        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+        XCTAssertTrue(
+            sawReady,
+            "Launcher pid \(pid) did not report readiness; diagnostics: \(diagnosticRecorder.text)"
+        )
+        guard sawReady else { return }
+
+        let targetStartedBeforeAcknowledgement = await waitUntil(timeout: .milliseconds(200)) {
+            FileManager.default.fileExists(atPath: marker.path)
+        }
+        XCTAssertFalse(
+            targetStartedBeforeAcknowledgement,
+            "Target started before acknowledgement; diagnostics: \(diagnosticRecorder.text)"
+        )
+        guard !targetStartedBeforeAcknowledgement else { return }
 
         XCTAssertEqual(fcntl(input.fileHandleForWriting.fileDescriptor, F_SETNOSIGPIPE, 1), 0)
         var acknowledgement: UInt8 = 0x06
         XCTAssertEqual(Darwin.write(input.fileHandleForWriting.fileDescriptor, &acknowledgement, 1), 1)
         input.fileHandleForWriting.closeFile()
 
-        let targetDeadline = ContinuousClock.now + .seconds(1)
-        while ContinuousClock.now < targetDeadline,
-              !FileManager.default.fileExists(atPath: marker.path) {
-            await Task.yield()
+        let targetStarted = await waitUntil(timeout: .seconds(1)) {
+            FileManager.default.fileExists(atPath: marker.path)
         }
-        XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path))
-        process.waitUntilExit()
+        XCTAssertTrue(
+            targetStarted,
+            "Target did not start after acknowledgement; diagnostics: \(diagnosticRecorder.text)"
+        )
+        guard targetStarted else { return }
+
+        let processExited = await waitUntil(timeout: .seconds(1)) { !process.isRunning }
+        XCTAssertTrue(
+            processExited,
+            "Target pid \(pid) did not exit; marker exists: \(FileManager.default.fileExists(atPath: marker.path)); "
+                + "diagnostics: \(diagnosticRecorder.text)"
+        )
+        guard processExited else { return }
         XCTAssertEqual(process.terminationStatus, 24)
     }
 
@@ -825,6 +847,23 @@ final class WorkerProcessTests: XCTestCase {
         throw WorkerProcessError.notRunning
     }
 
+    private func waitUntil(
+        timeout: Duration,
+        condition: () -> Bool
+    ) async -> Bool {
+        let clock = ContinuousClock()
+        let deadline = clock.now + timeout
+        while clock.now < deadline {
+            if condition() { return true }
+            do {
+                try await clock.sleep(for: .milliseconds(5))
+            } catch {
+                return condition()
+            }
+        }
+        return condition()
+    }
+
     private func XCTAssertReady(_ envelope: WorkerEnvelope, file: StaticString = #filePath, line: UInt = #line) {
         guard case .ready? = envelope.event else {
             XCTFail("Expected ready, got \(envelope)", file: file, line: line)
@@ -980,6 +1019,31 @@ private final class WorkerProcessErrorRecorder: @unchecked Sendable {
 
     func contains(_ error: WorkerProcessError) -> Bool {
         lock.withLock { errors.contains(error) }
+    }
+}
+
+private final class WorkerProcessDiagnosticRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var data = Data()
+
+    var text: String {
+        String(decoding: lock.withLock { data }, as: UTF8.self)
+    }
+
+    func start(reading handle: FileHandle) {
+        handle.readabilityHandler = { [weak self] readableHandle in
+            let chunk = readableHandle.availableData
+            guard !chunk.isEmpty else {
+                readableHandle.readabilityHandler = nil
+                return
+            }
+            guard let self else { return }
+            lock.withLock { data.append(chunk) }
+        }
+    }
+
+    func stop(reading handle: FileHandle) {
+        handle.readabilityHandler = nil
     }
 }
 

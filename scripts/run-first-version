@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "$#" -gt 1 || ("$#" -eq 1 && "$1" != "--build-only") ]]; then
+  echo "usage: scripts/run-first-version [--build-only]" >&2
+  exit 64
+fi
+
+scripts_dir="$(cd "$(dirname "$0")" && pwd)"
+repo_root="$(cd "${scripts_dir}/.." && pwd)"
+temp_root="${TMPDIR:-/tmp}"
+derived_data="${temp_root%/}/cloudpoint-first-version"
+
+"${scripts_dir}/bootstrap"
+
+xcodebuild build -quiet \
+  -project "${repo_root}/CloudPoint.xcodeproj" \
+  -scheme CloudPoint \
+  -configuration Debug \
+  -destination 'platform=macOS,arch=arm64' \
+  -derivedDataPath "$derived_data"
+
+app_path="${derived_data}/Build/Products/Debug/CloudPoint.app"
+if [[ ! -x "${app_path}/Contents/MacOS/CloudPoint" ]]; then
+  echo "CloudPoint build product is missing: $app_path" >&2
+  exit 70
+fi
+
+echo "CloudPoint first version: $app_path"
+echo "Mock reconstruction is enabled only for this test launch."
+
+if [[ "${1:-}" != "--build-only" ]]; then
+  open -n "$app_path" --args --mock-engine
+fi

@@ -303,6 +303,7 @@ final class ProtocolOwnershipContractTests: XCTestCase {
             .fixture(index: 0, inferenceStart: 2, frames: [2, 6, 9]),
             .fixture(index: 1, inferenceStart: 6, frames: [14, 20]),
         ]
+        manifest.synchronizeSessionCounts()
 
         let checkpoint = try XCTUnwrap(manifest.resumeCheckpoint())
         XCTAssertEqual(
@@ -318,6 +319,7 @@ final class ProtocolOwnershipContractTests: XCTestCase {
             PersistedFrame(index: $0, sourceTimestamp: Double($0), relativePath: String(format: "Frames/%08u.jpg", $0))
         }
         manifest.completedWindows = [.fixture(index: 0, inferenceStart: 11, frames: [11, 19])]
+        manifest.synchronizeSessionCounts()
 
         XCTAssertEqual(
             try manifest.resumeCheckpoint(),
@@ -349,6 +351,7 @@ final class ProtocolOwnershipContractTests: XCTestCase {
             .fixture(index: 0, inferenceStart: 1, frames: [1, 3]),
             .fixture(index: 1, inferenceStart: 3, frames: [5]),
         ]
+        baseline.synchronizeSessionCounts()
         XCTAssertNoThrow(try ProjectManifest.validate(baseline))
 
         let mutations: [(String, (inout ProjectManifest) -> Void)] = [
@@ -396,6 +399,7 @@ final class ProtocolOwnershipContractTests: XCTestCase {
         var manifest = ProjectManifest.fixtureV2(windowOverlap: 1)
         manifest.frames = [PersistedFrame(index: .max, sourceTimestamp: 1, relativePath: "Frames/4294967295.jpg")]
         manifest.completedWindows = [.fixture(index: .max, inferenceStart: .max, frames: [.max])]
+        manifest.synchronizeSessionCounts()
         XCTAssertThrowsError(try manifest.resumeCheckpoint()) {
             XCTAssertEqual($0 as? ProjectManifestError, .checkpointWindowIndexOverflow)
         }
@@ -511,6 +515,17 @@ private extension ProjectManifest {
             createdAt: Date(timeIntervalSinceReferenceDate: 1_000),
             updatedAt: Date(timeIntervalSinceReferenceDate: 2_000),
             engineConfiguration: EngineConfiguration(windowOverlap: windowOverlap)
+        )
+    }
+
+    mutating func synchronizeSessionCounts() {
+        let captured = UInt64(frames.count)
+        let processed = UInt64(completedWindows.flatMap(\.frameArtifacts).count)
+        sessionState = SessionState(
+            phase: .processing,
+            capturedCount: captured,
+            queuedCount: max(processed, captured),
+            processedCount: processed
         )
     }
 }
