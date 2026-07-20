@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "sourceRepository": "https://github.com/Robbyant/lingbot-map",
+  "sourceCommit": "7ff6f3ed0913d4d326f8f13bbb429c4ffc0195c2",
+  "sourceDirectory": "example/courthouse",
+  "license": {
+    "spdx": "Apache-2.0",
+    "url": "https://github.com/Robbyant/lingbot-map/blob/7ff6f3ed0913d4d326f8f13bbb429c4ffc0195c2/LICENSE.txt"
+  },
+  "files": {
+    "000000.png": "8b07befd90f26e87411e64f7fd433c6b96b2dec6d640ce1e3c78f35402043b8c",
+    "000001.png": "382233d33a4e6c4c596d09cf8d44c361962df502a180bfa9c1a64e8cf10e3425",
+    "000002.png": "234711bff562f68da4e8515d0788404d406591a93f0efe4391c34ff6c7f3f1e2",
+    "000003.png": "54549d7a0a6386d1e2279060836edddd20b68c4c5f3acfe7198ed20cc0c869b4",
+    "000004.png": "52a808711be5309c8be9041acd947d2adba0d754da0c35da6537c1fb1b210c9f",
+    "000005.png": "7d44bf8ecaa77e06567a431cb0d731bf31c486fa7c397ee76d8571d43a4f6c87",
+    "000006.png": "b4c6aa89f28d696c3acdb6b06917ed7d51a21dbb1a770b6e7b4ec2262fc8030a",
+    "000007.png": "e94422026dee320f1c1455ec461df9dbff80c10557a582ec5f62d0a57dd66eea",
+    "000008.png": "b18bfeb7f53b4a24e873eb466ec10f6dae41a430defbe82566c9b2d587c6a3ad"
+  }
+}
