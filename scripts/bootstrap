@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+required_xcodegen="2.46.0"
+actual_xcodegen="$(xcodegen --version 2>/dev/null | awk '{print $2}' || true)"
+if [[ "$actual_xcodegen" != "$required_xcodegen" ]]; then
+  brew install xcodegen
+fi
+
+if xcodebuild -showComponent MetalToolchain -json | grep -q '"status" : "uninstalled"'; then
+  xcodebuild -downloadComponent MetalToolchain
+fi
+
+"$(dirname "$0")/generate-project"

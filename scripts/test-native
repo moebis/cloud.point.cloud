@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+xcodebuild build -project CloudPoint.xcodeproj -scheme CloudPoint -destination 'platform=macOS,arch=arm64'
+xcodebuild build -project CloudPoint.xcodeproj -scheme CloudPointTests -destination 'platform=macOS,arch=arm64'
+xcodebuild build -project CloudPoint.xcodeproj -scheme CloudPointMockWorker -destination 'platform=macOS,arch=arm64'
+xcodebuild test -project CloudPoint.xcodeproj -scheme CloudPoint -destination 'platform=macOS,arch=arm64'

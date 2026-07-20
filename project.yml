@@ -1,0 +1,83 @@
+name: CloudPoint
+
+options:
+  deploymentTarget:
+    macOS: "15.0"
+
+configs:
+  Debug: debug
+  Release: release
+
+targets:
+  CloudPoint:
+    type: application
+    platform: macOS
+    sources:
+      - path: CloudPoint
+        excludes:
+          - Resources/Info.plist
+          - Resources/CloudPoint.entitlements
+    configFiles:
+      Debug: Config/Base.xcconfig
+      Release: Config/Base.xcconfig
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: cloud.point.cloud.CloudPoint
+        INFOPLIST_FILE: CloudPoint/Resources/Info.plist
+        CODE_SIGN_ENTITLEMENTS: CloudPoint/Resources/CloudPoint.entitlements
+        MACOSX_DEPLOYMENT_TARGET: "15.0"
+        SWIFT_VERSION: "6.0"
+        SWIFT_STRICT_CONCURRENCY: complete
+
+  CloudPointTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: CloudPointTests
+    dependencies:
+      - target: CloudPoint
+    configFiles:
+      Debug: Config/Base.xcconfig
+      Release: Config/Base.xcconfig
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: cloud.point.cloud.CloudPointTests
+        GENERATE_INFOPLIST_FILE: YES
+        MACOSX_DEPLOYMENT_TARGET: "15.0"
+        SWIFT_VERSION: "6.0"
+        SWIFT_STRICT_CONCURRENCY: complete
+
+  CloudPointMockWorker:
+    type: tool
+    platform: macOS
+    sources:
+      - path: CloudPointMockWorker
+    configFiles:
+      Debug: Config/Base.xcconfig
+      Release: Config/Base.xcconfig
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: cloud.point.cloud.CloudPointMockWorker
+        MACOSX_DEPLOYMENT_TARGET: "15.0"
+        SWIFT_VERSION: "6.0"
+        SWIFT_STRICT_CONCURRENCY: complete
+
+schemes:
+  CloudPoint:
+    build:
+      targets:
+        CloudPoint: all
+    test:
+      targets:
+        - CloudPointTests
+  CloudPointTests:
+    build:
+      targets:
+        CloudPointTests: all
+    test:
+      targets:
+        - CloudPointTests
+  CloudPointMockWorker:
+    build:
+      targets:
+        CloudPointMockWorker: all

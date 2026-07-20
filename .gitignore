@@ -1,0 +1,8 @@
+.DS_Store
+DerivedData/
+build/
+CloudPoint.xcodeproj/
+*.xcuserstate
+xcuserdata/
+*.cloudpoint/
+*.cloudpoint
