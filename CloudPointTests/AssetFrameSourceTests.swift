@@ -1,5 +1,6 @@
 import AVFoundation
 import CoreGraphics
+import Darwin
 import ImageIO
 import XCTest
 @testable import CloudPoint
@@ -308,7 +309,7 @@ final class AssetFrameSourceTests: XCTestCase {
         XCTAssertEqual(try fileManager.contentsOfDirectory(atPath: escaped.path), [])
     }
 
-    func testPersistenceUsesOriginallyOpenedFramesDirectoryAfterPathIsReplacedBySymlink() async throws {
+    func testPersistenceRejectsFramesDirectoryRelocatedOutsidePackageBeforeWrite() async throws {
         let directory = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let fixture = try await VideoFixtureFactory.makeVFRMovie(in: directory)
@@ -318,18 +319,59 @@ final class AssetFrameSourceTests: XCTestCase {
         let fileManager = FileManager.default
         let persistence = try JPEGFramePersistence(packageURL: package.url)
         let framesURL = package.url.appending(path: "Frames", directoryHint: .isDirectory)
-        let heldFramesURL = package.url.appending(path: "HeldFrames", directoryHint: .isDirectory)
+        let heldFramesURL = directory.appending(path: "held-frames", directoryHint: .isDirectory)
         let escapedURL = directory.appending(path: "escaped", directoryHint: .isDirectory)
         try fileManager.createDirectory(at: escapedURL, withIntermediateDirectories: false)
 
         try fileManager.moveItem(at: framesURL, to: heldFramesURL)
         try fileManager.createSymbolicLink(at: framesURL, withDestinationURL: escapedURL)
 
-        let persisted = try await persistence.persist(frame)
+        do {
+            let emitted = try await persistence.persist(frame)
+            XCTFail("Relocated Frames directory unexpectedly emitted \(emitted)")
+        } catch {
+            XCTAssertEqual(error as? FramePersistenceError, .unsafePackageLayout)
+        }
 
-        XCTAssertEqual(persisted.relativePath, "Frames/00000000.jpg")
-        XCTAssertTrue(fileManager.fileExists(atPath: heldFramesURL.appending(path: "00000000.jpg").path))
-        XCTAssertFalse(fileManager.fileExists(atPath: heldFramesURL.appending(path: "00000000.jpg.partial").path))
+        XCTAssertEqual(try fileManager.contentsOfDirectory(atPath: heldFramesURL.path), [])
+        XCTAssertEqual(try fileManager.contentsOfDirectory(atPath: escapedURL.path), [])
+    }
+
+    func testPersistenceRejectsFramesDirectoryReplacementAfterPartialCreation() async throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let package = try TemporaryProjectPackage.make()
+        let fileManager = FileManager.default
+        let persistence = try JPEGFramePersistence(packageURL: package.url)
+        let frame = try makeLargeNoisyFrame()
+        let framesURL = package.url.appending(path: "Frames", directoryHint: .isDirectory)
+        let partialURL = framesURL.appending(path: "00000000.jpg.partial")
+        let heldFramesURL = directory.appending(path: "held-frames", directoryHint: .isDirectory)
+        let escapedURL = directory.appending(path: "escaped", directoryHint: .isDirectory)
+        try fileManager.createDirectory(at: escapedURL, withIntermediateDirectories: false)
+
+        let persistenceTask = Task { () -> Result<PersistedFrame, Error> in
+            do { return .success(try await persistence.persist(frame)) }
+            catch { return .failure(error) }
+        }
+
+        do {
+            try await waitForFile(at: partialURL, timeout: .seconds(15))
+            try fileManager.moveItem(at: framesURL, to: heldFramesURL)
+            try fileManager.createSymbolicLink(at: framesURL, withDestinationURL: escapedURL)
+        } catch {
+            persistenceTask.cancel()
+            _ = await persistenceTask.value
+            throw error
+        }
+
+        switch await persistenceTask.value {
+        case let .success(emitted):
+            XCTFail("Replaced Frames directory unexpectedly emitted \(emitted)")
+        case let .failure(error):
+            XCTAssertEqual(error as? FramePersistenceError, .unsafePackageLayout)
+        }
+        XCTAssertEqual(try fileManager.contentsOfDirectory(atPath: heldFramesURL.path), [])
         XCTAssertEqual(try fileManager.contentsOfDirectory(atPath: escapedURL.path), [])
     }
 
@@ -387,6 +429,55 @@ final class AssetFrameSourceTests: XCTestCase {
         return url
     }
 
+    private func makeLargeNoisyFrame() throws -> CapturedFrame {
+        let width = 4_096
+        let height = 4_096
+        var pixelBuffer: CVPixelBuffer?
+        let status = CVPixelBufferCreate(
+            kCFAllocatorDefault,
+            width,
+            height,
+            kCVPixelFormatType_32BGRA,
+            [
+                kCVPixelBufferCGImageCompatibilityKey: true,
+                kCVPixelBufferCGBitmapContextCompatibilityKey: true,
+            ] as CFDictionary,
+            &pixelBuffer
+        )
+        guard status == kCVReturnSuccess, let pixelBuffer else {
+            throw PartialCreationCoordinationError.cannotCreatePixelBuffer(status)
+        }
+
+        CVPixelBufferLockBaseAddress(pixelBuffer, [])
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, []) }
+        guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else {
+            throw PartialCreationCoordinationError.missingPixelBufferBaseAddress
+        }
+        let byteCount = CVPixelBufferGetBytesPerRow(pixelBuffer) * height
+        arc4random_buf(baseAddress, byteCount)
+        let bytes = baseAddress.assumingMemoryBound(to: UInt8.self)
+        for offset in stride(from: 3, to: byteCount, by: 4) { bytes[offset] = 255 }
+
+        return CapturedFrame(
+            index: 0,
+            presentationTimestamp: .zero,
+            pixelBuffer: pixelBuffer,
+            orientation: .identity,
+            sourceSampleSequence: 0
+        )
+    }
+
+    private func waitForFile(at url: URL, timeout: Duration) async throws {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while !FileManager.default.fileExists(atPath: url.path) {
+            guard clock.now < deadline else {
+                throw PartialCreationCoordinationError.timedOutWaitingForPartial
+            }
+            await Task.yield()
+        }
+    }
+
     private func decodeJPEG(at url: URL) throws -> CGImage {
         let source = try XCTUnwrap(CGImageSourceCreateWithURL(url as CFURL, nil))
         return try XCTUnwrap(CGImageSourceCreateImageAtIndex(source, 0, nil))
@@ -420,6 +511,12 @@ final class AssetFrameSourceTests: XCTestCase {
 }
 
 private struct UnexpectedEmissionError: Error {}
+
+private enum PartialCreationCoordinationError: Error {
+    case cannotCreatePixelBuffer(CVReturn)
+    case missingPixelBufferBaseAddress
+    case timedOutWaitingForPartial
+}
 
 private enum ConcurrentPersistenceOutcome: Sendable {
     case success(PersistedFrame)

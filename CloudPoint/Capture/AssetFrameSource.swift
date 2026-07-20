@@ -191,6 +191,7 @@ actor JPEGFramePersistence: FramePersistence {
 
         let jpeg = try makeOrientedJPEG(frame)
         try Task.checkCancellation()
+        try validateFramesDirectoryIdentity()
         let partialDescriptor = partialName.withCString {
             Darwin.openat(
                 framesDescriptor,
@@ -217,6 +218,7 @@ actor JPEGFramePersistence: FramePersistence {
             }
             descriptorIsOpen = false
             try Task.checkCancellation()
+            try validateFramesDirectoryIdentity()
             let renameResult = partialName.withCString { partialPath in
                 filename.withCString { finalPath in
                     renameatx_np(
@@ -230,10 +232,12 @@ actor JPEGFramePersistence: FramePersistence {
             }
             guard renameResult == 0 else { throw FramePersistenceError.ioFailure(errno) }
             renamed = true
+            try validateFramesDirectoryIdentity()
             guard Darwin.fsync(framesDescriptor) == 0 else {
                 throw FramePersistenceError.ioFailure(errno)
             }
             try Task.checkCancellation()
+            try validateFramesDirectoryIdentity()
         } catch {
             if descriptorIsOpen { Darwin.close(partialDescriptor) }
             partialName.withCString { _ = Darwin.unlinkat(framesDescriptor, $0, 0) }
@@ -249,6 +253,30 @@ actor JPEGFramePersistence: FramePersistence {
             sourceTimestamp: frame.presentationTimestamp.seconds,
             relativePath: "Frames/\(filename)"
         )
+    }
+
+    private func validateFramesDirectoryIdentity() throws {
+        var heldFramesStatus = stat()
+        guard Darwin.fstat(framesDescriptor, &heldFramesStatus) == 0,
+              heldFramesStatus.st_mode & S_IFMT == S_IFDIR else {
+            throw FramePersistenceError.unsafePackageLayout
+        }
+
+        var packageFramesStatus = stat()
+        let statusResult = "Frames".withCString {
+            Darwin.fstatat(
+                packageDescriptor,
+                $0,
+                &packageFramesStatus,
+                AT_SYMLINK_NOFOLLOW
+            )
+        }
+        guard statusResult == 0,
+              packageFramesStatus.st_mode & S_IFMT == S_IFDIR,
+              packageFramesStatus.st_dev == heldFramesStatus.st_dev,
+              packageFramesStatus.st_ino == heldFramesStatus.st_ino else {
+            throw FramePersistenceError.unsafePackageLayout
+        }
     }
 
     private func writeAll(_ data: Data, to descriptor: Int32) throws {
