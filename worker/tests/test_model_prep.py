@@ -4,6 +4,8 @@ import hashlib
 import json
 import os
 import socket
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -15,6 +17,8 @@ from cloudpoint_worker.model.config import ModelConfig
 from cloudpoint_worker.model.weight_specs import WeightSpec, build_weight_specs
 from cloudpoint_worker.model_prep.cli import model_prepare_parser
 from cloudpoint_worker.model_prep.convert import (
+    _atomic_write_bytes,
+    _restricted_environment,
     convert_state_dict,
     load_checkpoint,
     prepare_model,
@@ -110,11 +114,71 @@ def test_converter_rejects_nonfloating_tensors_except_identity_scalars() -> None
     assert rows[0]["destinationDtype"] == "int64"
 
 
+def test_load_checkpoint_rejects_unpinned_artifact_before_loading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "arbitrary.pt"
+    torch.save({"weight": torch.ones(1)}, path)
+    calls: list[str] = []
+
+    def unexpected_load(*args: object, **kwargs: object) -> object:
+        calls.append("restricted")
+        raise AssertionError("restricted loader must not run")
+
+    def unexpected_child(*args: object, **kwargs: object) -> object:
+        calls.append("unsafe")
+        raise AssertionError("unsafe loader must not run")
+
+    monkeypatch.setattr(torch, "load", unexpected_load)
+    monkeypatch.setattr(
+        "cloudpoint_worker.model_prep.convert._trusted_load_in_child",
+        unexpected_child,
+    )
+
+    with pytest.raises(WorkerFault, match="MODEL_CHECKSUM_MISMATCH"):
+        load_checkpoint(path)
+    assert calls == []
+
+
+def test_trusted_child_reverifies_pinned_provenance_in_subprocess(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "arbitrary.pt"
+    torch.save({"weight": torch.ones(1)}, path)
+    output = tmp_path / "unsafe.safetensors"
+
+    process = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "cloudpoint_worker.model_prep.convert",
+            "--trusted-child",
+            str(path),
+            str(output),
+        ],
+        check=False,
+        capture_output=True,
+        env=_restricted_environment(),
+    )
+
+    assert process.returncode != 0
+    assert b"MODEL_CHECKSUM_MISMATCH" in process.stderr
+    assert not output.exists()
+
+
 def test_load_checkpoint_uses_restricted_mode_first(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     path = tmp_path / "checkpoint.pt"
     torch.save({"weight": torch.ones(1)}, path)
+    checkpoint_bytes = path.read_bytes()
+    monkeypatch.setattr(
+        "cloudpoint_worker.model_prep.convert.MODEL_SIZE", len(checkpoint_bytes)
+    )
+    monkeypatch.setattr(
+        "cloudpoint_worker.model_prep.convert.MODEL_SHA256",
+        hashlib.sha256(checkpoint_bytes).hexdigest(),
+    )
     calls: list[bool] = []
     original_load = torch.load
 
@@ -134,6 +198,11 @@ def test_trusted_fallback_scrubs_environment(
 ) -> None:
     path = tmp_path / "checkpoint.pt"
     path.write_bytes(b"checkpoint")
+    monkeypatch.setattr("cloudpoint_worker.model_prep.convert.MODEL_SIZE", 10)
+    monkeypatch.setattr(
+        "cloudpoint_worker.model_prep.convert.MODEL_SHA256",
+        hashlib.sha256(b"checkpoint").hexdigest(),
+    )
     captured: dict[str, object] = {}
 
     def restricted_failure(*args: object, **kwargs: object) -> object:
@@ -142,14 +211,10 @@ def test_trusted_fallback_scrubs_environment(
 
     def fake_child(
         checkpoint: Path,
-        expected_size: int,
-        expected_sha256: str,
         environment: dict[str, str],
     ) -> dict[str, torch.Tensor]:
         captured.update(
             checkpoint=checkpoint,
-            expected_size=expected_size,
-            expected_sha256=expected_sha256,
             environment=environment,
         )
         return {"weight": torch.ones(1)}
@@ -194,6 +259,13 @@ def test_prepare_writes_atomic_deterministic_manifests(
     )
     source_bytes = checkpoint.read_bytes()
     monkeypatch.setattr(
+        "cloudpoint_worker.model_prep.convert.MODEL_SIZE", len(source_bytes)
+    )
+    monkeypatch.setattr(
+        "cloudpoint_worker.model_prep.convert.MODEL_SHA256",
+        hashlib.sha256(source_bytes).hexdigest(),
+    )
+    monkeypatch.setattr(
         "cloudpoint_worker.model_prep.convert.verify_checkpoint",
         lambda path: VerifiedArtifact(
             path.resolve(), len(source_bytes), hashlib.sha256(source_bytes).hexdigest()
@@ -213,6 +285,22 @@ def test_prepare_writes_atomic_deterministic_manifests(
     ).hexdigest()
     assert manifest.tensor_count == 2
     assert not list(destination.glob("*.partial"))
+
+
+def test_atomic_replace_failure_removes_partial_and_never_publishes_final(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    destination = tmp_path / "manifest.json"
+
+    def fail_replace(source: Path, target: Path) -> None:
+        raise OSError("injected replace failure")
+
+    monkeypatch.setattr(os, "replace", fail_replace)
+    with pytest.raises(OSError, match="injected replace failure"):
+        _atomic_write_bytes(destination, b"content")
+
+    assert not destination.exists()
+    assert not destination.with_name("manifest.json.partial").exists()
 
 
 def test_weight_specs_are_deterministic_and_unique() -> None:

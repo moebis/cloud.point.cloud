@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 import hashlib
-import hmac
 import importlib.metadata
 import json
 import os
-import stat
 import subprocess
 import sys
 import tempfile
@@ -30,7 +28,6 @@ from cloudpoint_worker.model_prep.provenance import (
     MODEL_SHA256,
     MODEL_SIZE,
     SOURCE_COMMIT,
-    VerifiedArtifact,
     verify_checkpoint,
     verify_open_file,
 )
@@ -81,17 +78,6 @@ def _open_checkpoint(path: Path) -> object:
     return os.fdopen(fd, "rb", closefd=True)
 
 
-def _fingerprint_open_file(source: object) -> tuple[int, str]:
-    fileno = source.fileno()  # type: ignore[attr-defined]
-    info = os.fstat(fileno)
-    if not stat.S_ISREG(info.st_mode):
-        raise _fault("MODEL_INVALID_PATH", "checkpoint must be a regular file")
-    source.seek(0)  # type: ignore[attr-defined]
-    digest = hashlib.file_digest(source, "sha256").hexdigest()  # type: ignore[arg-type]
-    source.seek(0)  # type: ignore[attr-defined]
-    return info.st_size, digest
-
-
 def _restricted_environment() -> dict[str, str]:
     return {
         "LC_ALL": "C",
@@ -104,8 +90,6 @@ def _restricted_environment() -> dict[str, str]:
 
 def _trusted_load_in_child(
     checkpoint: Path,
-    expected_size: int,
-    expected_sha256: str,
     environment: dict[str, str],
 ) -> dict[str, torch.Tensor]:
     with tempfile.TemporaryDirectory(prefix="cloudpoint-trusted-load-") as temporary:
@@ -117,8 +101,6 @@ def _trusted_load_in_child(
                 "cloudpoint_worker.model_prep.convert",
                 "--trusted-child",
                 str(checkpoint),
-                str(expected_size),
-                expected_sha256,
                 str(output),
             ],
             check=False,
@@ -137,26 +119,20 @@ def _trusted_load_in_child(
 
 def load_checkpoint(
     path: Path,
-    verified: VerifiedArtifact | None = None,
+    *,
     progress: Callable[[str], None] | None = None,
 ) -> tuple[dict[str, torch.Tensor], bool]:
     """Load restricted-first, retrying unsafe pickle only in a scrubbed child."""
 
     with _open_checkpoint(path) as source:  # type: ignore[attr-defined]
-        size, digest = _fingerprint_open_file(source)
-        if verified is not None and (
-            size != verified.size or not hmac.compare_digest(digest, verified.sha256)
-        ):
-            raise WorkerFault("MODEL_CHECKSUM_MISMATCH", "checkpoint changed", True)
+        verify_open_file(source, MODEL_SIZE, MODEL_SHA256)
         try:
             payload = torch.load(source, map_location="cpu", weights_only=True)
         except Exception:
-            verify_open_file(source, size, digest)
+            verify_open_file(source, MODEL_SIZE, MODEL_SHA256)
             if progress is not None:
                 progress("trustedArtifactLoading")
-            state = _trusted_load_in_child(
-                path.resolve(), size, digest, _restricted_environment()
-            )
+            state = _trusted_load_in_child(path.resolve(), _restricted_environment())
             return state, True
     return _state_dict(payload), False
 
@@ -303,7 +279,7 @@ def prepare_model(
     artifact = verify_checkpoint(checkpoint)
     if progress is not None:
         progress("restrictedLoading")
-    state, _ = load_checkpoint(checkpoint, artifact, progress)
+    state, _ = load_checkpoint(checkpoint, progress=progress)
     if progress is not None:
         progress("converting")
     converted, rows = convert_state_dict(state, specs)
@@ -348,15 +324,12 @@ def prepare_model(
 
 
 def _trusted_child(arguments: list[str]) -> int:
-    if len(arguments) != 4:
+    if len(arguments) != 2:
         return 2
     checkpoint = Path(arguments[0])
-    expected_size = int(arguments[1])
-    expected_sha256 = arguments[2]
-    output = Path(arguments[3])
-    verified = VerifiedArtifact(checkpoint, expected_size, expected_sha256)
+    output = Path(arguments[1])
     with _open_checkpoint(checkpoint) as source:  # type: ignore[attr-defined]
-        verify_open_file(source, verified.size, verified.sha256)
+        verify_open_file(source, MODEL_SIZE, MODEL_SHA256)
         payload = torch.load(source, map_location="cpu", weights_only=False)
     state = _state_dict(payload)
     save_file(dict(sorted(state.items())), output)
