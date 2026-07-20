@@ -16,6 +16,10 @@ protocol ReconstructionEngine: Sendable {
     func shutdown() async
 }
 
+protocol ReconstructionEngineFactory: Sendable {
+    func makeEngine(modelDirectory: URL) throws -> any ReconstructionEngine
+}
+
 enum EngineConfigurationError: Error, Sendable, Equatable {
     case invalidScaleFrames(UInt32)
     case invalidWindowSize(UInt32)
