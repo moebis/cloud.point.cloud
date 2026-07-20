@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import math
-import stat
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -12,7 +12,7 @@ from typing import Protocol
 import numpy as np
 
 from cloudpoint_worker import PROTOCOL_VERSION
-from cloudpoint_worker.cpc import atomic_write_bytes
+from cloudpoint_worker.cpc import _open_directory_fd, atomic_write_bytes
 from cloudpoint_worker.errors import WorkerFault
 from cloudpoint_worker.preprocess import PreprocessedFrame
 
@@ -42,14 +42,15 @@ def _fault(message: str, *, code: str = "INVALID_MODEL_OUTPUT") -> WorkerFault:
     return WorkerFault(code, message, False)
 
 
-def _real_directory(path: Path) -> None:
+def _real_directory(path: Path, *, create: bool) -> None:
+    descriptor = -1
     try:
-        info = path.lstat()
-    except FileNotFoundError:
-        path.mkdir(mode=0o700)
-        info = path.lstat()
-    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-        raise _fault("artifact directory must not be a symlink")
+        descriptor = _open_directory_fd(path, create_leaf=create)
+    except (OSError, ValueError) as error:
+        raise _fault("artifact directory must be a real symlink-free path") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 
 def _matrix_values(value: object, shape: tuple[int, ...], label: str) -> np.ndarray:
@@ -74,12 +75,7 @@ def write_frame_outputs(
 
     if not project_root.is_absolute():
         raise _fault("project root must be absolute")
-    try:
-        root_info = project_root.lstat()
-    except FileNotFoundError as error:
-        raise _fault("project root does not exist") from error
-    if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode):
-        raise _fault("project root must be a real directory")
+    _real_directory(project_root, create=False)
     if type(frame.index) is not int or not 0 <= frame.index <= 2**32 - 1:
         raise _fault("frame index exceeds UInt32")
     if not math.isfinite(float(frame.source_timestamp)) or frame.source_timestamp < 0:
@@ -88,18 +84,21 @@ def write_frame_outputs(
         raise _fault("confidence floor must be finite and positive")
 
     predictions = project_root / "Predictions"
-    _real_directory(predictions)
+    _real_directory(predictions, create=True)
     stem = f"{frame.index:08d}"
     relative = FrameArtifactPaths(
         depth_path=f"Predictions/{stem}.depth-f16",
         confidence_path=f"Predictions/{stem}.confidence-f16",
         geometry_path=f"Predictions/{stem}.geometry.json",
     )
-    finals = tuple(project_root / value for value in (
-        relative.depth_path,
-        relative.confidence_path,
-        relative.geometry_path,
-    ))
+    finals = tuple(
+        project_root / value
+        for value in (
+            relative.depth_path,
+            relative.confidence_path,
+            relative.geometry_path,
+        )
+    )
     for final in finals:
         if final.exists() or final.is_symlink():
             raise _fault(

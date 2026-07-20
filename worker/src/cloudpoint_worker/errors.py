@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 
+# Do not freeze exceptions: contextlib restores ``__traceback__`` when propagating
+# through generator-based context managers, which requires normal assignment.
 @dataclass
 class WorkerFault(Exception):
     """An internal fault that can be transported without leaking an exception."""

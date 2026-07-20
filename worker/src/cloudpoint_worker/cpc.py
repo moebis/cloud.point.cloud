@@ -22,8 +22,10 @@ _VERSION = 1
 _STRIDE = 24
 _MAX_POINTS = 50_000_000
 _MAX_BYTES = 1_200_000_032
-_UINT16_MAX = 2**16 - 1
 _UINT32_MAX = 2**32 - 1
+_INT64_MIN = -(2**63)
+_INT64_MAX = 2**63 - 1
+_SUPPORTED_FLAGS = 0b11
 
 
 @dataclass(frozen=True)
@@ -59,58 +61,122 @@ def _fault(message: str, *, code: str = "INVALID_POINT_CHUNK") -> WorkerFault:
     return WorkerFault(code, message, False)
 
 
-def _check_final_path(path: Path) -> None:
-    if not path.is_absolute():
-        raise _fault("output path must be absolute")
+def _directory_flags() -> int:
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    directory = getattr(os, "O_DIRECTORY", 0)
+    if no_follow == 0 or directory == 0:
+        raise OSError(errno.ENOTSUP, "safe directory traversal is unavailable")
+    return os.O_RDONLY | no_follow | directory | getattr(os, "O_CLOEXEC", 0)
+
+
+def _path_components(path: Path) -> tuple[str, ...]:
+    if not path.is_absolute() or path.anchor not in {"/", "//"}:
+        raise OSError(errno.EINVAL, "path must be absolute")
+    components = path.parts[1:]
+    if any(
+        component in {"", ".", ".."} or "\0" in component for component in components
+    ):
+        raise OSError(errno.EINVAL, "path contains an unsafe component")
+    return components
+
+
+def _open_directory_fd(path: Path, *, create_leaf: bool = False) -> int:
+    """Open every directory component without following symbolic links."""
+
+    components = _path_components(path)
+    flags = _directory_flags()
+    descriptor = os.open(path.anchor, flags)
     try:
-        target = path.lstat()
-    except FileNotFoundError:
-        target = None
-    if target is not None:
-        if stat.S_ISLNK(target.st_mode):
-            raise _fault("output path must not be a symlink")
-        raise _fault("output already exists", code="OUTPUT_ALREADY_EXISTS")
-    try:
-        parent = path.parent.lstat()
-    except FileNotFoundError as error:
-        raise _fault("output parent does not exist") from error
-    if not stat.S_ISDIR(parent.st_mode) or stat.S_ISLNK(parent.st_mode):
-        raise _fault("output parent must be a real directory")
+        for index, component in enumerate(components):
+            created = False
+            next_descriptor = -1
+            try:
+                try:
+                    next_descriptor = os.open(component, flags, dir_fd=descriptor)
+                except FileNotFoundError:
+                    if not create_leaf or index != len(components) - 1:
+                        raise
+                    try:
+                        os.mkdir(component, mode=0o700, dir_fd=descriptor)
+                        created = True
+                    except FileExistsError:
+                        pass
+                    next_descriptor = os.open(component, flags, dir_fd=descriptor)
+                if created:
+                    os.fsync(descriptor)
+            except BaseException:
+                if next_descriptor >= 0:
+                    os.close(next_descriptor)
+                raise
+            previous_descriptor = descriptor
+            descriptor = next_descriptor
+            os.close(previous_descriptor)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _open_parent_directory(path: Path) -> tuple[int, str]:
+    components = _path_components(path)
+    if not components:
+        raise OSError(errno.EINVAL, "output path has no filename")
+    return _open_directory_fd(path.parent), components[-1]
 
 
 def atomic_write_bytes(path: Path, payload: bytes) -> None:
     """Write one exclusive sibling partial and promote without clobbering."""
 
-    _check_final_path(path)
-    partial = path.with_name(f".{path.name}.{uuid.uuid4()}.partial")
+    parent_fd = -1
     fd = -1
+    partial_name: str | None = None
     try:
+        parent_fd, final_name = _open_parent_directory(path)
+        try:
+            target = os.stat(final_name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            target = None
+        if target is not None:
+            if stat.S_ISLNK(target.st_mode):
+                raise _fault("output path must not be a symlink")
+            raise _fault("output already exists", code="OUTPUT_ALREADY_EXISTS")
+
+        partial_name = f".{final_name}.{uuid.uuid4()}.partial"
         fd = os.open(
-            partial,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            partial_name,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
             0o600,
+            dir_fd=parent_fd,
         )
-        with os.fdopen(fd, "wb", closefd=True) as stream:
-            fd = -1
+        stream = os.fdopen(fd, "wb", closefd=True)
+        fd = -1
+        with stream:
             stream.write(payload)
             stream.flush()
             os.fsync(stream.fileno())
         try:
-            os.link(partial, path, follow_symlinks=False)
+            os.link(
+                partial_name,
+                final_name,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
         except FileExistsError as error:
             raise _fault(
                 "output already exists", code="OUTPUT_ALREADY_EXISTS"
             ) from error
-        os.unlink(partial)
-        directory_fd = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+        os.unlink(partial_name, dir_fd=parent_fd)
+        partial_name = None
+        os.fsync(parent_fd)
     except WorkerFault:
         raise
-    except OSError as error:
-        if error.errno == errno.EEXIST:
+    except (OSError, ValueError) as error:
+        if getattr(error, "errno", None) == errno.EEXIST:
             raise _fault(
                 "output already exists", code="OUTPUT_ALREADY_EXISTS"
             ) from error
@@ -118,11 +184,19 @@ def atomic_write_bytes(path: Path, payload: bytes) -> None:
     finally:
         if fd >= 0:
             os.close(fd)
-        with suppress(FileNotFoundError):
-            partial.unlink()
+        if parent_fd >= 0:
+            if partial_name is not None:
+                with suppress(FileNotFoundError):
+                    os.unlink(partial_name, dir_fd=parent_fd)
+            os.close(parent_fd)
 
 
-def _validated_vertex(vertex: CPCVertex) -> CPCVertex:
+def _validated_vertex(
+    vertex: CPCVertex,
+    *,
+    frame_start: int | None = None,
+    frame_end: int | None = None,
+) -> CPCVertex:
     if len(vertex.position) != 3 or not all(
         math.isfinite(float(value)) for value in vertex.position
     ):
@@ -133,14 +207,35 @@ def _validated_vertex(vertex: CPCVertex) -> CPCVertex:
         raise _fault("vertex RGBA must contain four bytes")
     if not math.isfinite(float(vertex.confidence)):
         raise _fault("vertex confidence must be finite")
-    if type(vertex.flags) is not int or not 0 <= vertex.flags <= _UINT16_MAX:
-        raise _fault("vertex flags exceed UInt16")
+    if type(vertex.flags) is not int or not 0 <= vertex.flags <= _SUPPORTED_FLAGS:
+        raise _fault("vertex flags contain unsupported reserved bits")
     if (
         type(vertex.source_frame) is not int
         or not 0 <= vertex.source_frame <= _UINT32_MAX
     ):
         raise _fault("source frame exceeds UInt32")
+    if (
+        frame_start is not None
+        and frame_end is not None
+        and not frame_start <= vertex.source_frame <= frame_end
+    ):
+        raise _fault("source frame is outside the inclusive CPC1 range")
     return vertex
+
+
+def _voxel_key(
+    position: tuple[float, float, float], voxel_size: float
+) -> tuple[int, int, int]:
+    key: list[int] = []
+    for axis in position:
+        quotient = float(axis) / voxel_size
+        if not math.isfinite(quotient):
+            raise _fault("voxel coordinate exceeds Int64")
+        coordinate = math.floor(quotient)
+        if not _INT64_MIN <= coordinate <= _INT64_MAX:
+            raise _fault("voxel coordinate exceeds Int64")
+        key.append(coordinate)
+    return (key[0], key[1], key[2])
 
 
 def reduce_vertices(
@@ -153,7 +248,7 @@ def reduce_vertices(
     winners: dict[tuple[int, int, int], CPCVertex] = {}
     for candidate in vertices:
         candidate = _validated_vertex(candidate)
-        key = tuple(math.floor(axis / voxel_size) for axis in candidate.position)
+        key = _voxel_key(candidate.position, voxel_size)
         current = winners.get(key)
         if current is None or (
             -candidate.confidence,
@@ -209,7 +304,11 @@ def write_cpc(
     )
     offset = _HEADER.size
     for raw_vertex in vertices:
-        vertex = _validated_vertex(raw_vertex)
+        vertex = _validated_vertex(
+            raw_vertex,
+            frame_start=frame_start,
+            frame_end=frame_end_inclusive,
+        )
         try:
             _VERTEX.pack_into(
                 payload,
@@ -236,12 +335,38 @@ def write_cpc(
 def read_cpc(path: Path) -> CPCContents:
     """Strictly read a CPC1 file for verification and recovery."""
 
+    parent_fd = -1
+    descriptor = -1
     try:
-        raw = path.read_bytes()
-    except OSError as error:
+        parent_fd, filename = _open_parent_directory(path)
+        descriptor = os.open(
+            filename,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=parent_fd,
+        )
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise _fault("point chunk must be a regular file")
+        if info.st_size > _MAX_BYTES:
+            raise _fault("point chunk exceeds CPC1 size bounds")
+        if info.st_size < _HEADER.size:
+            raise _fault("truncated CPC1 header")
+        stream = os.fdopen(descriptor, "rb", closefd=True)
+        descriptor = -1
+        with stream:
+            raw = stream.read(info.st_size + 1)
+        if len(raw) != info.st_size:
+            raise _fault("point chunk changed while being read")
+    except WorkerFault:
+        raise
+    except (OSError, ValueError) as error:
         raise _fault(f"unable to read point chunk: {error}") from error
-    if len(raw) < _HEADER.size:
-        raise _fault("truncated CPC1 header")
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if parent_fd >= 0:
+            os.close(parent_fd)
+
     (
         magic,
         version,
@@ -275,7 +400,13 @@ def read_cpc(path: Path) -> CPCContents:
             flags=values[8],
             source_frame=values[9],
         )
-        vertices.append(_validated_vertex(vertex))
+        vertices.append(
+            _validated_vertex(
+                vertex,
+                frame_start=frame_start,
+                frame_end=frame_end,
+            )
+        )
         offset += _STRIDE
     descriptor = CPCDescriptor(
         relative_path=_relative_name(path),

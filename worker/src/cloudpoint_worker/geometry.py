@@ -10,7 +10,6 @@ import numpy as np
 from cloudpoint_worker.cpc import CPCVertex, reduce_vertices
 from cloudpoint_worker.errors import WorkerFault
 
-_UINT16_MAX = 2**16 - 1
 _UINT32_MAX = 2**32 - 1
 
 
@@ -139,8 +138,8 @@ def filter_and_reduce_points(
         raise _fault("filter thresholds must be finite and positive")
     if type(source_frame) is not int or not 0 <= source_frame <= _UINT32_MAX:
         raise _fault("source frame exceeds UInt32")
-    if type(flags) is not int or not 0 <= flags <= _UINT16_MAX:
-        raise _fault("point flags exceed UInt16")
+    if type(flags) is not int or not 0 <= flags <= 0b11:
+        raise _fault("point flags contain unsupported reserved bits")
 
     points = unproject_depth(depth_array, intrinsics, camera_to_world)
     mask = (
@@ -154,9 +153,9 @@ def filter_and_reduce_points(
     flat_indices = np.flatnonzero(mask.reshape(-1))
     flat_points = points.reshape(-1, 3)
     flat_confidence = confidence_array.reshape(-1)
-    flat_rgb = np.clip(
-        np.rint(rgb_array.reshape(-1, 3) * 255.0), 0, 255
-    ).astype(np.uint8)
+    flat_rgb = np.clip(np.rint(rgb_array.reshape(-1, 3) * 255.0), 0, 255).astype(
+        np.uint8
+    )
     vertices = (
         CPCVertex(
             position=tuple(float(value) for value in flat_points[index]),

@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import errno
 import json
+import os
 import struct
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -17,6 +21,21 @@ from cloudpoint_worker.geometry import (
 )
 from cloudpoint_worker.outputs import write_frame_outputs
 from cloudpoint_worker.preprocess import PreprocessedFrame
+
+
+@contextmanager
+def _propagate_exception() -> Iterator[None]:
+    yield
+
+
+def test_worker_fault_allows_contextmanager_traceback_assignment() -> None:
+    fault = WorkerFault("TEST_FAULT", "traceback compatible", False)
+
+    with pytest.raises(WorkerFault) as caught, _propagate_exception():
+        raise fault
+
+    assert caught.value is fault
+    assert caught.value.__traceback__ is not None
 
 
 def _translation(x: float, y: float, z: float) -> np.ndarray:
@@ -90,6 +109,29 @@ def test_filtering_and_voxel_ties_are_deterministic() -> None:
     assert reduced[0].rgba == (7, 8, 9, 255)
 
 
+@pytest.mark.parametrize("position", [1.0, 1e308])
+def test_voxel_keys_reject_values_outside_int64(position: float) -> None:
+    vertex = CPCVertex((position, 0, 1), (1, 2, 3, 255), 2.0, 0, 0)
+
+    with pytest.raises(WorkerFault, match="INVALID_POINT_CHUNK"):
+        reduce_vertices((vertex,), voxel_size=1e-300)
+
+
+def test_filtering_rejects_reserved_flag_bits() -> None:
+    with pytest.raises(WorkerFault, match="INVALID_MODEL_OUTPUT"):
+        filter_and_reduce_points(
+            np.ones((1, 1), dtype=np.float32),
+            np.full((1, 1), 2, dtype=np.float32),
+            np.zeros((1, 1, 3), dtype=np.float32),
+            np.eye(3, dtype=np.float32),
+            np.eye(4, dtype=np.float32),
+            source_frame=0,
+            confidence_floor=1.5,
+            voxel_size=0.01,
+            flags=4,
+        )
+
+
 def test_cpc1_exact_layout_round_trip_and_no_clobber(tmp_path: Path) -> None:
     vertices = (
         CPCVertex((0, 0, 1), (255, 0, 0, 255), 2.0, 1, 1),
@@ -134,6 +176,107 @@ def test_cpc_rejects_invalid_values_ranges_and_truncation(tmp_path: Path) -> Non
         read_cpc(truncated)
 
 
+@pytest.mark.parametrize(
+    ("vertex", "frame_start", "frame_end"),
+    [
+        (CPCVertex((0, 0, 1), (0, 0, 0, 255), 2, 4, 1), 1, 1),
+        (CPCVertex((0, 0, 1), (0, 0, 0, 255), 2, 0, 9), 1, 2),
+    ],
+)
+def test_cpc_writer_rejects_reserved_flags_and_frames_outside_header(
+    tmp_path: Path,
+    vertex: CPCVertex,
+    frame_start: int,
+    frame_end: int,
+) -> None:
+    with pytest.raises(WorkerFault, match="INVALID_POINT_CHUNK"):
+        write_cpc(tmp_path / "invalid.cpc", frame_start, frame_end, (vertex,))
+
+
+@pytest.mark.parametrize(("flags", "source_frame"), [(4, 1), (0, 9)])
+def test_cpc_reader_rejects_reserved_flags_and_frames_outside_header(
+    tmp_path: Path, flags: int, source_frame: int
+) -> None:
+    path = tmp_path / "invalid.cpc"
+    path.write_bytes(
+        struct.pack("<4sHHQII8s", b"CPC1", 1, 24, 1, 1, 2, b"\0" * 8)
+        + struct.pack("<fff4BeHI", 0, 0, 1, 0, 0, 0, 255, 2, flags, source_frame)
+    )
+
+    with pytest.raises(WorkerFault, match="INVALID_POINT_CHUNK"):
+        read_cpc(path)
+
+
+def test_cpc_reader_rejects_symlink_without_following_it(tmp_path: Path) -> None:
+    outside = tmp_path / "outside.cpc"
+    write_cpc(
+        outside,
+        0,
+        0,
+        (CPCVertex((0, 0, 1), (0, 0, 0, 255), 2, 0, 0),),
+    )
+    link = tmp_path / "linked.cpc"
+    link.symlink_to(outside)
+
+    with pytest.raises(WorkerFault, match="INVALID_POINT_CHUNK"):
+        read_cpc(link)
+
+
+def test_cpc_reader_checks_size_before_allocating(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    oversized = tmp_path / "oversized.cpc"
+    oversized.touch()
+    os.truncate(oversized, 1_200_000_033)
+
+    def unexpected_path_read(_: Path) -> bytes:
+        raise AssertionError("read_bytes called before the CPC size bound")
+
+    monkeypatch.setattr(Path, "read_bytes", unexpected_path_read)
+    with pytest.raises(WorkerFault, match="INVALID_POINT_CHUNK"):
+        read_cpc(oversized)
+
+
+def test_atomic_writer_rejects_symlinked_ancestor(tmp_path: Path) -> None:
+    real = tmp_path / "real"
+    inner = real / "inner"
+    inner.mkdir(parents=True)
+    alias = tmp_path / "alias"
+    alias.symlink_to(real, target_is_directory=True)
+    destination = alias / inner.name / "escaped.cpc"
+
+    with pytest.raises(WorkerFault, match="INVALID_POINT_CHUNK"):
+        write_cpc(
+            destination,
+            0,
+            0,
+            (CPCVertex((0, 0, 1), (0, 0, 0, 255), 2, 0, 0),),
+        )
+
+    assert not (inner / destination.name).exists()
+
+
+def test_atomic_writer_cleans_partial_when_promotion_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    destination = tmp_path / "failed.cpc"
+
+    def fail_link(*_: object, **__: object) -> None:
+        raise OSError(errno.EIO, "injected promotion failure")
+
+    monkeypatch.setattr(os, "link", fail_link)
+    with pytest.raises(WorkerFault, match="INVALID_POINT_CHUNK"):
+        write_cpc(
+            destination,
+            0,
+            0,
+            (CPCVertex((0, 0, 1), (0, 0, 0, 255), 2, 0, 0),),
+        )
+
+    assert not destination.exists()
+    assert not [path for path in tmp_path.iterdir() if path.name.endswith(".partial")]
+
+
 @dataclass(frozen=True)
 class _Frame:
     index: int
@@ -148,6 +291,49 @@ class _Prediction:
     pose_encoding: np.ndarray
     intrinsics: np.ndarray
     camera_to_world: np.ndarray
+
+
+def _one_pixel_preprocessed() -> PreprocessedFrame:
+    return PreprocessedFrame(
+        rgb=np.zeros((1, 1, 3), np.float32),
+        normalized=np.zeros((1, 1, 3), np.float32),
+        model_to_source=np.eye(3, dtype=np.float64),
+        source_size=(1, 1),
+        model_size=(1, 1),
+    )
+
+
+def _one_pixel_prediction() -> _Prediction:
+    return _Prediction(
+        depth=np.ones((1, 1), np.float32),
+        confidence=np.full((1, 1), 2, np.float32),
+        pose_encoding=np.array([0, 0, 0, 0, 0, 0, 1, 1, 1], np.float32),
+        intrinsics=np.eye(3, dtype=np.float32),
+        camera_to_world=np.eye(4, dtype=np.float32),
+    )
+
+
+def test_frame_outputs_reject_symlinked_project_ancestor(tmp_path: Path) -> None:
+    real_parent = tmp_path / "real"
+    real_parent.mkdir()
+    real_project = real_parent / "Test.cloudpoint"
+    real_project.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(real_parent, target_is_directory=True)
+
+    with pytest.raises(WorkerFault, match="INVALID_MODEL_OUTPUT"):
+        write_frame_outputs(
+            alias / real_project.name,
+            _Frame(0, 0, "Frames/00000000.jpg"),
+            _one_pixel_prediction(),
+            _one_pixel_preprocessed(),
+            confidence_floor=1.5,
+            engine_version="1.0.0",
+            model_identifier="robbyant/lingbot-map",
+            model_revision="204754b",
+        )
+
+    assert not (real_project / "Predictions").exists()
 
 
 def test_frame_outputs_are_exact_atomic_and_descriptive(tmp_path: Path) -> None:
