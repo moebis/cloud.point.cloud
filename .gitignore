@@ -7,3 +7,4 @@ CloudPoint*.xcodeproj/
 xcuserdata/
 *.cloudpoint/
 *.cloudpoint
+Config/Local.xcconfig

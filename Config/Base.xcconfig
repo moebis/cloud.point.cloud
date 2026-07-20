@@ -2,3 +2,7 @@ ARCHS = arm64
 MACOSX_DEPLOYMENT_TARGET = 15.0
 SWIFT_VERSION = 6.0
 SWIFT_STRICT_CONCURRENCY = complete
+
+// Machine-local absolute paths live in the ignored Local.xcconfig. Release
+// packaging replaces this development runtime with an app-bundled copy.
+#include? "Local.xcconfig"

@@ -42,4 +42,19 @@ if xcodebuild -showComponent MetalToolchain -json | grep -q '"status" : "uninsta
   xcodebuild -downloadComponent MetalToolchain
 fi
 
+local_config="${repo_root}/Config/Local.xcconfig"
+if [[ ! -f "$local_config" ]]; then
+  cp "${repo_root}/Config/Local.example.xcconfig" "$local_config"
+fi
+
+(
+  cd "${repo_root}/worker"
+  uv sync --frozen --group dev --extra model-prep --extra reference
+  # Finder flags can make a newly created virtual environment invisible to
+  # Xcode's process launcher on macOS.
+  chflags -R nohidden .venv 2>/dev/null || true
+  uv run --frozen cloudpoint-worker --help >/dev/null
+  uv run --frozen cloudpoint-model --help >/dev/null
+)
+
 XCODEGEN_BIN="$xcodegen_bin" "${scripts_dir}/generate-project"

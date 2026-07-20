@@ -1,0 +1,2 @@
+// Copy to Local.xcconfig. scripts/bootstrap does this automatically.
+CLOUDPOINT_WORKER_RUNTIME = $(SRCROOT)/worker/.venv
