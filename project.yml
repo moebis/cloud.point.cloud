@@ -23,6 +23,7 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: cloud.point.cloud.CloudPoint
+        PRODUCT_BUNDLE_PACKAGE_TYPE: APPL
         INFOPLIST_FILE: CloudPoint/Resources/Info.plist
         CODE_SIGN_ENTITLEMENTS: CloudPoint/Resources/CloudPoint.entitlements
         MACOSX_DEPLOYMENT_TARGET: "15.0"
