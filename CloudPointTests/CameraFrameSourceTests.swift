@@ -60,16 +60,100 @@ final class CameraSampleGateTests: XCTestCase {
             XCTAssertEqual($0 as? FrameSamplingError, .invalidRate(11))
         }
     }
+
+    func testSevenAndNineFPSUseExactRationalBoundaries() throws {
+        for rate in [7, 9] {
+            var gate = try CameraSampleGate(rate: rate)
+            XCTAssertTrue(gate.accepts(.zero))
+            XCTAssertFalse(
+                gate.accepts(CMTime(value: 999_999, timescale: CMTimeScale(rate * 1_000_000))),
+                "\(rate) FPS accepted a timestamp before its exact 1/rate boundary"
+            )
+            XCTAssertTrue(gate.accepts(CMTime(value: 1, timescale: CMTimeScale(rate))))
+        }
+    }
+
+    func testLargeTimestampJumpAdvancesInBoundedTimeAndKeepsExactGrid() throws {
+        var gate = try CameraSampleGate(rate: 7)
+        XCTAssertTrue(gate.accepts(.zero))
+        let clock = ContinuousClock()
+        let start = clock.now
+
+        XCTAssertTrue(gate.accepts(CMTime(value: 7_000_000, timescale: 7)))
+
+        XCTAssertLessThan(clock.now - start, .milliseconds(500))
+        XCTAssertFalse(gate.accepts(CMTime(value: 7_000_000_999_999, timescale: 7_000_000)))
+        XCTAssertTrue(gate.accepts(CMTime(value: 7_000_001, timescale: 7)))
+    }
+}
+
+final class CameraEventChannelTests: XCTestCase {
+    func testAuthoritativePersistedEventIsRetainedUntilConsumerAttaches() async {
+        let channel = CameraEventChannel(capacity: 16)
+        await channel.send(
+            .persisted(
+                PersistedFrame(
+                    index: 7,
+                    sourceTimestamp: 1.4,
+                    relativePath: "Frames/00000007.jpg"
+                )
+            )
+        )
+
+        var iterator = channel.stream().makeAsyncIterator()
+        guard case let .persisted(frame)? = await iterator.next() else {
+            return XCTFail("Expected the retained persisted event")
+        }
+        XCTAssertEqual(frame.index, 7)
+        channel.finish()
+    }
+
+    func testAuthoritativePersistedEventsBackpressureWithoutLosingIndexesBeyondCapacity() async {
+        let channel = CameraEventChannel(capacity: 16)
+        let stream = channel.stream()
+        let senderCompletion = CompletionProbe()
+        let sender = Task {
+            for index in 0..<40 {
+                await channel.send(
+                    .persisted(
+                        PersistedFrame(
+                            index: index,
+                            sourceTimestamp: Double(index),
+                            relativePath: "Frames/\(index).jpg"
+                        )
+                    )
+                )
+            }
+            senderCompletion.markComplete()
+        }
+        for _ in 0..<100 { await Task.yield() }
+        XCTAssertFalse(senderCompletion.isComplete)
+
+        var iterator = stream.makeAsyncIterator()
+        var indexes: [Int] = []
+        for _ in 0..<40 {
+            guard case let .persisted(frame)? = await iterator.next() else {
+                return XCTFail("Authoritative persisted event was lost")
+            }
+            indexes.append(frame.index)
+        }
+        await sender.value
+        channel.finish()
+
+        XCTAssertEqual(indexes, Array(0..<40))
+    }
 }
 
 final class CameraFrameSourceTests: XCTestCase {
     func testThirtyPreviewFramesProduceFivePersistedFrames() async throws {
         let persistence = PersistenceProbe()
         let session = SyntheticCameraCaptureSession(deviceIDs: ["camera-a"])
+        let previewObserver = PreviewObservationProbe()
         let source = CameraFrameSource(
             persistence: persistence,
             authority: FixedCameraAuthority(.authorized),
-            captureSession: session
+            captureSession: session,
+            previewObserver: previewObserver
         )
         let collector = PersistedFrameCollector(stream: source.events())
         defer { collector.cancel() }
@@ -90,6 +174,10 @@ final class CameraFrameSourceTests: XCTestCase {
         }
         let metrics = await source.metrics
         XCTAssertEqual(metrics.previewFrameCount, 30)
+        XCTAssertEqual(
+            previewObserver.timestamps,
+            (0..<30).map { CMTime(value: CMTimeValue($0), timescale: 30) }
+        )
         XCTAssertEqual(metrics.acceptedPersistenceCount, 5)
         XCTAssertEqual(metrics.droppedPersistenceCount, 0)
         let timestamps = await persistence.timestamps
@@ -136,6 +224,108 @@ final class CameraFrameSourceTests: XCTestCase {
         try await eventually { await collector.persisted.count == 2 }
         let persistedTimestamps = await persistence.timestamps
         XCTAssertEqual(persistedTimestamps, [.zero, CMTime(value: 1, timescale: 5)])
+    }
+
+    func testSecondAuthoritativeEventConsumerIsRejected() async throws {
+        let persistence = PersistenceProbe()
+        let session = SyntheticCameraCaptureSession(deviceIDs: ["camera-a"])
+        let source = CameraFrameSource(
+            persistence: persistence,
+            authority: FixedCameraAuthority(.authorized),
+            captureSession: session
+        )
+        let first = PersistedFrameCollector(stream: source.events())
+        var rejectedIterator = source.events().makeAsyncIterator()
+        let rejectedNext = Task { await rejectedIterator.next() }
+        defer { first.cancel() }
+        await source.start(deviceID: "camera-a", sampleRate: 5)
+
+        for sequence in 0..<30 {
+            session.emit(
+                try makeFrame(
+                    sequence: sequence,
+                    timestamp: CMTime(value: CMTimeValue(sequence), timescale: 30)
+                )
+            )
+            if sequence.isMultiple(of: 6) {
+                let expectedCount = sequence / 6 + 1
+                try await eventually { await persistence.callCount == expectedCount }
+            }
+        }
+
+        try await eventually { await first.persisted.count == 5 }
+        let firstFrames = await first.persisted
+        XCTAssertEqual(firstFrames.map(\.index), Array(0..<5))
+        let rejectedEvent = await rejectedNext.value
+        XCTAssertNil(rejectedEvent)
+    }
+
+    func testSlowEventSubscriberRetainsBoundedOldestTelemetryWindow() async throws {
+        let persistence = PersistenceProbe(suspended: true)
+        let session = SyntheticCameraCaptureSession(deviceIDs: ["camera-a"])
+        let source = CameraFrameSource(
+            persistence: persistence,
+            authority: FixedCameraAuthority(.authorized),
+            captureSession: session
+        )
+        let stream = source.events()
+        await source.start(deviceID: "camera-a", sampleRate: 10)
+        session.emit(try makeFrame(sequence: 0, timestamp: .zero))
+        try await eventually { await persistence.callCount == 1 }
+        session.emit(try makeFrame(sequence: 1, timestamp: CMTime(value: 1, timescale: 10)))
+        for sequence in 2..<42 {
+            session.emit(
+                try makeFrame(
+                    sequence: sequence,
+                    timestamp: CMTime(value: CMTimeValue(sequence), timescale: 10)
+                )
+            )
+        }
+
+        var iterator = stream.makeAsyncIterator()
+        var drops: [CameraDroppedFrame] = []
+        for _ in 0..<16 {
+            guard case let .dropped(drop)? = await iterator.next() else {
+                return XCTFail("Expected a buffered drop event")
+            }
+            drops.append(drop)
+        }
+        XCTAssertEqual(
+            drops.map(\.timestamp),
+            (2..<18).map { CMTime(value: CMTimeValue($0), timescale: 10) }
+        )
+        await persistence.resumeOne()
+    }
+
+    func testEventsPublishedWithoutSubscribersAreNotReplayed() async throws {
+        let persistence = PersistenceProbe(suspended: true)
+        let session = SyntheticCameraCaptureSession(deviceIDs: ["camera-a"])
+        let source = CameraFrameSource(
+            persistence: persistence,
+            authority: FixedCameraAuthority(.authorized),
+            captureSession: session
+        )
+        await source.start(deviceID: "camera-a", sampleRate: 10)
+        session.emit(try makeFrame(sequence: 0, timestamp: .zero))
+        try await eventually { await persistence.callCount == 1 }
+        session.emit(try makeFrame(sequence: 1, timestamp: CMTime(value: 1, timescale: 10)))
+        for sequence in 2..<12 {
+            session.emit(
+                try makeFrame(
+                    sequence: sequence,
+                    timestamp: CMTime(value: CMTimeValue(sequence), timescale: 10)
+                )
+            )
+        }
+
+        let stream = source.events()
+        session.emit(try makeFrame(sequence: 12, timestamp: CMTime(value: 12, timescale: 10)))
+        var iterator = stream.makeAsyncIterator()
+        guard case let .dropped(drop)? = await iterator.next() else {
+            return XCTFail("Expected the post-subscription drop event")
+        }
+        XCTAssertEqual(drop.timestamp, CMTime(value: 12, timescale: 10))
+        await persistence.resumeOne()
     }
 
     func testPersistenceFailureTransitionsToFailedWithoutEmittingPersistedFrame() async throws {
@@ -222,6 +412,25 @@ final class CameraFrameSourceTests: XCTestCase {
         XCTAssertEqual(session.stopCount, 1)
     }
 
+    func testDifferentDeviceOrRateRestartsRunningCapture() async {
+        let session = SyntheticCameraCaptureSession(deviceIDs: ["camera-a", "camera-b"])
+        let source = CameraFrameSource(
+            persistence: PersistenceProbe(),
+            authority: FixedCameraAuthority(.authorized),
+            captureSession: session
+        )
+
+        await source.start(deviceID: "camera-a", sampleRate: 5)
+        await source.start(deviceID: "camera-b", sampleRate: 7)
+        await source.start(deviceID: "camera-b", sampleRate: 9)
+
+        XCTAssertEqual(session.startCount, 3)
+        XCTAssertEqual(session.stopCount, 2)
+        XCTAssertEqual(session.connectedDeviceID, "camera-b")
+        let finalState = await source.state
+        XCTAssertEqual(finalState, .running(deviceID: "camera-b"))
+    }
+
     func testDisconnectPreservesPersistedFileAndSuppressesLaterEmissions() async throws {
         let directory = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -306,6 +515,293 @@ final class CameraFrameSourceTests: XCTestCase {
         XCTAssertFalse(session.hasDisconnectObserver)
     }
 
+    func testDelayedConnectFromStaleStartCannotStopConcurrentRestart() async throws {
+        let delayedConnect = AsyncGate()
+        let session = ScriptedCameraCaptureSession(
+            deviceIDs: ["camera-a", "camera-b"],
+            connectGates: [delayedConnect, nil]
+        )
+        let source = CameraFrameSource(
+            persistence: PersistenceProbe(),
+            authority: FixedCameraAuthority(.authorized),
+            captureSession: session
+        )
+        let firstStart = Task { await source.start(deviceID: "camera-a", sampleRate: 5) }
+        try await eventually { await delayedConnect.isWaiting }
+
+        let restart = Task { await source.start(deviceID: "camera-b", sampleRate: 5) }
+        try await eventually { await source.state == .running(deviceID: "camera-b") }
+        await delayedConnect.open()
+        await firstStart.value
+        await restart.value
+
+        let finalState = await source.state
+        let connectedDeviceID = await session.connectedDeviceID
+        let isRunning = await session.isRunning
+        XCTAssertEqual(finalState, .running(deviceID: "camera-b"))
+        XCTAssertEqual(connectedDeviceID, "camera-b")
+        XCTAssertTrue(isRunning)
+    }
+
+    func testDelayedStartRunningFromStaleStartCannotStopConcurrentRestart() async throws {
+        let delayedStart = AsyncGate()
+        let session = ScriptedCameraCaptureSession(
+            deviceIDs: ["camera-a", "camera-b"],
+            startGates: [delayedStart, nil]
+        )
+        let source = CameraFrameSource(
+            persistence: PersistenceProbe(),
+            authority: FixedCameraAuthority(.authorized),
+            captureSession: session
+        )
+        let firstStart = Task { await source.start(deviceID: "camera-a", sampleRate: 5) }
+        try await eventually { await delayedStart.isWaiting }
+
+        let restart = Task { await source.start(deviceID: "camera-b", sampleRate: 5) }
+        try await eventually { await source.state == .running(deviceID: "camera-b") }
+        await delayedStart.open()
+        await firstStart.value
+        await restart.value
+
+        let finalState = await source.state
+        let connectedDeviceID = await session.connectedDeviceID
+        let isRunning = await session.isRunning
+        XCTAssertEqual(finalState, .running(deviceID: "camera-b"))
+        XCTAssertEqual(connectedDeviceID, "camera-b")
+        XCTAssertTrue(isRunning)
+    }
+
+    func testDelayedTeardownCannotStopOrOverwriteConcurrentRestart() async throws {
+        let delayedStop = AsyncGate()
+        let session = ScriptedCameraCaptureSession(
+            deviceIDs: ["camera-a", "camera-b"],
+            stopGates: [delayedStop, nil]
+        )
+        let source = CameraFrameSource(
+            persistence: PersistenceProbe(),
+            authority: FixedCameraAuthority(.authorized),
+            captureSession: session
+        )
+        await source.start(deviceID: "camera-a", sampleRate: 5)
+        let stop = Task { await source.stop() }
+        try await eventually { await delayedStop.isWaiting }
+
+        let restart = Task { await source.start(deviceID: "camera-b", sampleRate: 5) }
+        await delayedStop.open()
+        await stop.value
+        await restart.value
+
+        let finalState = await source.state
+        let connectedDeviceID = await session.connectedDeviceID
+        let isRunning = await session.isRunning
+        XCTAssertEqual(finalState, .running(deviceID: "camera-b"))
+        XCTAssertEqual(connectedDeviceID, "camera-b")
+        XCTAssertTrue(isRunning)
+    }
+
+    func testInvalidRateInvalidatesSuspendedPriorStart() async throws {
+        let delayedAuthorization = AsyncGate()
+        let authority = DelayedCameraAuthority(gate: delayedAuthorization, result: .authorized)
+        let session = ScriptedCameraCaptureSession(deviceIDs: ["camera-a"])
+        let source = CameraFrameSource(
+            persistence: PersistenceProbe(),
+            authority: authority,
+            captureSession: session
+        )
+        let firstStart = Task { await source.start(deviceID: "camera-a", sampleRate: 5) }
+        try await eventually { await delayedAuthorization.isWaiting }
+
+        await source.start(deviceID: "camera-a", sampleRate: 11)
+        await delayedAuthorization.open()
+        await firstStart.value
+
+        let finalState = await source.state
+        let connectCount = await session.connectCount
+        let isRunning = await session.isRunning
+        XCTAssertEqual(finalState, .failed(.invalidSampleRate))
+        XCTAssertEqual(connectCount, 0)
+        XCTAssertFalse(isRunning)
+    }
+
+    func testDisconnectTeardownCannotOverwriteRestart() async throws {
+        let delayedStop = AsyncGate()
+        let session = ScriptedCameraCaptureSession(
+            deviceIDs: ["camera-a", "camera-b"],
+            stopGates: [delayedStop, nil]
+        )
+        let source = CameraFrameSource(
+            persistence: PersistenceProbe(),
+            authority: FixedCameraAuthority(.authorized),
+            captureSession: session
+        )
+        await source.start(deviceID: "camera-a", sampleRate: 5)
+        await session.disconnect()
+        try await eventually { await delayedStop.isWaiting }
+
+        let restart = Task { await source.start(deviceID: "camera-b", sampleRate: 5) }
+        await delayedStop.open()
+        await restart.value
+
+        let finalState = await source.state
+        let connectedDeviceID = await session.connectedDeviceID
+        let isRunning = await session.isRunning
+        XCTAssertEqual(finalState, .running(deviceID: "camera-b"))
+        XCTAssertEqual(connectedDeviceID, "camera-b")
+        XCTAssertTrue(isRunning)
+    }
+
+    func testPersistenceFailureTeardownCannotOverwriteRestart() async throws {
+        let delayedStop = AsyncGate()
+        let session = ScriptedCameraCaptureSession(
+            deviceIDs: ["camera-a", "camera-b"],
+            stopGates: [delayedStop, nil]
+        )
+        let source = CameraFrameSource(
+            persistence: PersistenceProbe(error: ProbeError.writeFailed),
+            authority: FixedCameraAuthority(.authorized),
+            captureSession: session
+        )
+        await source.start(deviceID: "camera-a", sampleRate: 5)
+        await session.emit(try makeFrame(sequence: 0, timestamp: .zero))
+        try await eventually { await delayedStop.isWaiting }
+
+        let restart = Task { await source.start(deviceID: "camera-b", sampleRate: 5) }
+        await delayedStop.open()
+        await restart.value
+
+        let finalState = await source.state
+        let connectedDeviceID = await session.connectedDeviceID
+        let isRunning = await session.isRunning
+        XCTAssertEqual(finalState, .running(deviceID: "camera-b"))
+        XCTAssertEqual(connectedDeviceID, "camera-b")
+        XCTAssertTrue(isRunning)
+    }
+
+    func testRestartWaitsForCancellationInsensitiveOldPersistenceWorker() async throws {
+        let persistence = CancellationInsensitivePersistenceProbe()
+        let session = ScriptedCameraCaptureSession(deviceIDs: ["camera-a", "camera-b"])
+        let source = CameraFrameSource(
+            persistence: persistence,
+            authority: FixedCameraAuthority(.authorized),
+            captureSession: session
+        )
+        await source.start(deviceID: "camera-a", sampleRate: 5)
+        await session.emit(try makeFrame(sequence: 0, timestamp: .zero))
+        try await eventually { persistence.activeCallCount == 1 }
+
+        let restart = Task {
+            await source.stop()
+            await source.start(deviceID: "camera-b", sampleRate: 5)
+        }
+        for _ in 0..<100 { await Task.yield() }
+        await session.emit(try makeFrame(sequence: 1, timestamp: .zero))
+        for _ in 0..<100 { await Task.yield() }
+        XCTAssertEqual(persistence.callCount, 1)
+        XCTAssertEqual(persistence.maximumConcurrentCallCount, 1)
+
+        persistence.resumeFirst()
+        await restart.value
+        await session.emit(try makeFrame(sequence: 2, timestamp: .zero))
+        try await eventually { persistence.callCount == 2 }
+        XCTAssertEqual(persistence.maximumConcurrentCallCount, 1)
+        let finalState = await source.state
+        XCTAssertEqual(finalState, .running(deviceID: "camera-b"))
+    }
+
+    func testConcurrentRestartsShareTheOldPersistenceRetirementBarrier() async throws {
+        let persistence = CancellationInsensitivePersistenceProbe()
+        let session = ScriptedCameraCaptureSession(
+            deviceIDs: ["camera-a", "camera-b", "camera-c"]
+        )
+        let source = CameraFrameSource(
+            persistence: persistence,
+            authority: FixedCameraAuthority(.authorized),
+            captureSession: session
+        )
+        await source.start(deviceID: "camera-a", sampleRate: 5)
+        await session.emit(try makeFrame(sequence: 0, timestamp: .zero))
+        try await eventually { persistence.activeCallCount == 1 }
+
+        let firstRestart = Task {
+            await source.start(deviceID: "camera-b", sampleRate: 5)
+        }
+        for _ in 0..<100 { await Task.yield() }
+        let secondRestart = Task {
+            await source.start(deviceID: "camera-c", sampleRate: 5)
+        }
+        for _ in 0..<500 { await Task.yield() }
+        await session.emit(try makeFrame(sequence: 1, timestamp: .zero))
+        for _ in 0..<100 { await Task.yield() }
+
+        XCTAssertEqual(persistence.callCount, 1)
+        XCTAssertEqual(persistence.maximumConcurrentCallCount, 1)
+
+        persistence.resumeFirst()
+        await firstRestart.value
+        await secondRestart.value
+        await session.emit(try makeFrame(sequence: 2, timestamp: .zero))
+        try await eventually { persistence.callCount == 2 }
+        XCTAssertEqual(persistence.maximumConcurrentCallCount, 1)
+        let finalState = await source.state
+        XCTAssertEqual(finalState, .running(deviceID: "camera-c"))
+    }
+
+    func testShutdownTearsDownCaptureFinishesEventsAndReleasesInjectedSession() async throws {
+        var session: SyntheticCameraCaptureSession? = SyntheticCameraCaptureSession(
+            deviceIDs: ["camera-a"]
+        )
+        weak let weakSession = session
+        var source: CameraFrameSource? = CameraFrameSource(
+            persistence: PersistenceProbe(),
+            authority: FixedCameraAuthority(.authorized),
+            captureSession: session!
+        )
+        let retainedPreviewSession = source!.previewSession
+        var eventIterator = source!.events().makeAsyncIterator()
+        await source!.start(deviceID: "camera-a", sampleRate: 5)
+
+        await source!.shutdown()
+
+        XCTAssertEqual(session!.shutdownCount, 1)
+        XCTAssertFalse(session!.isRunning)
+        XCTAssertFalse(session!.hasDisconnectObserver)
+        let eventAfterShutdown = await eventIterator.next()
+        XCTAssertNil(eventAfterShutdown)
+        await source!.start(deviceID: "camera-a", sampleRate: 5)
+        XCTAssertEqual(session!.startCount, 1)
+        XCTAssertFalse(session!.isRunning)
+        let state = await source!.state
+        XCTAssertEqual(state, .stopped)
+
+        source = nil
+        session = nil
+        XCTAssertNil(weakSession)
+        withExtendedLifetime(retainedPreviewSession) {}
+    }
+
+    func testDroppingSourceWithoutShutdownRunsAVFallbackOnRetainedPreviewSession() {
+        var wrapper: AVCameraCaptureSession? = AVCameraCaptureSession()
+        weak let weakWrapper = wrapper
+        var source: CameraFrameSource? = CameraFrameSource(
+            persistence: PersistenceProbe(),
+            authority: FixedCameraAuthority(.authorized),
+            captureSession: wrapper!
+        )
+        let retainedPreviewSession = source!.previewSession
+        wrapper = nil
+        let output = AVCaptureVideoDataOutput()
+        retainedPreviewSession.beginConfiguration()
+        XCTAssertTrue(retainedPreviewSession.canAddOutput(output))
+        retainedPreviewSession.addOutput(output)
+        retainedPreviewSession.commitConfiguration()
+        XCTAssertEqual(retainedPreviewSession.outputs.count, 1)
+
+        source = nil
+
+        XCTAssertNil(weakWrapper)
+        XCTAssertTrue(retainedPreviewSession.outputs.isEmpty)
+    }
+
     @MainActor
     func testPreviewLayerTracksSessionResizesAndTearsDown() {
         let first = AVCaptureSession()
@@ -351,6 +847,28 @@ final class CameraManualTests: XCTestCase {
 
 private enum ProbeError: Error {
     case writeFailed
+}
+
+private final class CompletionProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var complete = false
+
+    var isComplete: Bool { lock.withLock { complete } }
+
+    func markComplete() {
+        lock.withLock { complete = true }
+    }
+}
+
+private final class PreviewObservationProbe: CameraPreviewObserving, @unchecked Sendable {
+    private let lock = NSLock()
+    private var observedTimestamps: [CMTime] = []
+
+    var timestamps: [CMTime] { lock.withLock { observedTimestamps } }
+
+    func observe(timestamp: CMTime) {
+        lock.withLock { observedTimestamps.append(timestamp) }
+    }
 }
 
 private struct FixedCameraAuthority: CameraAuthorizing {
@@ -427,6 +945,7 @@ private final class SyntheticCameraCaptureSession: CameraCaptureSession, @unchec
     private var _isRunning = false
     private var _startCount = 0
     private var _stopCount = 0
+    private var _shutdownCount = 0
 
     init(deviceIDs: Set<String>) {
         self.deviceIDs = deviceIDs
@@ -437,6 +956,7 @@ private final class SyntheticCameraCaptureSession: CameraCaptureSession, @unchec
     var isRunning: Bool { lock.withLock { _isRunning } }
     var startCount: Int { lock.withLock { _startCount } }
     var stopCount: Int { lock.withLock { _stopCount } }
+    var shutdownCount: Int { lock.withLock { _shutdownCount } }
     var hasDisconnectObserver: Bool { lock.withLock { disconnectHandler != nil } }
 
     func connect(
@@ -461,6 +981,17 @@ private final class SyntheticCameraCaptureSession: CameraCaptureSession, @unchec
 
     func stopRunning() async {
         lock.withLock {
+            if _isRunning || _connectedDeviceID != nil { _stopCount += 1 }
+            _isRunning = false
+            _connectedDeviceID = nil
+            frameHandler = nil
+            disconnectHandler = nil
+        }
+    }
+
+    func shutdown() async {
+        lock.withLock {
+            _shutdownCount += 1
             if _isRunning || _connectedDeviceID != nil { _stopCount += 1 }
             _isRunning = false
             _connectedDeviceID = nil
@@ -526,7 +1057,7 @@ private final class PersistedFrameCollector: @unchecked Sendable {
     private let storage = EventStorage()
     private let task: Task<Void, Never>
 
-    init(stream: AsyncStream<CameraFrameSourceEvent>) {
+    init(stream: CameraFrameSourceEvents) {
         let storage = self.storage
         task = Task {
             for await event in stream {
@@ -544,6 +1075,200 @@ private final class PersistedFrameCollector: @unchecked Sendable {
     }
 
     func cancel() { task.cancel() }
+}
+
+private actor AsyncGate {
+    private(set) var isWaiting = false
+    private var isOpen = false
+    private var continuations: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        guard !isOpen else { return }
+        isWaiting = true
+        await withCheckedContinuation { continuations.append($0) }
+    }
+
+    func open() {
+        guard !isOpen else { return }
+        isOpen = true
+        isWaiting = false
+        let current = continuations
+        continuations.removeAll()
+        for continuation in current { continuation.resume() }
+    }
+}
+
+private struct DelayedCameraAuthority: CameraAuthorizing {
+    let gate: AsyncGate
+    let result: CameraAuthorization
+
+    func requestAccess() async -> CameraAuthorization {
+        await gate.wait()
+        return result
+    }
+}
+
+private final class ScriptedCameraCaptureSession: CameraCaptureSession, @unchecked Sendable {
+    let previewSession = AVCaptureSession()
+    private let backend: ScriptedCameraCaptureBackend
+
+    init(
+        deviceIDs: Set<String>,
+        connectGates: [AsyncGate?] = [],
+        startGates: [AsyncGate?] = [],
+        stopGates: [AsyncGate?] = []
+    ) {
+        backend = ScriptedCameraCaptureBackend(
+            deviceIDs: deviceIDs,
+            connectGates: connectGates,
+            startGates: startGates,
+            stopGates: stopGates
+        )
+    }
+
+    var connectCount: Int { get async { await backend.connectCount } }
+    var connectedDeviceID: String? { get async { await backend.connectedDeviceID } }
+    var isRunning: Bool { get async { await backend.isRunning } }
+
+    func connect(
+        deviceID: String,
+        frameHandler: @escaping @Sendable (CapturedFrame) -> Void,
+        disconnectHandler: @escaping @Sendable () -> Void
+    ) async throws {
+        try await backend.connect(
+            deviceID: deviceID,
+            frameHandler: frameHandler,
+            disconnectHandler: disconnectHandler
+        )
+    }
+
+    func startRunning() async throws {
+        await backend.startRunning()
+    }
+
+    func stopRunning() async {
+        await backend.stopRunning()
+    }
+
+    func emit(_ frame: CapturedFrame) async {
+        await backend.emit(frame)
+    }
+
+    func disconnect() async {
+        await backend.disconnect()
+    }
+}
+
+private actor ScriptedCameraCaptureBackend {
+    let deviceIDs: Set<String>
+    let connectGates: [AsyncGate?]
+    let startGates: [AsyncGate?]
+    let stopGates: [AsyncGate?]
+    private(set) var connectCount = 0
+    private(set) var connectedDeviceID: String?
+    private(set) var isRunning = false
+    private var startCount = 0
+    private var stopCount = 0
+    private var frameHandler: (@Sendable (CapturedFrame) -> Void)?
+    private var disconnectHandler: (@Sendable () -> Void)?
+
+    init(
+        deviceIDs: Set<String>,
+        connectGates: [AsyncGate?],
+        startGates: [AsyncGate?],
+        stopGates: [AsyncGate?]
+    ) {
+        self.deviceIDs = deviceIDs
+        self.connectGates = connectGates
+        self.startGates = startGates
+        self.stopGates = stopGates
+    }
+
+    func connect(
+        deviceID: String,
+        frameHandler: @escaping @Sendable (CapturedFrame) -> Void,
+        disconnectHandler: @escaping @Sendable () -> Void
+    ) async throws {
+        guard deviceIDs.contains(deviceID) else { throw CameraCaptureSessionError.deviceNotFound }
+        let call = connectCount
+        connectCount += 1
+        connectedDeviceID = deviceID
+        self.frameHandler = frameHandler
+        self.disconnectHandler = disconnectHandler
+        if call < connectGates.count, let gate = connectGates[call] {
+            await gate.wait()
+        }
+    }
+
+    func startRunning() async {
+        let call = startCount
+        startCount += 1
+        isRunning = true
+        if call < startGates.count, let gate = startGates[call] {
+            await gate.wait()
+        }
+    }
+
+    func stopRunning() async {
+        let call = stopCount
+        stopCount += 1
+        isRunning = false
+        connectedDeviceID = nil
+        frameHandler = nil
+        disconnectHandler = nil
+        if call < stopGates.count, let gate = stopGates[call] {
+            await gate.wait()
+        }
+    }
+
+    func emit(_ frame: CapturedFrame) {
+        guard isRunning else { return }
+        frameHandler?(frame)
+    }
+
+    func disconnect() {
+        disconnectHandler?()
+    }
+}
+
+private final class CancellationInsensitivePersistenceProbe: FramePersistence, @unchecked Sendable {
+    private let lock = NSLock()
+    private var firstContinuation: CheckedContinuation<Void, Never>?
+    private var _callCount = 0
+    private var _activeCallCount = 0
+    private var _maximumConcurrentCallCount = 0
+
+    var callCount: Int { lock.withLock { _callCount } }
+    var activeCallCount: Int { lock.withLock { _activeCallCount } }
+    var maximumConcurrentCallCount: Int { lock.withLock { _maximumConcurrentCallCount } }
+
+    func persist(_ frame: CapturedFrame) async throws -> PersistedFrame {
+        let shouldSuspend = lock.withLock { () -> Bool in
+            _callCount += 1
+            _activeCallCount += 1
+            _maximumConcurrentCallCount = max(_maximumConcurrentCallCount, _activeCallCount)
+            return _callCount == 1
+        }
+        if shouldSuspend {
+            await withCheckedContinuation { continuation in
+                lock.withLock { firstContinuation = continuation }
+            }
+        }
+        lock.withLock { _activeCallCount -= 1 }
+        return PersistedFrame(
+            index: frame.index,
+            sourceTimestamp: frame.presentationTimestamp.seconds,
+            relativePath: String(format: "Frames/%08d.jpg", frame.index)
+        )
+    }
+
+    func resumeFirst() {
+        let continuation = lock.withLock { () -> CheckedContinuation<Void, Never>? in
+            defer { firstContinuation = nil }
+            return firstContinuation
+        }
+        continuation?.resume()
+    }
 }
 
 private actor EventStorage {
