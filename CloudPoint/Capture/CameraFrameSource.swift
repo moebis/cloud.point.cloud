@@ -395,13 +395,20 @@ actor CameraFrameSource {
         lifecycleID: Int
     ) -> Task<Void, Never> {
         let persistence = self.persistence
+        let eventProducer = eventChannel.makeProducer()
         return Task { [weak self] in
+            defer { eventProducer.finish() }
             do {
                 for await frame in stream {
                     try Task.checkCancellation()
-                    let persisted = try await persistence.persist(frame)
-                    try Task.checkCancellation()
-                    await self?.didPersist(persisted, lifecycleID: lifecycleID)
+                    guard await eventProducer.prepareForPersistence() else { return }
+                    do {
+                        let persisted = try await persistence.persist(frame)
+                        await eventProducer.send(.persisted(persisted))
+                    } catch {
+                        eventProducer.cancelPersistencePermit()
+                        throw error
+                    }
                 }
             } catch is CancellationError {
                 return
@@ -411,11 +418,6 @@ actor CameraFrameSource {
                 }
             }
         }
-    }
-
-    private func didPersist(_ frame: PersistedFrame, lifecycleID: Int) async {
-        guard lifecycleID == self.lifecycleID else { return }
-        await eventChannel.send(.persisted(frame))
     }
 
     private func persistenceFailed(lifecycleID: Int) async {
@@ -594,10 +596,19 @@ struct CameraFrameSourceEvents: AsyncSequence, Sendable {
 }
 
 final class CameraEventChannel: @unchecked Sendable {
+    // The bounded buffer may have one channel-owned overflow event. A
+    // persistence permit prevents a replacement lifecycle from creating a
+    // second durable overflow before the first one drains.
     private struct PendingSend {
         let id: UUID
         let event: CameraFrameSourceEvent
-        let continuation: CheckedContinuation<Void, Never>
+        var continuation: CheckedContinuation<Void, Never>?
+    }
+
+    private struct WaitingPersistencePermit {
+        let id: UUID
+        let producerID: UUID
+        let continuation: CheckedContinuation<Bool, Never>
     }
 
     private struct WaitingConsumer {
@@ -608,10 +619,13 @@ final class CameraEventChannel: @unchecked Sendable {
     private let lock = NSLock()
     private let capacity: Int
     private var buffer: [CameraFrameSourceEvent] = []
-    private var pendingSends: [PendingSend] = []
+    private var pendingSend: PendingSend?
     private var waitingConsumer: WaitingConsumer?
     private var activeSubscriptionID: UUID?
-    private var isFinished = false
+    private var activeProducerIDs = Set<UUID>()
+    private var persistencePermitProducerID: UUID?
+    private var waitingPersistencePermit: WaitingPersistencePermit?
+    private var finishRequested = false
 
     init(capacity: Int) {
         precondition(capacity > 0)
@@ -620,7 +634,7 @@ final class CameraEventChannel: @unchecked Sendable {
 
     func stream() -> CameraFrameSourceEvents {
         let subscriptionID = lock.withLock { () -> UUID? in
-            guard !isFinished, activeSubscriptionID == nil else { return nil }
+            guard activeSubscriptionID == nil else { return nil }
             let id = UUID()
             activeSubscriptionID = id
             return id
@@ -630,35 +644,14 @@ final class CameraEventChannel: @unchecked Sendable {
         )
     }
 
-    /// Persisted events are authoritative. Producers suspend once the bounded
-    /// queue is full instead of evicting an older persisted notification.
-    func send(_ event: CameraFrameSourceEvent) async {
-        let sendID = UUID()
-        await withTaskCancellationHandler {
-            await withCheckedContinuation { continuation in
-                var consumer: CheckedContinuation<CameraFrameSourceEvent?, Never>?
-                let shouldResumeSender = lock.withLock { () -> Bool in
-                    guard !isFinished, !Task.isCancelled else { return true }
-                    if let waitingConsumer {
-                        self.waitingConsumer = nil
-                        consumer = waitingConsumer.continuation
-                        return true
-                    }
-                    guard buffer.count >= capacity else {
-                        buffer.append(event)
-                        return true
-                    }
-                    pendingSends.append(
-                        PendingSend(id: sendID, event: event, continuation: continuation)
-                    )
-                    return false
-                }
-                consumer?.resume(returning: event)
-                if shouldResumeSender { continuation.resume() }
-            }
-        } onCancel: { [weak self] in
-            self?.cancelSend(id: sendID)
+    func makeProducer() -> CameraEventProducer {
+        let producerID = lock.withLock { () -> UUID? in
+            guard !finishRequested else { return nil }
+            let id = UUID()
+            activeProducerIDs.insert(id)
+            return id
         }
+        return CameraEventProducer(channel: self, id: producerID)
     }
 
     /// Drop events are telemetry. They are retained only while the sole
@@ -666,7 +659,7 @@ final class CameraEventChannel: @unchecked Sendable {
     func offerTelemetry(_ event: CameraFrameSourceEvent) {
         var consumer: CheckedContinuation<CameraFrameSourceEvent?, Never>?
         lock.withLock {
-            guard !isFinished, activeSubscriptionID != nil else { return }
+            guard !finishRequested, activeSubscriptionID != nil else { return }
             if let waitingConsumer {
                 self.waitingConsumer = nil
                 consumer = waitingConsumer.continuation
@@ -679,17 +672,26 @@ final class CameraEventChannel: @unchecked Sendable {
 
     func finish() {
         var consumer: CheckedContinuation<CameraFrameSourceEvent?, Never>?
-        var senders: [CheckedContinuation<Void, Never>] = []
+        var sender: CheckedContinuation<Void, Never>?
+        var permitWaiter: CheckedContinuation<Bool, Never>?
         lock.withLock {
-            guard !isFinished else { return }
-            isFinished = true
-            consumer = waitingConsumer?.continuation
-            waitingConsumer = nil
-            senders = pendingSends.map(\.continuation)
-            pendingSends.removeAll()
+            guard !finishRequested else { return }
+            finishRequested = true
+            if var pendingSend {
+                sender = pendingSend.continuation
+                pendingSend.continuation = nil
+                self.pendingSend = pendingSend
+            }
+            permitWaiter = waitingPersistencePermit?.continuation
+            waitingPersistencePermit = nil
+            if isTerminalLocked {
+                consumer = waitingConsumer?.continuation
+                waitingConsumer = nil
+            }
         }
+        sender?.resume()
+        permitWaiter?.resume(returning: false)
         consumer?.resume(returning: nil)
-        for sender in senders { sender.resume() }
     }
 
     fileprivate func next(subscriptionID: UUID) async -> CameraFrameSourceEvent? {
@@ -697,6 +699,7 @@ final class CameraEventChannel: @unchecked Sendable {
             await withCheckedContinuation { continuation in
                 var result: CameraFrameSourceEvent??
                 var sender: CheckedContinuation<Void, Never>?
+                var permitWaiter: CheckedContinuation<Bool, Never>?
                 lock.withLock {
                     guard activeSubscriptionID == subscriptionID, !Task.isCancelled else {
                         result = .some(nil)
@@ -704,12 +707,18 @@ final class CameraEventChannel: @unchecked Sendable {
                     }
                     if !buffer.isEmpty {
                         result = .some(buffer.removeFirst())
-                        if !pendingSends.isEmpty {
-                            let pending = pendingSends.removeFirst()
+                        if let pending = pendingSend {
+                            pendingSend = nil
                             buffer.append(pending.event)
                             sender = pending.continuation
+                            permitWaiter = promotePersistencePermitLocked()
                         }
-                    } else if isFinished {
+                    } else if let pending = pendingSend {
+                        pendingSend = nil
+                        result = .some(pending.event)
+                        sender = pending.continuation
+                        permitWaiter = promotePersistencePermitLocked()
+                    } else if isTerminalLocked {
                         result = .some(nil)
                     } else if waitingConsumer == nil {
                         waitingConsumer = WaitingConsumer(
@@ -722,6 +731,7 @@ final class CameraEventChannel: @unchecked Sendable {
                     }
                 }
                 sender?.resume()
+                permitWaiter?.resume(returning: true)
                 if let result { continuation.resume(returning: result) }
             }
         } onCancel: { [weak self] in
@@ -746,8 +756,10 @@ final class CameraEventChannel: @unchecked Sendable {
     private func cancelSend(id: UUID) {
         var sender: CheckedContinuation<Void, Never>?
         lock.withLock {
-            guard let index = pendingSends.firstIndex(where: { $0.id == id }) else { return }
-            sender = pendingSends.remove(at: index).continuation
+            guard var pendingSend, pendingSend.id == id else { return }
+            sender = pendingSend.continuation
+            pendingSend.continuation = nil
+            self.pendingSend = pendingSend
         }
         sender?.resume()
     }
@@ -761,10 +773,260 @@ final class CameraEventChannel: @unchecked Sendable {
         }
         consumer?.resume(returning: nil)
     }
+
+    fileprivate func prepareForPersistence(producerID: UUID) async -> Bool {
+        let permitID = UUID()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                let result = lock.withLock { () -> Bool? in
+                    guard activeProducerIDs.contains(producerID),
+                          !finishRequested,
+                          !Task.isCancelled else {
+                        return false
+                    }
+                    guard pendingSend == nil,
+                          persistencePermitProducerID == nil else {
+                        precondition(
+                            waitingPersistencePermit == nil,
+                            "CameraEventChannel supports one persistence producer"
+                        )
+                        waitingPersistencePermit = WaitingPersistencePermit(
+                            id: permitID,
+                            producerID: producerID,
+                            continuation: continuation
+                        )
+                        return nil
+                    }
+                    persistencePermitProducerID = producerID
+                    return true
+                }
+                if let result { continuation.resume(returning: result) }
+            }
+        } onCancel: { [weak self] in
+            self?.cancelPersistencePermitWait(id: permitID)
+        }
+    }
+
+    fileprivate func send(
+        _ event: CameraFrameSourceEvent,
+        producerID: UUID
+    ) async {
+        let sendID = UUID()
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                var consumer: CheckedContinuation<CameraFrameSourceEvent?, Never>?
+                var permitWaiter: CheckedContinuation<Bool, Never>?
+                let shouldResumeSender = lock.withLock { () -> Bool in
+                    guard activeProducerIDs.contains(producerID),
+                          persistencePermitProducerID == producerID else {
+                        return true
+                    }
+                    persistencePermitProducerID = nil
+                    if let waitingConsumer {
+                        self.waitingConsumer = nil
+                        consumer = waitingConsumer.continuation
+                        permitWaiter = promotePersistencePermitLocked()
+                        return true
+                    }
+                    guard buffer.count >= capacity else {
+                        buffer.append(event)
+                        permitWaiter = promotePersistencePermitLocked()
+                        return true
+                    }
+                    precondition(
+                        pendingSend == nil,
+                        "Prepared persistence must own the sole overflow slot"
+                    )
+                    let shouldReleaseProducer = Task.isCancelled || finishRequested
+                    pendingSend = PendingSend(
+                        id: sendID,
+                        event: event,
+                        continuation: shouldReleaseProducer ? nil : continuation
+                    )
+                    return shouldReleaseProducer
+                }
+                consumer?.resume(returning: event)
+                permitWaiter?.resume(returning: true)
+                if shouldResumeSender { continuation.resume() }
+            }
+        } onCancel: { [weak self] in
+            self?.cancelSend(id: sendID)
+        }
+    }
+
+    fileprivate func cancelPersistencePermit(producerID: UUID) {
+        var permitWaiter: CheckedContinuation<Bool, Never>?
+        lock.withLock {
+            guard persistencePermitProducerID == producerID else { return }
+            persistencePermitProducerID = nil
+            permitWaiter = promotePersistencePermitLocked()
+        }
+        permitWaiter?.resume(returning: true)
+    }
+
+    fileprivate func finishProducer(id: UUID) {
+        var consumer: CheckedContinuation<CameraFrameSourceEvent?, Never>?
+        var permitWaiter: (CheckedContinuation<Bool, Never>, Bool)?
+        lock.withLock {
+            guard activeProducerIDs.remove(id) != nil else { return }
+            if persistencePermitProducerID == id {
+                persistencePermitProducerID = nil
+                if let promoted = promotePersistencePermitLocked() {
+                    permitWaiter = (promoted, true)
+                }
+            }
+            if waitingPersistencePermit?.producerID == id {
+                if let continuation = waitingPersistencePermit?.continuation {
+                    permitWaiter = (continuation, false)
+                }
+                waitingPersistencePermit = nil
+            }
+            if isTerminalLocked {
+                consumer = waitingConsumer?.continuation
+                waitingConsumer = nil
+            }
+        }
+        if let (continuation, result) = permitWaiter {
+            continuation.resume(returning: result)
+        }
+        consumer?.resume(returning: nil)
+    }
+
+    private func cancelPersistencePermitWait(id: UUID) {
+        var permitWaiter: CheckedContinuation<Bool, Never>?
+        lock.withLock {
+            guard waitingPersistencePermit?.id == id else { return }
+            permitWaiter = waitingPersistencePermit?.continuation
+            waitingPersistencePermit = nil
+        }
+        permitWaiter?.resume(returning: false)
+    }
+
+    private func promotePersistencePermitLocked() -> CheckedContinuation<Bool, Never>? {
+        guard !finishRequested,
+              pendingSend == nil,
+              persistencePermitProducerID == nil,
+              let waitingPersistencePermit,
+              activeProducerIDs.contains(waitingPersistencePermit.producerID) else {
+            return nil
+        }
+        self.waitingPersistencePermit = nil
+        persistencePermitProducerID = waitingPersistencePermit.producerID
+        return waitingPersistencePermit.continuation
+    }
+
+    private var isTerminalLocked: Bool {
+        finishRequested && activeProducerIDs.isEmpty && buffer.isEmpty && pendingSend == nil
+    }
+}
+
+final class CameraEventProducer: @unchecked Sendable {
+    private let lock = NSLock()
+    private let channel: CameraEventChannel
+    private let id: UUID?
+    private var operationCount = 0
+    private var hasPersistencePermit = false
+    private var finishRequested = false
+    private var didFinishChannel = false
+
+    init(channel: CameraEventChannel, id: UUID?) {
+        self.channel = channel
+        self.id = id
+    }
+
+    func prepareForPersistence() async -> Bool {
+        guard let id else { return false }
+        let mayPrepare = lock.withLock { () -> Bool in
+            guard !finishRequested,
+                  !hasPersistencePermit,
+                  operationCount == 0 else {
+                return false
+            }
+            operationCount += 1
+            return true
+        }
+        guard mayPrepare else { return false }
+        let granted = await channel.prepareForPersistence(producerID: id)
+        completeOperation(grantedPermit: granted)
+        return granted
+    }
+
+    func send(_ event: CameraFrameSourceEvent) async {
+        guard let id else { return }
+        let maySend = lock.withLock { () -> Bool in
+            guard hasPersistencePermit, operationCount == 0 else { return false }
+            hasPersistencePermit = false
+            operationCount += 1
+            return true
+        }
+        guard maySend else { return }
+        await channel.send(event, producerID: id)
+        completeOperation()
+    }
+
+    func cancelPersistencePermit() {
+        guard let id else { return }
+        let result = lock.withLock { () -> (cancel: Bool, finish: Bool) in
+            guard hasPersistencePermit, operationCount == 0 else { return (false, false) }
+            hasPersistencePermit = false
+            return (true, shouldFinishChannelLocked())
+        }
+        guard result.cancel else { return }
+        channel.cancelPersistencePermit(producerID: id)
+        if result.finish { channel.finishProducer(id: id) }
+    }
+
+    func finish() {
+        guard let id else { return }
+        let shouldFinish = lock.withLock { () -> Bool in
+            finishRequested = true
+            return shouldFinishChannelLocked()
+        }
+        if shouldFinish { channel.finishProducer(id: id) }
+    }
+
+    deinit {
+        abandon()
+    }
+
+    private func completeOperation(grantedPermit: Bool = false) {
+        guard let id else { return }
+        let shouldFinish = lock.withLock { () -> Bool in
+            precondition(operationCount == 1)
+            operationCount = 0
+            if grantedPermit { hasPersistencePermit = true }
+            return shouldFinishChannelLocked()
+        }
+        if shouldFinish { channel.finishProducer(id: id) }
+    }
+
+    private func shouldFinishChannelLocked() -> Bool {
+        guard finishRequested,
+              operationCount == 0,
+              !hasPersistencePermit,
+              !didFinishChannel else {
+            return false
+        }
+        didFinishChannel = true
+        return true
+    }
+
+    private func abandon() {
+        guard let id else { return }
+        let action = lock.withLock { () -> (cancelPermit: Bool, finish: Bool) in
+            precondition(operationCount == 0)
+            finishRequested = true
+            let cancelPermit = hasPersistencePermit
+            hasPersistencePermit = false
+            return (cancelPermit, shouldFinishChannelLocked())
+        }
+        if action.cancelPermit { channel.cancelPersistencePermit(producerID: id) }
+        if action.finish { channel.finishProducer(id: id) }
+    }
 }
 
 private final class CameraEventSubscription: @unchecked Sendable {
-    private weak var channel: CameraEventChannel?
+    private let channel: CameraEventChannel
     private let id: UUID?
 
     init(channel: CameraEventChannel, id: UUID?) {
@@ -773,12 +1035,12 @@ private final class CameraEventSubscription: @unchecked Sendable {
     }
 
     func next() async -> CameraFrameSourceEvent? {
-        guard let channel, let id else { return nil }
+        guard let id else { return nil }
         return await channel.next(subscriptionID: id)
     }
 
     deinit {
-        channel?.cancelSubscription(id: id)
+        channel.cancelSubscription(id: id)
     }
 }
 
