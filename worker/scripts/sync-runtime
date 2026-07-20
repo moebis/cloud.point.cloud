@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+worker_root="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$worker_root"
+
+# Python 3.12.11 on macOS skips editable .pth files inside a hidden .venv.
+# A wheel install also matches the isolated runtime that the native app launches.
+exec uv sync --frozen --group dev --no-editable "$@"

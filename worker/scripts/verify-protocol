@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+worker_root="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$worker_root"
+
+uv sync \
+  --frozen \
+  --group dev \
+  --no-editable \
+  --reinstall-package cloudpoint-worker
+uv run --frozen --no-editable \
+  python -m cloudpoint_worker.protocol.fixtures \
+  --output tests/fixtures/protocol-v1.json
+uv run --frozen --no-editable ruff check src tests/protocol
+uv run --frozen --no-editable pytest tests/protocol -q
