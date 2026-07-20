@@ -1,3 +1,4 @@
+#if DEBUG
 import Darwin
 import Foundation
 
@@ -672,3 +673,4 @@ private extension Data {
         appendLittleEndian(value.bitPattern)
     }
 }
+#endif

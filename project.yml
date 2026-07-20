@@ -17,6 +17,7 @@ targets:
         excludes:
           - Resources/Info.plist
           - Resources/CloudPoint.entitlements
+          - App/CloudPointApp 2.swift
     configFiles:
       Debug: Config/Base.xcconfig
       Release: Config/Base.xcconfig

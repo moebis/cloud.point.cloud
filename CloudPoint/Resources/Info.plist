@@ -27,7 +27,6 @@
             <string>Alternate</string>
             <key>LSItemContentTypes</key>
             <array>
-                <string>public.movie</string>
                 <string>com.apple.quicktime-movie</string>
                 <string>public.mpeg-4</string>
                 <string>com.apple.m4v-video</string>
