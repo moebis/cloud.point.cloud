@@ -1,17 +1,9 @@
 @preconcurrency import AVFoundation
-import AppKit
 import Metal
 import SwiftUI
-import UniformTypeIdentifiers
 
 @MainActor
 final class WorkspaceViewModel: ObservableObject {
-    static let recordingContentTypes: [UTType] = [
-        .movie,
-        .quickTimeMovie,
-        .mpeg4Movie,
-    ]
-
     @Published private(set) var snapshot: WorkspaceSnapshot
     @Published private(set) var cameras: [CameraDescriptor] = []
     @Published var selectedCameraID: String?
@@ -23,14 +15,17 @@ final class WorkspaceViewModel: ObservableObject {
 
     private let document: CloudPointDocument
     private var controller: SessionController?
+    private var initialSource: WorkspaceInitialSource?
     private var didStart = false
 
     init(
         document: CloudPointDocument,
-        packageURL: URL?,
+        packageURL: URL,
+        initialSource: WorkspaceInitialSource? = nil,
         arguments: [String] = ProcessInfo.processInfo.arguments
     ) {
         self.document = document
+        self.initialSource = initialSource
         let cameraCaptureSession = AVCameraCaptureSession()
         previewSession = cameraCaptureSession.previewSession
         if let device = MTLCreateSystemDefaultDevice() {
@@ -48,7 +43,7 @@ final class WorkspaceViewModel: ObservableObject {
             processedCount: state.processedCount,
             failedCount: state.failedCount,
             currentWindow: state.currentWindow,
-            setupText: packageURL == nil ? SessionControllerError.packageNotSaved.localizedDescription : nil,
+            setupText: nil,
             errorText: nil,
             samplingRate: 2,
             pointSize: 3,
@@ -56,7 +51,9 @@ final class WorkspaceViewModel: ObservableObject {
             capabilities: .disabled
         )
 
+#if DEBUG
         let useMock = Self.shouldUseMockEngine(arguments: arguments)
+#endif
         let effects = SessionControllerEffects(
             adoptManifest: { [weak self] manifest in
                 await MainActor.run { self?.document.adoptCommittedManifest(manifest) }
@@ -73,6 +70,7 @@ final class WorkspaceViewModel: ObservableObject {
                     self.snapshot = snapshot
                     self.renderer?.setPointSize(snapshot.pointSize)
                     self.renderer?.setConfidenceThreshold(snapshot.confidenceThreshold)
+                    self.beginInitialRecordingIfReady()
                 }
             }
         )
@@ -81,8 +79,12 @@ final class WorkspaceViewModel: ObservableObject {
             packageURL: packageURL,
             dependencies: SessionControllerDependencies(
                 engineFactory: {
+#if DEBUG
                     guard useMock else { throw SessionControllerError.engineUnavailable }
                     return MockReconstructionEngine()
+#else
+                    throw SessionControllerError.engineUnavailable
+#endif
                 },
                 cameraFactory: { packageURL, startingIndex in
                     CameraFrameSource(
@@ -126,22 +128,19 @@ final class WorkspaceViewModel: ObservableObject {
         }
     }
 
-    func updatePackageURL(_ url: URL?) {
-        Task { [controller] in await controller?.updatePackageURL(url) }
-    }
-
-    func openRecording() {
-        guard snapshot.capabilities.canImportRecording else { return }
-        let panel = NSOpenPanel()
-        panel.title = "Open Recording"
-        panel.prompt = "Open Recording"
-        panel.allowedContentTypes = Self.recordingContentTypes
-        panel.allowsMultipleSelection = false
-        panel.canChooseDirectories = false
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        let rate = snapshot.samplingRate
+    private func beginInitialRecordingIfReady() {
+        guard snapshot.capabilities.canImportRecording,
+              case let .recording(url, framesPerSecond) = initialSource else {
+            return
+        }
+        initialSource = nil
         Task { [controller] in
-            do { try await controller?.importRecording(url, framesPerSecond: rate) }
+            do {
+                try await controller?.importRecording(
+                    url,
+                    framesPerSecond: framesPerSecond
+                )
+            }
             catch { await MainActor.run { self.report(error) } }
         }
     }

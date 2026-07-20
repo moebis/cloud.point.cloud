@@ -26,6 +26,10 @@ final class CloudPointDocument: ReferenceFileDocument, @unchecked Sendable {
         storedManifest = ProjectManifest()
     }
 
+    init(manifest: ProjectManifest) {
+        storedManifest = manifest
+    }
+
     required init(configuration: ReadConfiguration) throws {
         storedManifest = try Self.loadManifest(from: configuration.file)
     }

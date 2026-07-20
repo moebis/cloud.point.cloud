@@ -18,6 +18,21 @@
                 <string>cloud.point.cloud.project</string>
             </array>
         </dict>
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>Movie</string>
+            <key>CFBundleTypeRole</key>
+            <string>Viewer</string>
+            <key>LSHandlerRank</key>
+            <string>Alternate</string>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>public.movie</string>
+                <string>com.apple.quicktime-movie</string>
+                <string>public.mpeg-4</string>
+                <string>com.apple.m4v-video</string>
+            </array>
+        </dict>
     </array>
     <key>CFBundleExecutable</key>
     <string>$(EXECUTABLE_NAME)</string>

@@ -2,12 +2,27 @@ import SwiftUI
 
 struct WorkspaceView: View {
     @StateObject private var viewModel: WorkspaceViewModel
-    let packageURL: URL?
+    let sourceTitle: String
+    let onOpenVideo: () -> Void
+    let onShowWelcome: () -> Void
 
-    init(document: CloudPointDocument, packageURL: URL?) {
-        self.packageURL = packageURL
+    init(
+        document: CloudPointDocument,
+        packageURL: URL,
+        initialSource: WorkspaceInitialSource? = nil,
+        sourceTitle: String = "CloudPoint Project",
+        onOpenVideo: @escaping () -> Void = {},
+        onShowWelcome: @escaping () -> Void = {}
+    ) {
+        self.sourceTitle = sourceTitle
+        self.onOpenVideo = onOpenVideo
+        self.onShowWelcome = onShowWelcome
         _viewModel = StateObject(
-            wrappedValue: WorkspaceViewModel(document: document, packageURL: packageURL)
+            wrappedValue: WorkspaceViewModel(
+                document: document,
+                packageURL: packageURL,
+                initialSource: initialSource
+            )
         )
     }
 
@@ -25,7 +40,20 @@ struct WorkspaceView: View {
         .safeAreaInset(edge: .bottom, spacing: 0) { timeline }
         .frame(minWidth: 1_000, minHeight: 680)
         .task { viewModel.start() }
-        .onChange(of: packageURL) { _, value in viewModel.updatePackageURL(value) }
+        .toolbar {
+            ToolbarItem(placement: .navigation) {
+                Button("Projects", systemImage: "chevron.left") { onShowWelcome() }
+            }
+            ToolbarItem(placement: .principal) {
+                Text(sourceTitle)
+                    .font(.headline)
+                    .lineLimit(1)
+            }
+            ToolbarItem(placement: .primaryAction) {
+                Button("Open Video", systemImage: "film") { onOpenVideo() }
+                    .keyboardShortcut("o", modifiers: .command)
+            }
+        }
     }
 
     private var sourceSidebar: some View {
@@ -33,11 +61,8 @@ struct WorkspaceView: View {
             Text("Source")
                 .font(.title2.bold())
 
-            Button("Open Recording", systemImage: "film") {
-                viewModel.openRecording()
-            }
+            Button("Open Another Video…", systemImage: "film") { onOpenVideo() }
             .buttonStyle(.borderedProminent)
-            .disabled(!viewModel.snapshot.capabilities.canImportRecording)
 
             Picker("Camera", selection: $viewModel.selectedCameraID) {
                 Text("Choose a camera").tag(String?.none)

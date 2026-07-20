@@ -309,6 +309,23 @@ final class ProjectManifestTests: XCTestCase {
         XCTAssertTrue(identifiers.contains("cloud.point.cloud.project"))
     }
 
+    func testApplicationRegistersMovieTypesOnlyAtAlternateRank() throws {
+        let declarations = try XCTUnwrap(
+            Bundle.main.object(forInfoDictionaryKey: "CFBundleDocumentTypes") as? [[String: Any]]
+        )
+        let movieDeclaration = try XCTUnwrap(declarations.first { declaration in
+            let identifiers = declaration["LSItemContentTypes"] as? [String] ?? []
+            return identifiers.contains("public.movie")
+        })
+
+        XCTAssertEqual(movieDeclaration["LSHandlerRank"] as? String, "Alternate")
+        XCTAssertEqual(
+            Set(movieDeclaration["LSItemContentTypes"] as? [String] ?? []),
+            ["public.movie", "com.apple.quicktime-movie", "public.mpeg-4", "com.apple.m4v-video"]
+        )
+        XCTAssertEqual(CloudPointDocument.readableContentTypes, [.cloudPointProject])
+    }
+
     private func manifestData(formatVersion: Int) throws -> Data {
         let valid = try ProjectManifest.encode(.fixture())
         var object = try XCTUnwrap(JSONSerialization.jsonObject(with: valid) as? [String: Any])
