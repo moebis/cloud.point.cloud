@@ -2,13 +2,44 @@
 set -euo pipefail
 
 required_xcodegen="2.46.0"
+xcodegen_url="https://github.com/yonaskolb/XcodeGen/releases/download/${required_xcodegen}/xcodegen.zip"
+xcodegen_sha256="4d9e34b62172d645eed6457cac13fc222569974098ef4ee9c3368bedf0196806"
+scripts_dir="$(cd "$(dirname "$0")" && pwd)"
+repo_root="$(cd "${scripts_dir}/.." && pwd)"
+pinned_xcodegen_root="${repo_root}/.tools/xcodegen-${required_xcodegen}"
+pinned_xcodegen_bin="${pinned_xcodegen_root}/bin/xcodegen"
+
+xcodebuild -version
+
 actual_xcodegen="$(xcodegen --version 2>/dev/null | awk '{print $2}' || true)"
+if [[ "$actual_xcodegen" == "$required_xcodegen" ]]; then
+  xcodegen_bin="$(command -v xcodegen)"
+else
+  install_dir="$(mktemp -d)"
+  archive_path="${install_dir}/xcodegen.zip"
+
+  curl --fail --location --silent --show-error --output "$archive_path" "$xcodegen_url"
+  actual_sha256="$(shasum -a 256 "$archive_path" | awk '{print $1}')"
+  if [[ "$actual_sha256" != "$xcodegen_sha256" ]]; then
+    echo "XcodeGen archive checksum mismatch" >&2
+    exit 1
+  fi
+
+  unzip -q "$archive_path" -d "$install_dir"
+  mkdir -p "${pinned_xcodegen_root}/bin" "${pinned_xcodegen_root}/share"
+  install -m 755 "${install_dir}/xcodegen/bin/xcodegen" "$pinned_xcodegen_bin"
+  cp -R "${install_dir}/xcodegen/share/." "${pinned_xcodegen_root}/share/"
+  xcodegen_bin="$pinned_xcodegen_bin"
+fi
+
+actual_xcodegen="$("$xcodegen_bin" --version 2>/dev/null | awk '{print $2}' || true)"
 if [[ "$actual_xcodegen" != "$required_xcodegen" ]]; then
-  brew install xcodegen
+  echo "XcodeGen ${required_xcodegen} is required; found ${actual_xcodegen:-none}" >&2
+  exit 1
 fi
 
 if xcodebuild -showComponent MetalToolchain -json | grep -q '"status" : "uninstalled"'; then
   xcodebuild -downloadComponent MetalToolchain
 fi
 
-"$(dirname "$0")/generate-project"
+XCODEGEN_BIN="$xcodegen_bin" "${scripts_dir}/generate-project"

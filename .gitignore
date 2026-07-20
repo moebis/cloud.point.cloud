@@ -2,6 +2,7 @@
 DerivedData/
 build/
 CloudPoint.xcodeproj/
+.tools/
 *.xcuserstate
 xcuserdata/
 *.cloudpoint/

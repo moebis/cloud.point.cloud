@@ -2,4 +2,13 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
-xcodegen generate
+
+required_xcodegen="2.46.0"
+xcodegen_bin="${XCODEGEN_BIN:-xcodegen}"
+actual_xcodegen="$("$xcodegen_bin" --version 2>/dev/null | awk '{print $2}' || true)"
+if [[ "$actual_xcodegen" != "$required_xcodegen" ]]; then
+  echo "XcodeGen ${required_xcodegen} is required; found ${actual_xcodegen:-none}" >&2
+  exit 1
+fi
+
+"$xcodegen_bin" generate
