@@ -64,6 +64,26 @@ def _fault(code: str, message: str, recoverable: bool = True) -> WorkerFault:
     return WorkerFault(code, message, recoverable)
 
 
+class _PrefixedReader:
+    """Replay a consumed frame byte without buffering the framed body."""
+
+    def __init__(self, prefix: bytes, stream: BinaryIO) -> None:
+        self._prefix = prefix
+        self._stream = stream
+
+    def read(self, count: int = -1) -> bytes:
+        if count == 0:
+            return b""
+        prefix = self._prefix
+        self._prefix = b""
+        if count < 0:
+            return prefix + self._stream.read()
+        if len(prefix) >= count:
+            self._prefix = prefix[count:]
+            return prefix[:count]
+        return prefix + self._stream.read(count - len(prefix))
+
+
 class WorkerServer:
     """Decode commands, own responses, and keep MLX work off the reader thread."""
 
@@ -90,15 +110,19 @@ class WorkerServer:
         self._external_sink = event_sink
         self._heartbeat_interval = heartbeat_interval
         self._write_lock = threading.RLock()
+        self._state_lock = threading.RLock()
         self._heartbeat_stop = threading.Event()
         self._heartbeat_thread: threading.Thread | None = None
         self._executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="cloudpoint-mlx"
         )
         self._future: Future[None] | None = None
+        self._model_future: Future[None] | None = None
         self._tracker = CommandIDTracker()
         self._hello_received = False
         self._model_loading = False
+        self._model_ready = False
+        self._shutdown_requested = False
         self._closed = False
         self._model: ReconstructionModel | None = None
         self._configuration = None
@@ -147,8 +171,9 @@ class WorkerServer:
         self._heartbeat_thread.start()
 
     def _require_hello(self) -> None:
-        if not self._hello_received or self._model is None:
-            raise _fault("INVALID_STATE", "hello must complete before this command")
+        with self._state_lock:
+            if not self._hello_received or not self._model_ready or self._model is None:
+                raise _fault("INVALID_STATE", "hello must complete before this command")
 
     def _require_runner(self) -> SessionRunner:
         if self._runner is None:
@@ -168,59 +193,79 @@ class WorkerServer:
         )
 
     def _load_after_hello(self) -> None:
-        self._emit(
-            ModelProgress(
-                PROTOCOL_VERSION,
-                uuid.uuid4(),
-                self.project_id,
-                "modelProgress",
-                ModelProgressPayload("validating", 0, 1),
+        with self._state_lock:
+            if self._shutdown_requested:
+                self._model_loading = False
+                return
+            self._emit(
+                ModelProgress(
+                    PROTOCOL_VERSION,
+                    uuid.uuid4(),
+                    self.project_id,
+                    "modelProgress",
+                    ModelProgressPayload("validating", 0, 1),
+                )
             )
-        )
         try:
             model = self._model_loader()
         except WorkerFault as fault:
-            self._model_loading = False
-            self._emit(self._asynchronous_error(fault))
+            with self._state_lock:
+                self._model_loading = False
+                if not self._shutdown_requested:
+                    self._emit(self._asynchronous_error(fault))
             return
         except Exception as error:
-            self._model_loading = False
+            should_report = False
+            with self._state_lock:
+                self._model_loading = False
+                if not self._shutdown_requested:
+                    should_report = True
+                    self._emit(
+                        self._asynchronous_error(
+                            WorkerFault(
+                                "MODEL_LOAD_FAILED",
+                                "model could not be loaded",
+                                False,
+                            )
+                        )
+                    )
+            if should_report:
+                print(
+                    f"MODEL_LOAD_FAILED: {type(error).__name__}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            return
+        with self._state_lock:
+            if self._shutdown_requested:
+                self._model_loading = False
+                return
+            self._model = model
             self._emit(
-                self._asynchronous_error(
-                    WorkerFault("MODEL_LOAD_FAILED", "model could not be loaded", False)
+                ModelProgress(
+                    PROTOCOL_VERSION,
+                    uuid.uuid4(),
+                    self.project_id,
+                    "modelProgress",
+                    ModelProgressPayload("loading", 1, 1),
                 )
             )
-            print(
-                f"MODEL_LOAD_FAILED: {type(error).__name__}",
-                file=sys.stderr,
-                flush=True,
+            self._emit(
+                Ready(
+                    PROTOCOL_VERSION,
+                    uuid.uuid4(),
+                    self.project_id,
+                    "ready",
+                    ReadyPayload(
+                        ENGINE_VERSION,
+                        MODEL_REPO,
+                        MODEL_REVISION,
+                        CONVERTED_MODEL_SHA256,
+                    ),
+                )
             )
-            return
-        self._model = model
-        self._emit(
-            ModelProgress(
-                PROTOCOL_VERSION,
-                uuid.uuid4(),
-                self.project_id,
-                "modelProgress",
-                ModelProgressPayload("loading", 1, 1),
-            )
-        )
-        self._model_loading = False
-        self._emit(
-            Ready(
-                PROTOCOL_VERSION,
-                uuid.uuid4(),
-                self.project_id,
-                "ready",
-                ReadyPayload(
-                    ENGINE_VERSION,
-                    MODEL_REPO,
-                    MODEL_REVISION,
-                    CONVERTED_MODEL_SHA256,
-                ),
-            )
-        )
+            self._model_ready = True
+            self._model_loading = False
 
     def _run_session(self) -> None:
         runner = self._require_runner()
@@ -262,11 +307,13 @@ class WorkerServer:
                 # Protocol readiness begins with an immediate post-ACK heartbeat.
                 self._emit(self._heartbeat())
                 self._start_heartbeats()
-                # Do not hold the serialized writer while loading. The heartbeat
-                # thread must stay able to flush during multi-second model setup.
-                self._load_after_hello()
+                # Loading must never own the command-reader thread: shutdown and
+                # control commands remain live during multi-second model setup.
+                self._model_future = self._executor.submit(self._load_after_hello)
                 return True
             if isinstance(command, ShutdownCommand) and self._hello_received:
+                with self._state_lock:
+                    self._shutdown_requested = True
                 runner = self._runner
                 if runner is not None and runner.state not in {
                     SessionState.COMPLETED,
@@ -350,6 +397,15 @@ class WorkerServer:
         except TimeoutError as error:
             raise TimeoutError("worker session did not reach a boundary") from error
 
+    def wait_for_model(self, timeout: float | None = None) -> None:
+        future = self._model_future
+        if future is None:
+            return
+        try:
+            future.result(timeout=timeout)
+        except TimeoutError as error:
+            raise TimeoutError("worker model did not finish loading") from error
+
     def _header_error(self, header: CommandHeader, fault: WorkerFault) -> ErrorMessage:
         return ErrorMessage(
             PROTOCOL_VERSION,
@@ -387,17 +443,23 @@ class WorkerServer:
     def serve(self) -> int:
         """Serve framed stdin/stdout without opening any network endpoint."""
 
+        protocol_error_seen = False
         try:
             while True:
                 raw: object | None = None
                 try:
-                    raw = read_json_frame(self._input)
+                    first_byte = self._input.read(1)
+                    if not first_byte:
+                        break
+                    prefixed = cast(BinaryIO, _PrefixedReader(first_byte, self._input))
+                    raw = read_json_frame(prefixed)
                     command = decode_command(raw)
                 except (
                     WorkerFault,
                     ProtocolValidationError,
                     msgspec.ValidationError,
                 ) as error:
+                    protocol_error_seen = True
                     fault: WorkerFault | ProtocolValidationError
                     if isinstance(error, WorkerFault | ProtocolValidationError):
                         fault = error
@@ -408,14 +470,17 @@ class WorkerServer:
                     continue
                 if not self.handle(command):
                     break
-            return 0
+            return 3 if protocol_error_seen else 0
         finally:
             self.close()
 
     def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
+        with self._state_lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._shutdown_requested = True
+        self._heartbeat_stop.set()
         runner = self._runner
         if runner is not None and runner.state not in {
             SessionState.COMPLETED,
@@ -426,7 +491,7 @@ class WorkerServer:
         try:
             self.wait_for_idle(timeout=None)
         finally:
-            self._heartbeat_stop.set()
+            self.wait_for_model(timeout=None)
             if self._heartbeat_thread is not None:
                 self._heartbeat_thread.join(timeout=1)
             self._executor.shutdown(wait=True, cancel_futures=False)

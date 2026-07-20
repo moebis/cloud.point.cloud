@@ -10,12 +10,14 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import stat
 import threading
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -25,7 +27,12 @@ import mlx.core as mx
 import numpy as np
 
 from cloudpoint_worker import ENGINE_VERSION, PROTOCOL_VERSION
-from cloudpoint_worker.cpc import CPCVertex, reduce_vertices, write_cpc
+from cloudpoint_worker.cpc import (
+    CPCVertex,
+    _open_directory_fd,
+    reduce_vertices,
+    write_cpc,
+)
 from cloudpoint_worker.errors import WorkerFault
 from cloudpoint_worker.geometry import filter_and_reduce_points
 from cloudpoint_worker.model.lingbot import FrameBatchPrediction
@@ -58,6 +65,7 @@ from cloudpoint_worker.protocol.schema import (
 )
 
 _UINT32_MAX = 2**32 - 1
+_UINT64_MAX = 2**64 - 1
 _DIRECT_FRAME_LIMIT = 32
 _MANIFEST_MAX_BYTES = 16 * 1024 * 1024
 _CANONICAL_PREDICTION = re.compile(
@@ -101,10 +109,19 @@ class PersistedFrame:
 @dataclass(frozen=True, slots=True)
 class _ProjectSnapshot:
     project_id: uuid.UUID
+    root_device: int
+    root_inode: int
     manifest: dict[str, object]
     frames: dict[int, PersistedFrame]
     referenced_artifacts: frozenset[str]
     completed_windows: tuple[dict[str, object], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _OwnedOutput:
+    relative_path: str
+    device: int
+    inode: int
 
 
 def _fault(
@@ -142,11 +159,56 @@ def _canonical_uuid(
     return result
 
 
-def _read_manifest(project_root: Path) -> _ProjectSnapshot:
-    manifest_path = project_root / "Manifest.json"
+def _manifest_relative(value: object) -> str:
     try:
-        info = manifest_path.lstat()
-        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        return _safe_relative(value)
+    except WorkerFault as error:
+        raise _fault(
+            "PROJECT_INVALID_MANIFEST",
+            "manifest contains an unsafe project-relative path",
+        ) from error
+
+
+def _directory_flags() -> int:
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    directory = getattr(os, "O_DIRECTORY", 0)
+    if no_follow == 0 or directory == 0:
+        raise OSError("safe descriptor-relative traversal is unavailable")
+    return os.O_RDONLY | no_follow | directory | getattr(os, "O_CLOEXEC", 0)
+
+
+def _file_flags() -> int:
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    if no_follow == 0:
+        raise OSError("safe descriptor-relative traversal is unavailable")
+    return os.O_RDONLY | no_follow | getattr(os, "O_CLOEXEC", 0)
+
+
+def _open_project_fd(
+    project_root: Path, expected_identity: tuple[int, int] | None = None
+) -> int:
+    descriptor = _open_directory_fd(project_root)
+    try:
+        info = os.fstat(descriptor)
+        identity = (info.st_dev, info.st_ino)
+        if expected_identity is not None and identity != expected_identity:
+            raise OSError("project package identity changed")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _open_child_directory(parent_fd: int, name: str) -> int:
+    return os.open(name, _directory_flags(), dir_fd=parent_fd)
+
+
+def _read_manifest(root_fd: int, root_identity: tuple[int, int]) -> _ProjectSnapshot:
+    descriptor = -1
+    try:
+        descriptor = os.open("Manifest.json", _file_flags(), dir_fd=root_fd)
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
             raise OSError("manifest is not a regular file")
         if info.st_size > _MANIFEST_MAX_BYTES:
             raise OSError("manifest exceeds the worker bound")
@@ -159,13 +221,26 @@ def _read_manifest(project_root: Path) -> _ProjectSnapshot:
                 result[key] = value
             return result
 
-        decoded = json.loads(
-            manifest_path.read_text("utf-8"), object_pairs_hook=reject_duplicates
-        )
+        def reject_constant(token: str) -> object:
+            raise ValueError(f"nonstandard JSON number {token}")
+
+        with os.fdopen(descriptor, "rb", closefd=True) as stream:
+            descriptor = -1
+            payload = stream.read(_MANIFEST_MAX_BYTES + 1)
+            if len(payload) > _MANIFEST_MAX_BYTES:
+                raise OSError("manifest exceeds the worker bound")
+            decoded = json.loads(
+                payload.decode("utf-8", errors="strict"),
+                object_pairs_hook=reject_duplicates,
+                parse_constant=reject_constant,
+            )
     except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
         raise _fault(
             "PROJECT_INVALID_MANIFEST", "Manifest.json is unavailable or invalid"
         ) from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
     if not isinstance(decoded, dict) or decoded.get("formatVersion") != 2:
         raise _fault(
             "PROJECT_UNSUPPORTED_FORMAT",
@@ -197,13 +272,14 @@ def _read_manifest(project_root: Path) -> _ProjectSnapshot:
             or float(timestamp) < 0
         ):
             raise _fault("PROJECT_INVALID_MANIFEST", "manifest frame is invalid")
-        relative = _safe_relative(raw.get("relativePath"))
+        relative = _manifest_relative(raw.get("relativePath"))
         frames[index] = PersistedFrame(index, float(timestamp), relative)
         previous_index = index
 
     completed: list[dict[str, object]] = []
     referenced: set[str] = set()
     previous_window = -1
+    previous_output_end = -1
     for raw_window in windows_value:
         if not isinstance(raw_window, dict):
             raise _fault(
@@ -211,20 +287,44 @@ def _read_manifest(project_root: Path) -> _ProjectSnapshot:
             )
         window = cast(dict[str, object], raw_window)
         index = window.get("index")
+        inference_start = window.get("inferenceFrameStart")
         frame_start = window.get("frameStart")
         frame_end = window.get("frameEnd")
+        last_processed = window.get("lastProcessedFrameIndex")
+        alignment = window.get("alignmentRowMajor")
+        inlier_count = window.get("inlierCount")
+        duration = window.get("durationSeconds")
         if (
             type(index) is not int
             or not 0 <= index <= _UINT32_MAX
             or index <= previous_window
+            or type(inference_start) is not int
             or type(frame_start) is not int
             or type(frame_end) is not int
-            or not 0 <= frame_start <= frame_end <= _UINT32_MAX
+            or type(last_processed) is not int
+            or not 0
+            <= inference_start
+            <= frame_start
+            <= frame_end
+            <= last_processed
+            <= _UINT32_MAX
+            or frame_start <= previous_output_end
+            or not isinstance(alignment, list)
+            or len(alignment) != 16
+            or any(
+                type(value) not in {int, float} or not math.isfinite(float(value))
+                for value in alignment
+            )
+            or type(inlier_count) is not int
+            or not 0 <= inlier_count <= _UINT64_MAX
+            or type(duration) not in {int, float}
+            or not math.isfinite(float(duration))
+            or float(duration) < 0
         ):
             raise _fault(
                 "PROJECT_INVALID_MANIFEST", "completed window bounds are invalid"
             )
-        point_path = _safe_relative(window.get("pointChunkRelativePath"))
+        point_path = _manifest_relative(window.get("pointChunkRelativePath"))
         if point_path != window_point_path(index):
             raise _fault(
                 "PROJECT_INVALID_MANIFEST", "completed CPC path is not canonical"
@@ -235,33 +335,66 @@ def _read_manifest(project_root: Path) -> _ProjectSnapshot:
             raise _fault(
                 "PROJECT_INVALID_MANIFEST", "completed window has no artifacts"
             )
+        artifact_indices: list[int] = []
+        previous_artifact = -1
         for artifact in artifacts:
             if not isinstance(artifact, dict):
                 raise _fault("PROJECT_INVALID_MANIFEST", "frame artifact is invalid")
             frame_index = artifact.get("frameIndex")
-            if type(frame_index) is not int or frame_index not in frames:
+            artifact_window = artifact.get("windowIndex")
+            artifact_duration = artifact.get("durationSeconds")
+            if (
+                type(frame_index) is not int
+                or frame_index not in frames
+                or not frame_start <= frame_index <= frame_end
+                or frame_index <= previous_artifact
+                or type(artifact_window) is not int
+                or artifact_window != index
+                or type(artifact_duration) not in {int, float}
+                or not math.isfinite(float(artifact_duration))
+                or float(artifact_duration) < 0
+            ):
                 raise _fault(
                     "PROJECT_INVALID_MANIFEST", "frame artifact index is invalid"
                 )
             expected = artifact_paths(frame_index)
             actual = (
-                _safe_relative(artifact.get("depthRelativePath")),
-                _safe_relative(artifact.get("confidenceRelativePath")),
-                _safe_relative(artifact.get("geometryRelativePath")),
+                _manifest_relative(artifact.get("depthRelativePath")),
+                _manifest_relative(artifact.get("confidenceRelativePath")),
+                _manifest_relative(artifact.get("geometryRelativePath")),
             )
             if actual != expected:
                 raise _fault(
                     "PROJECT_INVALID_MANIFEST", "frame artifact paths are not canonical"
                 )
             referenced.update(actual)
+            artifact_indices.append(frame_index)
+            previous_artifact = frame_index
+        expected_artifact_indices = [
+            frame_index
+            for frame_index in frames
+            if frame_start <= frame_index <= frame_end
+        ]
+        if (
+            artifact_indices[0] != frame_start
+            or artifact_indices[-1] != frame_end
+            or artifact_indices != expected_artifact_indices
+        ):
+            raise _fault(
+                "PROJECT_INVALID_MANIFEST",
+                "completed window artifacts do not cover its ordered frame range",
+            )
         completed.append(window)
         previous_window = index
+        previous_output_end = frame_end
     return _ProjectSnapshot(
-        project_id,
-        manifest,
-        frames,
-        frozenset(referenced),
-        tuple(completed),
+        project_id=project_id,
+        root_device=root_identity[0],
+        root_inode=root_identity[1],
+        manifest=manifest,
+        frames=frames,
+        referenced_artifacts=frozenset(referenced),
+        completed_windows=tuple(completed),
     )
 
 
@@ -274,56 +407,78 @@ def validate_project_root(project_root: Path) -> _ProjectSnapshot:
             "project must be an absolute existing .cloudpoint package",
             True,
         )
+    root_fd = -1
     try:
-        info = project_root.lstat()
+        root_fd = _open_project_fd(project_root)
+        root_info = os.fstat(root_fd)
+        for name in ("Frames", "Predictions", "Points", "Logs"):
+            child_fd = -1
+            try:
+                child_fd = _open_child_directory(root_fd, name)
+            finally:
+                if child_fd >= 0:
+                    os.close(child_fd)
+        return _read_manifest(root_fd, (root_info.st_dev, root_info.st_ino))
+    except WorkerFault:
+        raise
     except OSError as error:
         raise _fault(
-            "PROJECT_INVALID_PATH", "project package does not exist", True
+            "PROJECT_INVALID_PATH",
+            "project package or one of its required directories is unsafe",
+            True,
         ) from error
-    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-        raise _fault(
-            "PROJECT_INVALID_PATH", "project package must be a real directory", True
-        )
-    for name in ("Frames", "Predictions", "Points", "Logs"):
-        path = project_root / name
-        try:
-            child = path.lstat()
-        except OSError as error:
-            raise _fault(
-                "PROJECT_INVALID_PATH", f"project directory {name} is missing", True
-            ) from error
-        if stat.S_ISLNK(child.st_mode) or not stat.S_ISDIR(child.st_mode):
-            raise _fault(
-                "PROJECT_INVALID_PATH", f"project directory {name} is unsafe", True
-            )
-    return _read_manifest(project_root)
+    finally:
+        if root_fd >= 0:
+            os.close(root_fd)
 
 
-def _real_project_file(project_root: Path, relative: str) -> Path:
+def _open_regular_relative(
+    project_root: Path,
+    relative: str,
+    *,
+    root_identity: tuple[int, int] | None = None,
+) -> int:
     relative = _safe_relative(relative)
     components = relative.split("/")
-    candidate = project_root
+    directory_fd = -1
+    descriptor = -1
     try:
-        for ordinal, component in enumerate(components):
-            candidate = candidate / component
-            info = candidate.lstat()
-            if stat.S_ISLNK(info.st_mode):
-                raise OSError("symlink component")
-            if ordinal < len(components) - 1 and not stat.S_ISDIR(info.st_mode):
-                raise OSError("non-directory component")
+        directory_fd = _open_project_fd(project_root, root_identity)
+        for component in components[:-1]:
+            next_fd = _open_child_directory(directory_fd, component)
+            os.close(directory_fd)
+            directory_fd = next_fd
+        descriptor = os.open(components[-1], _file_flags(), dir_fd=directory_fd)
+        info = os.fstat(descriptor)
         if not stat.S_ISREG(info.st_mode):
             raise OSError("not a regular file")
+        return descriptor
     except OSError as error:
+        if descriptor >= 0:
+            os.close(descriptor)
         raise _fault(
             "PATH_OUTSIDE_PROJECT",
-            "frame path must resolve to a regular package file without symlinks",
+            "path must resolve to a regular package file without symlinks",
             True,
             relativePath=relative,
         ) from error
-    return candidate
+    finally:
+        if directory_fd >= 0:
+            os.close(directory_fd)
 
 
-def _validate_frame_path(project_root: Path, frame: PersistedFrame) -> Path:
+def _real_project_file(
+    project_root: Path,
+    relative: str,
+    root_identity: tuple[int, int] | None = None,
+) -> None:
+    descriptor = _open_regular_relative(
+        project_root, relative, root_identity=root_identity
+    )
+    os.close(descriptor)
+
+
+def _validate_frame_relative(frame: PersistedFrame) -> None:
     components = frame.relative_path.split("/")
     expected_stem = f"{frame.index:08d}"
     if (
@@ -338,30 +493,136 @@ def _validate_frame_path(project_root: Path, frame: PersistedFrame) -> Path:
             True,
             relativePath=frame.relative_path,
         )
-    return _real_project_file(project_root, frame.relative_path)
 
 
-def _remove_regular_file(path: Path) -> None:
+def _validate_frame_path(
+    project_root: Path,
+    frame: PersistedFrame,
+    root_identity: tuple[int, int] | None = None,
+) -> None:
+    _validate_frame_relative(frame)
+    _real_project_file(project_root, frame.relative_path, root_identity)
+
+
+@contextmanager
+def _opened_frame_path(
+    project_root: Path,
+    frame: PersistedFrame,
+    root_identity: tuple[int, int],
+) -> Iterator[Path]:
+    _validate_frame_relative(frame)
+    descriptor = _open_regular_relative(
+        project_root, frame.relative_path, root_identity=root_identity
+    )
     try:
-        info = path.lstat()
-    except FileNotFoundError:
+        yield Path(f"/dev/fd/{descriptor}")
+    finally:
+        os.close(descriptor)
+
+
+def _capture_owned_output(
+    project_root: Path, relative: str, root_identity: tuple[int, int]
+) -> _OwnedOutput:
+    descriptor = _open_regular_relative(
+        project_root, relative, root_identity=root_identity
+    )
+    try:
+        info = os.fstat(descriptor)
+        return _OwnedOutput(relative, info.st_dev, info.st_ino)
+    finally:
+        os.close(descriptor)
+
+
+def _remove_owned_output(
+    project_root: Path, owned: _OwnedOutput, root_identity: tuple[int, int]
+) -> None:
+    components = _safe_relative(owned.relative_path).split("/")
+    if len(components) != 2 or components[0] not in {"Predictions", "Points"}:
         return
-    if stat.S_ISREG(info.st_mode) and not stat.S_ISLNK(info.st_mode):
-        path.unlink()
+    root_fd = -1
+    directory_fd = -1
+    try:
+        root_fd = _open_project_fd(project_root, root_identity)
+        directory_fd = _open_child_directory(root_fd, components[0])
+        try:
+            info = os.stat(components[1], dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        if (
+            stat.S_ISREG(info.st_mode)
+            and info.st_dev == owned.device
+            and info.st_ino == owned.inode
+        ):
+            os.unlink(components[1], dir_fd=directory_fd)
+    except OSError:
+        return
+    finally:
+        if directory_fd >= 0:
+            os.close(directory_fd)
+        if root_fd >= 0:
+            os.close(root_fd)
 
 
-def _cleanup_orphans(project_root: Path, referenced: frozenset[str]) -> None:
+def _cleanup_directory(
+    project_root: Path,
+    directory_name: str,
+    root_identity: tuple[int, int],
+    should_remove: Callable[[str], bool],
+) -> None:
+    root_fd = -1
+    directory_fd = -1
+    try:
+        root_fd = _open_project_fd(project_root, root_identity)
+        directory_fd = _open_child_directory(root_fd, directory_name)
+        for name in os.listdir(directory_fd):
+            if not should_remove(name):
+                continue
+            try:
+                info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if stat.S_ISREG(info.st_mode):
+                with suppress(FileNotFoundError):
+                    os.unlink(name, dir_fd=directory_fd)
+    except OSError as error:
+        raise _fault(
+            "PROJECT_INVALID_PATH",
+            f"project directory {directory_name} became unsafe",
+            True,
+        ) from error
+    finally:
+        if directory_fd >= 0:
+            os.close(directory_fd)
+        if root_fd >= 0:
+            os.close(root_fd)
+
+
+def _cleanup_orphans(
+    project_root: Path,
+    referenced: frozenset[str],
+    root_identity: tuple[int, int],
+) -> None:
     for directory_name, canonical_pattern in (
         ("Predictions", _CANONICAL_PREDICTION),
         ("Points", _CANONICAL_POINTS),
     ):
-        directory = project_root / directory_name
-        for path in directory.iterdir():
-            relative = f"{directory_name}/{path.name}"
-            if _PARTIAL.fullmatch(path.name) or (
-                canonical_pattern.fullmatch(path.name) and relative not in referenced
-            ):
-                _remove_regular_file(path)
+
+        def should_remove(
+            name: str,
+            directory: str = directory_name,
+            pattern: re.Pattern[str] = canonical_pattern,
+        ) -> bool:
+            return _PARTIAL.fullmatch(name) is not None or (
+                pattern.fullmatch(name) is not None
+                and f"{directory}/{name}" not in referenced
+            )
+
+        _cleanup_directory(
+            project_root,
+            directory_name,
+            root_identity,
+            should_remove,
+        )
 
 
 class SessionRunner:
@@ -386,6 +647,7 @@ class SessionRunner:
         self._snapshot: _ProjectSnapshot | None = None
         self._configuration: ConfigurePayload | None = None
         self._checkpoint: ResumeCheckpoint | None = None
+        self._expected_replay: tuple[PersistedFrame, ...] = ()
         self._frames: list[PersistedFrame] = []
         self._input_finished = False
         self._begun = False
@@ -394,7 +656,7 @@ class SessionRunner:
         self._pause_emitted = False
         self._cancel_requested = False
         self._cancelled_emitted = False
-        self._created_outputs: list[Path] = []
+        self._created_outputs: list[_OwnedOutput] = []
         self._condition = threading.Condition()
         self.state = SessionState.READY
         self.queued_frames = 0
@@ -436,11 +698,16 @@ class SessionRunner:
                 if payload is not None
                 else self._initial_checkpoint
             )
-            self._validate_checkpoint(snapshot, checkpoint)
+            expected_replay = self._validate_checkpoint(snapshot, checkpoint)
             if self._cleanup_orphans_enabled:
-                _cleanup_orphans(self.project_root, snapshot.referenced_artifacts)
+                _cleanup_orphans(
+                    self.project_root,
+                    snapshot.referenced_artifacts,
+                    (snapshot.root_device, snapshot.root_inode),
+                )
             self._snapshot = snapshot
             self._checkpoint = checkpoint
+            self._expected_replay = expected_replay
             self.last_completed_window_index = (
                 checkpoint.next_window_index - 1 if checkpoint is not None else None
             )
@@ -448,7 +715,7 @@ class SessionRunner:
 
     def _validate_checkpoint(
         self, snapshot: _ProjectSnapshot, checkpoint: ResumeCheckpoint | None
-    ) -> None:
+    ) -> tuple[PersistedFrame, ...]:
         if checkpoint is None:
             if snapshot.completed_windows:
                 raise _fault(
@@ -456,7 +723,7 @@ class SessionRunner:
                     "completed project state requires a resume checkpoint",
                     True,
                 )
-            return
+            return ()
         if not snapshot.completed_windows:
             raise _fault(
                 "INVALID_RESUME_CHECKPOINT",
@@ -475,20 +742,25 @@ class SessionRunner:
                 "resume checkpoint does not match committed manifest state",
                 True,
             )
-        artifact_indices = {
-            artifact.get("frameIndex")
+        artifact_indices = [
+            cast(int, artifact.get("frameIndex"))
             for window in snapshot.completed_windows
             for artifact in cast(list[dict[str, object]], window["frameArtifacts"])
-        }
-        replay_indices = [
-            index
-            for index in snapshot.frames
+            if checkpoint.replay_from_frame_index
+            <= cast(int, artifact.get("frameIndex"))
+            <= checkpoint.last_committed_frame_index
+        ]
+        expected_replay = tuple(
+            snapshot.frames[index]
+            for index in artifact_indices
             if checkpoint.replay_from_frame_index
             <= index
             <= checkpoint.last_committed_frame_index
-        ]
-        if not replay_indices or any(
-            index not in artifact_indices for index in replay_indices
+        )
+        if (
+            not expected_replay
+            or expected_replay[0].index != checkpoint.replay_from_frame_index
+            or expected_replay[-1].index != checkpoint.last_committed_frame_index
         ):
             raise _fault(
                 "MISSING_REPLAY_ARTIFACTS",
@@ -496,12 +768,27 @@ class SessionRunner:
                 True,
             )
         for relative in snapshot.referenced_artifacts:
-            _real_project_file(self.project_root, relative)
+            _real_project_file(
+                self.project_root,
+                relative,
+                (snapshot.root_device, snapshot.root_inode),
+            )
+        return expected_replay
 
     def enqueue(self, frame: PersistedFrame) -> None:
         with self._condition:
             if not self._begun or self._input_finished or self._cancel_requested:
                 raise _fault("INVALID_STATE", "session is not accepting frames", True)
+            configuration = cast(ConfigurePayload, self._configuration)
+            maximum = min(_DIRECT_FRAME_LIMIT, configuration.window_size)
+            if len(self._frames) >= maximum:
+                raise _fault(
+                    "WINDOWING_UNAVAILABLE",
+                    "direct reconstruction admission limit has been reached",
+                    True,
+                    frameCount=len(self._frames),
+                    maximum=maximum,
+                )
             if (
                 type(frame.index) is not int
                 or not 0 <= frame.index <= _UINT32_MAX
@@ -509,7 +796,12 @@ class SessionRunner:
                 or frame.source_timestamp < 0
             ):
                 raise _fault("INVALID_FRAME", "frame descriptor is invalid", True)
-            _validate_frame_path(self.project_root, frame)
+            snapshot = cast(_ProjectSnapshot, self._snapshot)
+            _validate_frame_path(
+                self.project_root,
+                frame,
+                (snapshot.root_device, snapshot.root_inode),
+            )
             if self._frames and frame.index <= self._frames[-1].index:
                 raise _fault(
                     "FRAME_ORDER_VIOLATION", "frame indices must increase", True
@@ -517,45 +809,32 @@ class SessionRunner:
 
             replay = False
             checkpoint = self._checkpoint
-            if (
-                checkpoint is not None
-                and frame.index <= checkpoint.last_committed_frame_index
-            ):
-                if (
-                    not self._frames
-                    and frame.index != checkpoint.replay_from_frame_index
-                ):
+            if checkpoint is not None:
+                replay_ordinal = len(self._frames)
+                if frame.index > checkpoint.last_committed_frame_index:
                     raise _fault(
-                        "REPLAY_ORDER_VIOLATION",
-                        "replay must begin at the exact checkpoint frame",
+                        "WINDOWING_UNAVAILABLE",
+                        "resumed output requires real Sim3 window alignment",
                         True,
                     )
-                committed = cast(_ProjectSnapshot, self._snapshot).frames.get(
-                    frame.index
-                )
-                if committed is None or (
-                    committed.relative_path != frame.relative_path
+                if replay_ordinal >= len(self._expected_replay):
+                    raise _fault(
+                        "REPLAY_ORDER_VIOLATION",
+                        "replay contains more descriptors than the manifest boundary",
+                        True,
+                    )
+                committed = self._expected_replay[replay_ordinal]
+                if (
+                    committed.index != frame.index
+                    or committed.relative_path != frame.relative_path
                     or committed.source_timestamp != frame.source_timestamp
                 ):
                     raise _fault(
-                        "MISSING_REPLAY_ARTIFACTS",
-                        "replay descriptor differs from committed manifest state",
+                        "REPLAY_ORDER_VIOLATION",
+                        "replay descriptors must exactly match manifest artifact order",
                         True,
                     )
                 replay = True
-            elif checkpoint is not None:
-                replay_seen = [
-                    candidate.index for candidate in self._frames if candidate.replay
-                ]
-                if (
-                    not replay_seen
-                    or replay_seen[-1] != checkpoint.last_committed_frame_index
-                ):
-                    raise _fault(
-                        "REPLAY_ORDER_VIOLATION",
-                        "new output cannot begin before the committed replay boundary",
-                        True,
-                    )
             admitted = PersistedFrame(
                 frame.index, frame.source_timestamp, frame.relative_path, replay
             )
@@ -568,11 +847,17 @@ class SessionRunner:
             if not self._begun or self._input_finished or self._cancel_requested:
                 raise _fault("INVALID_STATE", "input cannot be finished now", True)
             if self._checkpoint is not None:
-                replay_indices = [frame.index for frame in self._frames if frame.replay]
-                if (
-                    not replay_indices
-                    or replay_indices[0] != self._checkpoint.replay_from_frame_index
-                    or replay_indices[-1] != self._checkpoint.last_committed_frame_index
+                replay_descriptors = tuple(
+                    frame for frame in self._frames if frame.replay
+                )
+                if replay_descriptors != tuple(
+                    PersistedFrame(
+                        frame.index,
+                        frame.source_timestamp,
+                        frame.relative_path,
+                        True,
+                    )
+                    for frame in self._expected_replay
                 ):
                     raise _fault(
                         "REPLAY_ORDER_VIOLATION",
@@ -685,16 +970,23 @@ class SessionRunner:
                 self.state = SessionState.PROCESSING
 
     def _cleanup_uncommitted_outputs(self) -> None:
-        for path in reversed(self._created_outputs):
-            _remove_regular_file(path)
+        snapshot = self._snapshot
+        if snapshot is None:
+            return
+        root_identity = (snapshot.root_device, snapshot.root_inode)
+        for owned in reversed(self._created_outputs):
+            _remove_owned_output(self.project_root, owned, root_identity)
         self._created_outputs.clear()
-        for directory in (
-            self.project_root / "Predictions",
-            self.project_root / "Points",
-        ):
-            for path in directory.iterdir():
-                if _PARTIAL.fullmatch(path.name):
-                    _remove_regular_file(path)
+        for directory_name in ("Predictions", "Points"):
+            # Cleanup is best effort after a terminal failure; never replace the
+            # original reconstruction fault with a path-race diagnostic.
+            with suppress(WorkerFault):
+                _cleanup_directory(
+                    self.project_root,
+                    directory_name,
+                    root_identity,
+                    lambda name: _PARTIAL.fullmatch(name) is not None,
+                )
 
     def process(self) -> None:
         """Run one complete direct reconstruction on the calling thread."""
@@ -731,25 +1023,31 @@ class SessionRunner:
         try:
             unique_frames = [frame for frame in self._frames if not frame.replay]
             if not unique_frames:
-                self.state = SessionState.COMPLETED
-                self._emit(
-                    SessionCompleted(
-                        PROTOCOL_VERSION,
-                        uuid.uuid4(),
-                        self.project_id,
-                        "sessionCompleted",
-                        SessionCompletedPayload(0, 0, time.monotonic() - started),
-                    )
+                self._cooperative_boundary()
+                replay_event = SessionCompleted(
+                    PROTOCOL_VERSION,
+                    uuid.uuid4(),
+                    self.project_id,
+                    "sessionCompleted",
+                    SessionCompletedPayload(0, 0, time.monotonic() - started),
                 )
+                with self._condition:
+                    if self._cancel_requested:
+                        raise _fault("CANCELLED", "session was cancelled", True)
+                    self._emit(replay_event)
+                    self.state = SessionState.COMPLETED
                 return
 
+            snapshot = cast(_ProjectSnapshot, self._snapshot)
+            root_identity = (snapshot.root_device, snapshot.root_inode)
             prepared: list[PreprocessedFrame] = []
             for frame in self._frames:
                 self._cooperative_boundary()
                 try:
-                    prepared.append(
-                        preprocess_image(_validate_frame_path(self.project_root, frame))
-                    )
+                    with _opened_frame_path(
+                        self.project_root, frame, root_identity
+                    ) as opened_path:
+                        prepared.append(preprocess_image(opened_path))
                 except ImageBoundsError as error:
                     raise _fault(
                         error.code, "source frame exceeds supported image bounds", True
@@ -789,19 +1087,18 @@ class SessionRunner:
                     continue
                 self._cooperative_boundary()
                 frame_started = time.monotonic()
-                self._emit(
-                    FrameStarted(
-                        PROTOCOL_VERSION,
-                        uuid.uuid4(),
-                        self.project_id,
-                        "frameStarted",
-                        FrameStartedPayload(frame.index, window_index),
+                with self._condition:
+                    if self._cancel_requested:
+                        raise _fault("CANCELLED", "session was cancelled", True)
+                    self._emit(
+                        FrameStarted(
+                            PROTOCOL_VERSION,
+                            uuid.uuid4(),
+                            self.project_id,
+                            "frameStarted",
+                            FrameStartedPayload(frame.index, window_index),
+                        )
                     )
-                )
-                expected_artifacts = artifact_paths(frame.index)
-                self._created_outputs.extend(
-                    self.project_root / relative for relative in expected_artifacts
-                )
                 artifacts = write_frame_outputs(
                     self.project_root,
                     frame,
@@ -812,6 +1109,16 @@ class SessionRunner:
                     model_identifier=MODEL_REPO,
                     model_revision=MODEL_REVISION,
                 )
+                for relative in (
+                    artifacts.depth_path,
+                    artifacts.confidence_path,
+                    artifacts.geometry_path,
+                ):
+                    self._created_outputs.append(
+                        _capture_owned_output(
+                            self.project_root, relative, root_identity
+                        )
+                    )
                 flags = 0
                 if ordinal % configuration.keyframe_interval == 0:
                     flags |= 1
@@ -829,28 +1136,33 @@ class SessionRunner:
                     flags,
                 )
                 all_vertices.extend(vertices)
-                self.processed_frames += 1
-                self._emit(
-                    FrameCompleted(
-                        PROTOCOL_VERSION,
-                        uuid.uuid4(),
-                        self.project_id,
-                        "frameCompleted",
-                        FrameCompletedPayload(
-                            frame.index,
-                            window_index,
-                            artifacts.depth_path,
-                            artifacts.confidence_path,
-                            artifacts.geometry_path,
-                            time.monotonic() - frame_started,
-                        ),
+                self._cooperative_boundary()
+                with self._condition:
+                    if self._cancel_requested:
+                        raise _fault("CANCELLED", "session was cancelled", True)
+                    self.processed_frames += 1
+                    self._emit(
+                        FrameCompleted(
+                            PROTOCOL_VERSION,
+                            uuid.uuid4(),
+                            self.project_id,
+                            "frameCompleted",
+                            FrameCompletedPayload(
+                                frame.index,
+                                window_index,
+                                artifacts.depth_path,
+                                artifacts.confidence_path,
+                                artifacts.geometry_path,
+                                time.monotonic() - frame_started,
+                            ),
+                        )
                     )
-                )
 
             self._cooperative_boundary()
             vertices = reduce_vertices(
                 all_vertices, voxel_size=configuration.voxel_size
             )
+            self._cooperative_boundary()
             if not vertices:
                 raise _fault(
                     "EMPTY_POINT_CLOUD",
@@ -859,69 +1171,78 @@ class SessionRunner:
                 )
             self.state = SessionState.FINALIZING
             point_relative = window_point_path(window_index)
+            self._cooperative_boundary()
             descriptor = write_cpc(
                 self.project_root / point_relative,
                 unique_frames[0].index,
                 unique_frames[-1].index,
                 vertices,
             )
-            self._created_outputs.append(self.project_root / point_relative)
-            self.window_count = 1
-            self.last_completed_window_index = window_index
-            self._emit(
-                WindowCompleted(
-                    PROTOCOL_VERSION,
-                    uuid.uuid4(),
-                    self.project_id,
-                    "windowCompleted",
-                    WindowCompletedPayload(
-                        window_index,
-                        self._frames[0].index,
-                        descriptor.frame_start,
-                        descriptor.frame_end,
-                        descriptor.relative_path,
-                        [
-                            1.0,
-                            0.0,
-                            0.0,
-                            0.0,
-                            0.0,
-                            1.0,
-                            0.0,
-                            0.0,
-                            0.0,
-                            0.0,
-                            1.0,
-                            0.0,
-                            0.0,
-                            0.0,
-                            0.0,
-                            1.0,
-                        ],
-                        descriptor.frame_end,
-                        descriptor.point_count,
-                        time.monotonic() - window_started,
-                    ),
-                )
+            self._created_outputs.append(
+                _capture_owned_output(self.project_root, point_relative, root_identity)
             )
-            # A windowCompleted event transfers ownership to native's pending-window
-            # transaction. Cancellation must not remove those artifacts afterward.
-            self._created_outputs.clear()
-            self.current_window = None
-            self.state = SessionState.COMPLETED
-            self._emit(
-                SessionCompleted(
-                    PROTOCOL_VERSION,
-                    uuid.uuid4(),
-                    self.project_id,
-                    "sessionCompleted",
-                    SessionCompletedPayload(
-                        self.processed_frames,
-                        self.window_count,
-                        time.monotonic() - started,
-                    ),
-                )
+            self._cooperative_boundary()
+            window_event = WindowCompleted(
+                PROTOCOL_VERSION,
+                uuid.uuid4(),
+                self.project_id,
+                "windowCompleted",
+                WindowCompletedPayload(
+                    window_index,
+                    self._frames[0].index,
+                    descriptor.frame_start,
+                    descriptor.frame_end,
+                    descriptor.relative_path,
+                    [
+                        1.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        1.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        1.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        1.0,
+                    ],
+                    descriptor.frame_end,
+                    descriptor.point_count,
+                    time.monotonic() - window_started,
+                ),
             )
+            # Cancellation and ownership transfer are serialized. Once this event
+            # is visible, native owns a complete window and cleanup must preserve it.
+            with self._condition:
+                if self._cancel_requested:
+                    raise _fault("CANCELLED", "session was cancelled", True)
+                self._emit(window_event)
+                self._created_outputs.clear()
+                self.window_count = 1
+                self.last_completed_window_index = window_index
+                self.current_window = None
+            self._cooperative_boundary()
+            session_event = SessionCompleted(
+                PROTOCOL_VERSION,
+                uuid.uuid4(),
+                self.project_id,
+                "sessionCompleted",
+                SessionCompletedPayload(
+                    self.processed_frames,
+                    self.window_count,
+                    time.monotonic() - started,
+                ),
+            )
+            with self._condition:
+                if self._cancel_requested:
+                    raise _fault("CANCELLED", "session was cancelled", True)
+                self._emit(session_event)
+                self.state = SessionState.COMPLETED
         except WorkerFault as fault:
             if fault.code == "CANCELLED" or self._cancel_requested:
                 self._cleanup_uncommitted_outputs()

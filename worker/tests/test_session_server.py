@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -120,6 +121,90 @@ def _frame(index: int) -> PersistedFrame:
     return PersistedFrame(index, index / 2, f"Frames/{index:08d}.jpg")
 
 
+def _install_completed_window(
+    project: Path,
+    indices: tuple[int, ...],
+    *,
+    window_overrides: dict[str, object] | None = None,
+    artifact_overrides: dict[int, dict[str, object]] | None = None,
+) -> dict[Path, bytes]:
+    manifest = _manifest()
+    for index in indices:
+        frame_path = project / f"Frames/{index:08d}.jpg"
+        if not frame_path.exists():
+            Image.new("RGB", (42, 28), (20 + index, 40, 60)).save(frame_path)
+    manifest["frames"] = [
+        {
+            "index": index,
+            "sourceTimestamp": index / 2,
+            "relativePath": f"Frames/{index:08d}.jpg",
+        }
+        for index in indices
+    ]
+    artifacts: list[dict[str, object]] = []
+    for index in indices:
+        paths = (
+            f"Predictions/{index:08d}.depth-f16",
+            f"Predictions/{index:08d}.confidence-f16",
+            f"Predictions/{index:08d}.geometry.json",
+        )
+        for relative in paths:
+            (project / relative).write_bytes(f"committed-{relative}".encode())
+        artifact: dict[str, object] = {
+            "frameIndex": index,
+            "windowIndex": 0,
+            "depthRelativePath": paths[0],
+            "confidenceRelativePath": paths[1],
+            "geometryRelativePath": paths[2],
+            "durationSeconds": 0,
+        }
+        if artifact_overrides and index in artifact_overrides:
+            artifact.update(artifact_overrides[index])
+        artifacts.append(artifact)
+    point_path = project / "Points/window-00000000.cpc"
+    point_path.write_bytes(b"committed-cpc")
+    window: dict[str, object] = {
+        "index": 0,
+        "inferenceFrameStart": indices[0],
+        "frameStart": indices[0],
+        "frameEnd": indices[-1],
+        "pointChunkRelativePath": "Points/window-00000000.cpc",
+        "alignmentRowMajor": [
+            1,
+            0,
+            0,
+            0,
+            0,
+            1,
+            0,
+            0,
+            0,
+            0,
+            1,
+            0,
+            0,
+            0,
+            0,
+            1,
+        ],
+        "lastProcessedFrameIndex": indices[-1],
+        "inlierCount": len(indices),
+        "durationSeconds": 0,
+        "frameArtifacts": artifacts,
+    }
+    if window_overrides:
+        window.update(window_overrides)
+    manifest["completedWindows"] = [window]
+    (project / "Manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    return {
+        path.relative_to(project): path.read_bytes()
+        for path in (
+            *sorted((project / "Predictions").iterdir()),
+            point_path,
+        )
+    }
+
+
 def test_direct_session_writes_predictions_and_one_nonempty_cpc(project: Path) -> None:
     events: list[object] = []
     model = FakeModel()
@@ -169,14 +254,14 @@ def test_more_than_thirty_two_frames_fails_recoverably_without_outputs(
     runner = SessionRunner(project, FakeModel(), lambda _: None, project_id=PROJECT_ID)
     runner.configure(CONFIG)
     runner.begin(BeginSessionPayload(None))
-    for index in range(33):
+    for index in range(32):
         runner.enqueue(_frame(index))
-    runner.finish_input()
 
     with pytest.raises(WorkerFault, match="WINDOWING_UNAVAILABLE") as raised:
-        runner.process()
+        runner.enqueue(_frame(32))
 
     assert raised.value.recoverable is True
+    assert runner.queued_frames == 32
     assert not list((project / "Predictions").iterdir())
     assert not list((project / "Points").iterdir())
 
@@ -197,91 +282,153 @@ def test_memory_failure_maps_to_recoverable_allocation_fault(project: Path) -> N
     assert runner.state == SessionState.FAILED
 
 
-def test_failed_frame_transaction_removes_owned_canonical_outputs(
+def test_cancel_after_reduction_cleans_only_uncommitted_outputs(
     project: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    def fail_after_first_output(*_args: object, **_kwargs: object) -> object:
-        (project / "Predictions/00000000.depth-f16").write_bytes(b"orphan")
-        raise WorkerFault("INVALID_MODEL_OUTPUT", "synthetic output fault", False)
+    events: list[object] = []
+    runner = SessionRunner(project, FakeModel(), events.append, project_id=PROJECT_ID)
+    runner.configure(CONFIG)
+    runner.begin(BeginSessionPayload(None))
+    runner.enqueue(_frame(0))
+    runner.enqueue(_frame(1))
+    runner.finish_input()
+    real_reduce = session_module.reduce_vertices
 
-    monkeypatch.setattr(session_module, "write_frame_outputs", fail_after_first_output)
+    def cancel_after_reduce(*args: object, **kwargs: object) -> object:
+        result = real_reduce(*args, **kwargs)
+        runner.cancel()
+        return result
+
+    monkeypatch.setattr(session_module, "reduce_vertices", cancel_after_reduce)
+
+    runner.process()
+
+    assert runner.state == SessionState.CANCELLED
+    assert events[-1].type == "cancelled"
+    assert not any(event.type == "windowCompleted" for event in events)
+    assert not list((project / "Predictions").iterdir())
+    assert not list((project / "Points").iterdir())
+
+
+def test_cancel_after_cpc_promotion_prevents_completion_and_removes_owned_chunk(
+    project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events: list[object] = []
+    runner = SessionRunner(project, FakeModel(), events.append, project_id=PROJECT_ID)
+    runner.configure(CONFIG)
+    runner.begin(BeginSessionPayload(None))
+    runner.enqueue(_frame(0))
+    runner.finish_input()
+    real_write_cpc = session_module.write_cpc
+
+    def cancel_after_write(*args: object, **kwargs: object) -> object:
+        result = real_write_cpc(*args, **kwargs)
+        runner.cancel()
+        return result
+
+    monkeypatch.setattr(session_module, "write_cpc", cancel_after_write)
+
+    runner.process()
+
+    assert runner.state == SessionState.CANCELLED
+    assert events[-1].type == "cancelled"
+    assert not any(event.type == "windowCompleted" for event in events)
+    assert not list((project / "Predictions").iterdir())
+    assert not list((project / "Points").iterdir())
+
+
+def test_failed_frame_transaction_never_removes_preexisting_canonical_output(
+    project: Path,
+) -> None:
     runner = SessionRunner(project, FakeModel(), lambda _: None, project_id=PROJECT_ID)
     runner.configure(CONFIG)
     runner.begin(BeginSessionPayload(None))
     runner.enqueue(_frame(0))
     runner.finish_input()
+    preexisting = project / "Predictions/00000000.depth-f16"
+    preexisting.write_bytes(b"belongs-to-another-writer")
 
-    with pytest.raises(WorkerFault, match="INVALID_MODEL_OUTPUT"):
+    with pytest.raises(WorkerFault, match="OUTPUT_ALREADY_EXISTS"):
         runner.process()
 
-    assert not list((project / "Predictions").iterdir())
+    assert preexisting.read_bytes() == b"belongs-to-another-writer"
+
+
+def test_cancel_cleanup_preserves_output_replaced_after_worker_promotion(
+    project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    replacement = b"replacement-owned-by-another-writer"
+    runner = SessionRunner(project, FakeModel(), lambda _: None, project_id=PROJECT_ID)
+    runner.configure(CONFIG)
+    runner.begin(BeginSessionPayload(None))
+    runner.enqueue(_frame(0))
+    runner.finish_input()
+    real_filter = session_module.filter_and_reduce_points
+
+    def replace_after_promotion(*args: object, **kwargs: object) -> object:
+        depth = project / "Predictions/00000000.depth-f16"
+        depth.unlink()
+        depth.write_bytes(replacement)
+        runner.cancel()
+        return real_filter(*args, **kwargs)
+
+    monkeypatch.setattr(
+        session_module, "filter_and_reduce_points", replace_after_promotion
+    )
+
+    runner.process()
+
+    assert runner.state == SessionState.CANCELLED
+    assert (project / "Predictions/00000000.depth-f16").read_bytes() == replacement
 
 
 def test_replay_is_context_only_and_never_overwrites_committed_outputs(
     project: Path,
 ) -> None:
-    manifest = _manifest()
-    manifest["frames"] = [
-        {"index": 0, "sourceTimestamp": 0, "relativePath": "Frames/00000000.jpg"},
-        {"index": 1, "sourceTimestamp": 0.5, "relativePath": "Frames/00000001.jpg"},
-    ]
-    artifacts = []
-    for index in (0, 1):
-        paths = (
-            f"Predictions/{index:08d}.depth-f16",
-            f"Predictions/{index:08d}.confidence-f16",
-            f"Predictions/{index:08d}.geometry.json",
-        )
-        for relative in paths:
-            (project / relative).write_bytes(f"committed-{relative}".encode())
-        artifacts.append(
-            {
-                "frameIndex": index,
-                "windowIndex": 0,
-                "depthRelativePath": paths[0],
-                "confidenceRelativePath": paths[1],
-                "geometryRelativePath": paths[2],
-                "durationSeconds": 0,
-            }
-        )
-    (project / "Points/window-00000000.cpc").write_bytes(b"committed-cpc")
-    manifest["completedWindows"] = [
-        {
-            "index": 0,
-            "inferenceFrameStart": 0,
-            "frameStart": 0,
-            "frameEnd": 1,
-            "pointChunkRelativePath": "Points/window-00000000.cpc",
-            "alignmentRowMajor": [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
-            "lastProcessedFrameIndex": 1,
-            "inlierCount": 2,
-            "durationSeconds": 0,
-            "frameArtifacts": artifacts,
-        }
-    ]
-    (project / "Manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
-    original = {
-        path.relative_to(project): path.read_bytes()
-        for path in (
-            *sorted((project / "Predictions").iterdir()),
-            project / "Points/window-00000000.cpc",
-        )
-    }
+    original = _install_completed_window(project, (0, 1))
     Image.new("RGB", (42, 28), (90, 80, 70)).save(project / "Frames/00000002.jpg")
     events: list[object] = []
     runner = SessionRunner(project, FakeModel(), events.append, project_id=PROJECT_ID)
     runner.configure(CONFIG)
     runner.begin(BeginSessionPayload(ResumeCheckpoint(1, 0, 1)))
-    for index in range(3):
-        runner.enqueue(_frame(index))
+    runner.enqueue(_frame(0))
+    runner.enqueue(_frame(1))
+    with pytest.raises(WorkerFault, match="WINDOWING_UNAVAILABLE") as raised:
+        runner.enqueue(_frame(2))
+    assert raised.value.recoverable is True
     runner.finish_input()
     runner.process()
 
-    assert runner.processed_frames == 1
-    assert [
-        event.payload.frame_index for event in events if event.type == "frameCompleted"
-    ] == [2]
-    assert (project / "Points/window-00000001.cpc").exists()
+    assert runner.processed_frames == 0
+    assert [event.type for event in events] == ["sessionCompleted"]
+    assert not (project / "Points/window-00000001.cpc").exists()
+    for relative, contents in original.items():
+        assert (project / relative).read_bytes() == contents
+
+
+def test_replay_requires_every_exact_manifest_descriptor(project: Path) -> None:
+    _install_completed_window(project, (0, 1, 2))
+    runner = SessionRunner(project, FakeModel(), lambda _: None, project_id=PROJECT_ID)
+    runner.configure(CONFIG)
+    runner.begin(BeginSessionPayload(ResumeCheckpoint(2, 0, 1)))
+    runner.enqueue(_frame(0))
+
+    with pytest.raises(WorkerFault, match="REPLAY_ORDER_VIOLATION"):
+        runner.enqueue(_frame(2))
+
+
+def test_replay_exact_order_allows_legal_source_index_gaps(project: Path) -> None:
+    original = _install_completed_window(project, (0, 2))
+    events: list[object] = []
+    runner = SessionRunner(project, FakeModel(), events.append, project_id=PROJECT_ID)
+    runner.configure(CONFIG)
+    runner.begin(BeginSessionPayload(ResumeCheckpoint(2, 0, 1)))
+    runner.enqueue(_frame(0))
+    runner.enqueue(_frame(2))
+    runner.finish_input()
+    runner.process()
+
+    assert [event.type for event in events] == ["sessionCompleted"]
     for relative, contents in original.items():
         assert (project / relative).read_bytes() == contents
 
@@ -332,7 +479,9 @@ def test_server_acknowledges_each_command_once_and_hello_heartbeat_is_immediate(
     )
     finish = _command("finishInput", {}, 5)
 
-    for command in (hello, configure, begin, enqueue, finish):
+    assert server.handle(hello) is True
+    server.wait_for_model(timeout=10)
+    for command in (configure, begin, enqueue, finish):
         assert server.handle(command) is True
     server.wait_for_idle(timeout=10)
     server.close()
@@ -354,6 +503,62 @@ def test_server_acknowledges_each_command_once_and_hello_heartbeat_is_immediate(
     assert output[-1].type == "sessionCompleted"
 
 
+def test_server_rejects_first_descriptor_beyond_direct_cap_without_ack(
+    project: Path,
+) -> None:
+    Image.new("RGB", (42, 28), (10, 20, 30)).save(project / "Frames/00000002.jpg")
+    output: list[object] = []
+    server = WorkerServer(
+        project,
+        model_loader=lambda: FakeModel(),
+        event_sink=output.append,
+        heartbeat_interval=60,
+    )
+    hello = _command(
+        "hello", {"clientVersion": "test", "supportedProtocolVersions": [1]}, 51
+    )
+    configure = _command(
+        "configure",
+        {
+            "scaleFrames": 2,
+            "windowSize": 2,
+            "windowOverlap": 1,
+            "keyframeInterval": 1,
+            "cameraRefinementIterations": 4,
+            "confidenceThreshold": 1.5,
+            "voxelSize": 0.01,
+        },
+        52,
+    )
+    begin = _command("beginSession", {"resumeCheckpoint": None}, 53)
+    frames = tuple(
+        _command(
+            "enqueueFrame",
+            {
+                "frameIndex": index,
+                "sourceTimestamp": index / 2,
+                "relativePath": f"Frames/{index:08d}.jpg",
+            },
+            54 + index,
+        )
+        for index in range(3)
+    )
+    server.handle(hello)
+    server.wait_for_model(timeout=10)
+    for command in (configure, begin, *frames):
+        server.handle(command)
+    server.close()
+
+    final_responses = [
+        event
+        for event in output
+        if event.type in {"ack", "error"} and event.command_id == frames[-1].id
+    ]
+    assert [event.type for event in final_responses] == ["error"]
+    assert final_responses[0].payload.code == "WINDOWING_UNAVAILABLE"
+    assert final_responses[0].payload.details["frameCount"] == 2
+
+
 def test_heartbeat_continues_while_model_is_loading(project: Path) -> None:
     output: list[object] = []
 
@@ -371,9 +576,13 @@ def test_heartbeat_continues_while_model_is_loading(project: Path) -> None:
         "hello", {"clientVersion": "test", "supportedProtocolVersions": [1]}, 91
     )
 
+    started = time.monotonic()
     server.handle(hello)
+    handle_duration = time.monotonic() - started
+    server.wait_for_model(timeout=10)
     server.close()
 
+    assert handle_duration < 0.05
     ready_index = next(
         index for index, event in enumerate(output) if event.type == "ready"
     )
@@ -382,6 +591,120 @@ def test_heartbeat_continues_while_model_is_loading(project: Path) -> None:
     ]
     assert len(loading_heartbeats) >= 3
     assert all(event.payload.busy for event in loading_heartbeats)
+
+
+def test_shutdown_ack_remains_live_while_model_loader_is_blocked(
+    project: Path,
+) -> None:
+    output: list[object] = []
+    loading = threading.Event()
+    release = threading.Event()
+
+    def blocked_loader() -> FakeModel:
+        loading.set()
+        assert release.wait(timeout=5)
+        return FakeModel()
+
+    server = WorkerServer(
+        project,
+        model_loader=blocked_loader,
+        event_sink=output.append,
+        heartbeat_interval=60,
+    )
+    hello = _command(
+        "hello", {"clientVersion": "test", "supportedProtocolVersions": [1]}, 92
+    )
+    shutdown = _command("shutdown", {}, 93)
+
+    assert server.handle(hello) is True
+    assert loading.wait(timeout=5)
+    started = time.monotonic()
+    assert server.handle(shutdown) is False
+    shutdown_duration = time.monotonic() - started
+
+    assert shutdown_duration < 0.05
+    assert output[-1].type == "ack"
+    assert output[-1].command_id == shutdown.id
+    release.set()
+    server.close()
+    assert not any(event.type == "ready" for event in output)
+
+
+def test_shutdown_during_reduction_acks_then_cancels_and_cleans_outputs(
+    project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output: list[object] = []
+    reducing = threading.Event()
+    release = threading.Event()
+    real_reduce = session_module.reduce_vertices
+
+    def blocked_reduce(*args: object, **kwargs: object) -> object:
+        reducing.set()
+        assert release.wait(timeout=5)
+        return real_reduce(*args, **kwargs)
+
+    monkeypatch.setattr(session_module, "reduce_vertices", blocked_reduce)
+    server = WorkerServer(
+        project,
+        model_loader=lambda: FakeModel(),
+        event_sink=output.append,
+        heartbeat_interval=60,
+    )
+    commands = (
+        _command(
+            "hello",
+            {"clientVersion": "test", "supportedProtocolVersions": [1]},
+            94,
+        ),
+        _command(
+            "configure",
+            {
+                "scaleFrames": 8,
+                "windowSize": 32,
+                "windowOverlap": 8,
+                "keyframeInterval": 1,
+                "cameraRefinementIterations": 4,
+                "confidenceThreshold": 1.5,
+                "voxelSize": 0.01,
+            },
+            95,
+        ),
+        _command("beginSession", {"resumeCheckpoint": None}, 96),
+        _command(
+            "enqueueFrame",
+            {
+                "frameIndex": 0,
+                "sourceTimestamp": 0,
+                "relativePath": "Frames/00000000.jpg",
+            },
+            97,
+        ),
+        _command("finishInput", {}, 98),
+    )
+    server.handle(commands[0])
+    server.wait_for_model(timeout=10)
+    for command in commands[1:]:
+        server.handle(command)
+    assert reducing.wait(timeout=5)
+    shutdown = _command("shutdown", {}, 99)
+
+    assert server.handle(shutdown) is False
+    shutdown_ack = next(
+        index
+        for index, event in enumerate(output)
+        if event.type == "ack" and event.command_id == shutdown.id
+    )
+    release.set()
+    server.wait_for_idle(timeout=10)
+    server.close()
+
+    cancelled = next(
+        index for index, event in enumerate(output) if event.type == "cancelled"
+    )
+    assert cancelled > shutdown_ack
+    assert not any(event.type == "windowCompleted" for event in output)
+    assert not list((project / "Predictions").iterdir())
+    assert not list((project / "Points").iterdir())
 
 
 def test_cancel_then_shutdown_does_not_duplicate_cancelled(project: Path) -> None:
@@ -415,7 +738,9 @@ def test_cancel_then_shutdown_does_not_duplicate_cancelled(project: Path) -> Non
         _command("cancel", {}, 104),
         _command("shutdown", {}, 105),
     )
-    for command in commands:
+    server.handle(commands[0])
+    server.wait_for_model(timeout=10)
+    for command in commands[1:]:
         server.handle(command)
     server.close()
 
@@ -445,6 +770,7 @@ def test_duplicate_command_id_receives_one_error_without_repeating_mutation(
         "hello", {"clientVersion": "test", "supportedProtocolVersions": [1]}, 201
     )
     server.handle(hello)
+    server.wait_for_model(timeout=10)
     server.handle(hello)
     server.close()
 
@@ -475,6 +801,7 @@ def test_shutdown_is_acknowledged_after_model_load_failure(project: Path) -> Non
     )
     shutdown = _command("shutdown", {}, 212)
     server.handle(hello)
+    server.wait_for_model(timeout=10)
 
     should_continue = server.handle(shutdown)
     server.close()
@@ -511,7 +838,7 @@ def test_framed_server_stdout_contains_only_protocol_frames(project: Path) -> No
     destination = io.BytesIO()
     server = WorkerServer(
         project,
-        model_loader=lambda: FakeModel(),
+        model_loader=lambda: (time.sleep(0.09), FakeModel())[1],
         input_stream=source,
         output_stream=destination,
         heartbeat_interval=60,
@@ -523,15 +850,41 @@ def test_framed_server_stdout_contains_only_protocol_frames(project: Path) -> No
     decoded: list[dict[str, object]] = []
     while destination.tell() < len(destination.getvalue()):
         decoded.append(read_json_frame(destination))
-    assert [value["type"] for value in decoded] == [
-        "ack",
-        "heartbeat",
-        "modelProgress",
-        "modelProgress",
-        "ready",
-        "ack",
-    ]
+    assert [value["type"] for value in decoded[:2]] == ["ack", "heartbeat"]
+    assert decoded[-1]["type"] == "ack"
+    assert decoded[-1]["payload"]["command"] == "shutdown"
+    assert not any(value["type"] == "ready" for value in decoded)
     assert all(decode_event(value) for value in decoded)
+
+
+def test_framed_server_clean_eof_returns_success(project: Path) -> None:
+    output: list[object] = []
+    server = WorkerServer(
+        project,
+        model_loader=lambda: FakeModel(),
+        input_stream=io.BytesIO(),
+        event_sink=output.append,
+        heartbeat_interval=60,
+    )
+
+    assert server.serve() == 0
+    assert output == []
+
+
+def test_framed_server_malformed_input_returns_protocol_exit(project: Path) -> None:
+    output: list[object] = []
+    source = io.BytesIO((1).to_bytes(4, "big") + b"{")
+    server = WorkerServer(
+        project,
+        model_loader=lambda: FakeModel(),
+        input_stream=source,
+        event_sink=output.append,
+        heartbeat_interval=60,
+    )
+
+    assert server.serve() == 3
+    assert [event.type for event in output] == ["error"]
+    assert output[0].payload.code == "INVALID_JSON"
 
 
 def test_session_rejects_symlinked_frame(project: Path, tmp_path: Path) -> None:
@@ -545,3 +898,132 @@ def test_session_rejects_symlinked_frame(project: Path, tmp_path: Path) -> None:
 
     with pytest.raises(WorkerFault, match="PATH_OUTSIDE_PROJECT"):
         runner.enqueue(_frame(9))
+
+
+def test_manifest_read_cannot_be_redirected_after_path_validation(
+    project: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    outside = tmp_path / "outside-manifest.json"
+    outside.write_text("{}", encoding="utf-8")
+    original_read_text = Path.read_text
+
+    def swap_before_path_read(path: Path, *args: object, **kwargs: object) -> str:
+        if path == project / "Manifest.json":
+            path.rename(project / "Manifest.original.json")
+            path.symlink_to(outside)
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", swap_before_path_read)
+    runner = SessionRunner(project, FakeModel(), lambda _: None, project_id=PROJECT_ID)
+    runner.configure(CONFIG)
+
+    runner.begin(BeginSessionPayload(None))
+
+    assert runner.project_id == PROJECT_ID
+    assert not (project / "Manifest.original.json").exists()
+
+
+def test_frame_decode_uses_open_descriptor_across_path_swap(
+    project: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    outside = tmp_path / "outside.jpg"
+    Image.new("RGB", (42, 28), (10, 240, 10)).save(outside)
+    canonical = project / "Frames/00000000.jpg"
+    original_preprocess = session_module.preprocess_image
+    observed_red_minus_green: list[float] = []
+
+    def swap_before_decode(path: Path) -> object:
+        canonical.rename(project / "Frames/00000000.original.jpg")
+        canonical.symlink_to(outside)
+        result = original_preprocess(path)
+        observed_red_minus_green.append(
+            float(np.mean(result.rgb[..., 0]) - np.mean(result.rgb[..., 1]))
+        )
+        return result
+
+    monkeypatch.setattr(session_module, "preprocess_image", swap_before_decode)
+    runner = SessionRunner(project, FakeModel(), lambda _: None, project_id=PROJECT_ID)
+    runner.configure(CONFIG)
+    runner.begin(BeginSessionPayload(None))
+    runner.enqueue(_frame(0))
+    runner.finish_input()
+
+    runner.process()
+
+    assert observed_red_minus_green[0] > 0.5
+
+
+def test_orphan_cleanup_holds_directory_descriptor_across_path_swap(
+    project: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    orphan = project / "Predictions/00000009.depth-f16"
+    orphan.write_bytes(b"orphan")
+    outside = tmp_path / "outside-predictions"
+    outside.mkdir()
+    outside_file = outside / orphan.name
+    outside_file.write_bytes(b"must-survive")
+    original_iterdir = Path.iterdir
+
+    def swap_before_iteration(path: Path):  # type: ignore[no-untyped-def]
+        if path == project / "Predictions":
+            path.rename(project / "Predictions.original")
+            path.symlink_to(outside, target_is_directory=True)
+        return original_iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", swap_before_iteration)
+    runner = SessionRunner(project, FakeModel(), lambda _: None, project_id=PROJECT_ID)
+    runner.configure(CONFIG)
+
+    runner.begin(BeginSessionPayload(None))
+
+    assert outside_file.read_bytes() == b"must-survive"
+    assert not orphan.exists()
+
+
+@pytest.mark.parametrize(
+    ("window_overrides", "artifact_overrides"),
+    [
+        ({"alignmentRowMajor": [1.0] * 15}, None),
+        ({"alignmentRowMajor": [1.0] * 15 + [float("inf")]}, None),
+        ({"inferenceFrameStart": 1}, None),
+        ({"lastProcessedFrameIndex": 0}, None),
+        ({"inlierCount": -1}, None),
+        ({"durationSeconds": -0.1}, None),
+        (None, {0: {"windowIndex": 1}}),
+        (None, {0: {"durationSeconds": float("nan")}}),
+    ],
+)
+def test_recovery_rejects_malformed_window_metadata(
+    project: Path,
+    window_overrides: dict[str, object] | None,
+    artifact_overrides: dict[int, dict[str, object]] | None,
+) -> None:
+    _install_completed_window(
+        project,
+        (0, 1),
+        window_overrides=window_overrides,
+        artifact_overrides=artifact_overrides,
+    )
+    runner = SessionRunner(project, FakeModel(), lambda _: None, project_id=PROJECT_ID)
+    runner.configure(CONFIG)
+
+    with pytest.raises(WorkerFault, match="PROJECT_INVALID_MANIFEST"):
+        runner.begin(BeginSessionPayload(ResumeCheckpoint(1, 0, 1)))
+
+
+@pytest.mark.parametrize("artifact_indices", [(1, 0), (0,)])
+def test_recovery_rejects_reordered_or_incomplete_artifact_windows(
+    project: Path, artifact_indices: tuple[int, ...]
+) -> None:
+    _install_completed_window(project, (0, 1))
+    manifest = json.loads((project / "Manifest.json").read_text(encoding="utf-8"))
+    artifacts = manifest["completedWindows"][0]["frameArtifacts"]
+    manifest["completedWindows"][0]["frameArtifacts"] = [
+        artifacts[index] for index in artifact_indices
+    ]
+    (project / "Manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    runner = SessionRunner(project, FakeModel(), lambda _: None, project_id=PROJECT_ID)
+    runner.configure(CONFIG)
+
+    with pytest.raises(WorkerFault, match="PROJECT_INVALID_MANIFEST"):
+        runner.begin(BeginSessionPayload(ResumeCheckpoint(1, 0, 1)))
