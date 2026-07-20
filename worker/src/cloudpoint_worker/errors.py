@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 
-@dataclass(frozen=True)
+@dataclass
 class WorkerFault(Exception):
     """An internal fault that can be transported without leaking an exception."""
 
