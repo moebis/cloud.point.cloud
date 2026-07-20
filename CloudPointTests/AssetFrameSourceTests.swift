@@ -27,21 +27,14 @@ final class AssetFrameSourceTests: XCTestCase {
         XCTAssertEqual(tieFrames.map(\.presentationTimestamp), [CMTime(value: 2, timescale: 30)])
     }
 
-    func testAssetLoadingAndDecodingAreDemandDriven() async throws {
-        let directory = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: directory) }
-        let fixture = try await VideoFixtureFactory.makeVFRMovie(in: directory)
-        let source = AssetFrameSource(assetURL: fixture.url)
-        let stream = source.frames(at: [.zero])
+    func testEmptyTimestampPlanDoesNotOpenMissingAsset() async throws {
+        let missingURL = FileManager.default.temporaryDirectory
+            .appending(path: UUID().uuidString)
+            .appendingPathExtension("mov")
 
-        try FileManager.default.removeItem(at: fixture.url)
+        let frames = try await Self.collect(AssetFrameSource(assetURL: missingURL).frames(at: []))
 
-        do {
-            _ = try await Self.collect(stream)
-            XCTFail("Expected deferred asset loading to fail after the source was removed")
-        } catch {
-            XCTAssertFalse(error is CancellationError)
-        }
+        XCTAssertEqual(frames.count, 0)
     }
 
     func testInvalidOrNonIncreasingRequestedTimestampsAreRejected() async throws {
@@ -64,6 +57,64 @@ final class AssetFrameSourceTests: XCTestCase {
                 XCTAssertEqual(error as? AssetFrameSourceError, .invalidRequestedTimestamps)
             }
         }
+    }
+
+    func testRequestedTimestampEqualToOrBeyondDurationIsRejectedBeforePersistence() async throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fixture = try await VideoFixtureFactory.makeVFRMovie(in: directory)
+
+        for timestamp in [CMTime(value: 1, timescale: 1), CMTime(value: 31, timescale: 30)] {
+            let package = try TemporaryProjectPackage.make()
+            let persistence = try JPEGFramePersistence(packageURL: package.url)
+            do {
+                for try await frame in AssetFrameSource(assetURL: fixture.url).frames(at: [timestamp]) {
+                    _ = try await persistence.persist(frame)
+                }
+                XCTFail("Expected timestamp \(timestamp) to be rejected")
+            } catch {
+                XCTAssertEqual(error as? AssetFrameSourceError, .invalidRequestedTimestamps)
+            }
+            XCTAssertEqual(
+                try FileManager.default.contentsOfDirectory(atPath: package.url.appending(path: "Frames").path),
+                []
+            )
+        }
+    }
+
+    func testCancellingConsumerCancelsReaderWhileStreamIsRetained() async throws {
+        let pixelBuffer = try VideoFixtureFactory.makePixelBuffer(
+            color: .init(red: 40, green: 80, blue: 120)
+        )
+        let reader = BlockingRecordingAssetReaderSession(pixelBuffer: pixelBuffer)
+        let source = AssetFrameSource(
+            assetURL: URL(filePath: "/unused-by-injected-reader.mov"),
+            readerFactory: FixedAssetReaderSessionFactory(reader: reader)
+        )
+        let stream = source.frames(at: [
+            .zero,
+            CMTime(value: 1, timescale: 5),
+        ])
+        let firstFrame = expectation(description: "first frame emitted")
+
+        let consumer = Task { () -> Int in
+            var count = 0
+            do {
+                for try await _ in stream {
+                    count += 1
+                    firstFrame.fulfill()
+                }
+            } catch {}
+            return count
+        }
+
+        await fulfillment(of: [firstFrame], timeout: 1)
+        await reader.waitUntilBlockedOnNextSample()
+        consumer.cancel()
+        await reader.waitUntilCancelled()
+        let emittedCount = await consumer.value
+        XCTAssertEqual(emittedCount, 1)
+        withExtendedLifetime(stream) {}
     }
 
     func testPreCancelledIterationEmitsNoFrames() async throws {
@@ -92,7 +143,7 @@ final class AssetFrameSourceTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: directory) }
         let fixture = try await VideoFixtureFactory.makeVFRMovie(in: directory)
         let package = try TemporaryProjectPackage.make()
-        let persistence = JPEGFramePersistence(packageURL: package.url)
+        let persistence = try JPEGFramePersistence(packageURL: package.url)
         let plan = try FrameSamplingPlan(duration: CMTime(value: 1, timescale: 1), framesPerSecond: 10)
         let assetURL = fixture.url
         let timestamps = plan.timestamps
@@ -123,7 +174,7 @@ final class AssetFrameSourceTests: XCTestCase {
         let package = try TemporaryProjectPackage.make()
         let source = AssetFrameSource(assetURL: fixture.url)
         let plan = try FrameSamplingPlan(duration: CMTime(value: 1, timescale: 1), framesPerSecond: 5)
-        let persistence = JPEGFramePersistence(packageURL: package.url)
+        let persistence = try JPEGFramePersistence(packageURL: package.url)
 
         var persisted: [PersistedFrame] = []
         for try await frame in source.frames(at: plan.timestamps) {
@@ -219,7 +270,7 @@ final class AssetFrameSourceTests: XCTestCase {
         let frames = try await Self.collect(AssetFrameSource(assetURL: fixture.url).frames(at: [.zero]))
         let frame = try XCTUnwrap(frames.first)
         let package = try TemporaryProjectPackage.make()
-        let persistence = JPEGFramePersistence(packageURL: package.url)
+        let persistence = try JPEGFramePersistence(packageURL: package.url)
 
         let result = await Task { () -> Result<PersistedFrame, Error> in
             withUnsafeCurrentTask { $0?.cancel() }
@@ -255,6 +306,64 @@ final class AssetFrameSourceTests: XCTestCase {
         try fileManager.createSymbolicLink(at: framesURL, withDestinationURL: escaped)
         await assertContainmentRejected(packageURL: package.url, frame: frame)
         XCTAssertEqual(try fileManager.contentsOfDirectory(atPath: escaped.path), [])
+    }
+
+    func testPersistenceUsesOriginallyOpenedFramesDirectoryAfterPathIsReplacedBySymlink() async throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fixture = try await VideoFixtureFactory.makeVFRMovie(in: directory)
+        let frames = try await Self.collect(AssetFrameSource(assetURL: fixture.url).frames(at: [.zero]))
+        let frame = try XCTUnwrap(frames.first)
+        let package = try TemporaryProjectPackage.make()
+        let fileManager = FileManager.default
+        let persistence = try JPEGFramePersistence(packageURL: package.url)
+        let framesURL = package.url.appending(path: "Frames", directoryHint: .isDirectory)
+        let heldFramesURL = package.url.appending(path: "HeldFrames", directoryHint: .isDirectory)
+        let escapedURL = directory.appending(path: "escaped", directoryHint: .isDirectory)
+        try fileManager.createDirectory(at: escapedURL, withIntermediateDirectories: false)
+
+        try fileManager.moveItem(at: framesURL, to: heldFramesURL)
+        try fileManager.createSymbolicLink(at: framesURL, withDestinationURL: escapedURL)
+
+        let persisted = try await persistence.persist(frame)
+
+        XCTAssertEqual(persisted.relativePath, "Frames/00000000.jpg")
+        XCTAssertTrue(fileManager.fileExists(atPath: heldFramesURL.appending(path: "00000000.jpg").path))
+        XCTAssertFalse(fileManager.fileExists(atPath: heldFramesURL.appending(path: "00000000.jpg.partial").path))
+        XCTAssertEqual(try fileManager.contentsOfDirectory(atPath: escapedURL.path), [])
+    }
+
+    func testConcurrentIndependentStoresForSameIndexProduceExactlyOneValidFinalJPEG() async throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fixture = try await VideoFixtureFactory.makeVFRMovie(in: directory)
+        let frames = try await Self.collect(AssetFrameSource(assetURL: fixture.url).frames(at: [.zero]))
+        let frame = try XCTUnwrap(frames.first)
+        let package = try TemporaryProjectPackage.make()
+        let firstStore = try JPEGFramePersistence(packageURL: package.url)
+        let secondStore = try JPEGFramePersistence(packageURL: package.url)
+
+        let outcomes = await withTaskGroup(of: ConcurrentPersistenceOutcome.self) { group in
+            for store in [firstStore, secondStore] {
+                group.addTask {
+                    do { return .success(try await store.persist(frame)) }
+                    catch { return .failure }
+                }
+            }
+            var values: [ConcurrentPersistenceOutcome] = []
+            for await value in group { values.append(value) }
+            return values
+        }
+
+        XCTAssertEqual(outcomes.filter(\.isSuccess).count, 1)
+        let finalURL = package.url.appending(path: "Frames/00000000.jpg")
+        let decoded = try decodeJPEG(at: finalURL)
+        XCTAssertGreaterThan(decoded.width, 0)
+        XCTAssertGreaterThan(decoded.height, 0)
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(atPath: package.url.appending(path: "Frames").path),
+            ["00000000.jpg"]
+        )
     }
 
     private func assertContainmentRejected(packageURL: URL, frame: CapturedFrame) async {
@@ -311,6 +420,99 @@ final class AssetFrameSourceTests: XCTestCase {
 }
 
 private struct UnexpectedEmissionError: Error {}
+
+private enum ConcurrentPersistenceOutcome: Sendable {
+    case success(PersistedFrame)
+    case failure
+
+    var isSuccess: Bool {
+        if case .success = self { true } else { false }
+    }
+}
+
+private struct FixedAssetReaderSessionFactory: AssetReaderSessionFactory {
+    let reader: BlockingRecordingAssetReaderSession
+
+    func makeSession(for assetURL: URL) async throws -> any AssetReaderSession {
+        reader
+    }
+}
+
+private final class BlockingRecordingAssetReaderSession: AssetReaderSession, @unchecked Sendable {
+    let duration = CMTime(value: 1, timescale: 1)
+    let preferredTransform = CGAffineTransform.identity
+
+    private let condition = NSCondition()
+    private let pixelBuffer: CVPixelBuffer
+    private var hasReturnedFirstSample = false
+    private var isBlocked = false
+    private var cancelled = false
+    private var blockedWaiters: [CheckedContinuation<Void, Never>] = []
+    private var cancellationWaiters: [CheckedContinuation<Void, Never>] = []
+
+    init(pixelBuffer: CVPixelBuffer) {
+        self.pixelBuffer = pixelBuffer
+    }
+
+    func start() throws {}
+
+    func nextSample() throws -> AssetReaderSample? {
+        condition.lock()
+        if !hasReturnedFirstSample {
+            hasReturnedFirstSample = true
+            condition.unlock()
+            return AssetReaderSample(timestamp: .zero, pixelBuffer: pixelBuffer, sequence: 0)
+        }
+
+        isBlocked = true
+        let waiters = blockedWaiters
+        blockedWaiters.removeAll()
+        for waiter in waiters { waiter.resume() }
+        while !cancelled { condition.wait() }
+        condition.unlock()
+        throw CancellationError()
+    }
+
+    func cancel() {
+        condition.lock()
+        guard !cancelled else {
+            condition.unlock()
+            return
+        }
+        cancelled = true
+        let waiters = cancellationWaiters
+        cancellationWaiters.removeAll()
+        condition.broadcast()
+        condition.unlock()
+        for waiter in waiters { waiter.resume() }
+    }
+
+    func waitUntilBlockedOnNextSample() async {
+        await withCheckedContinuation { continuation in
+            condition.lock()
+            if isBlocked {
+                condition.unlock()
+                continuation.resume()
+            } else {
+                blockedWaiters.append(continuation)
+                condition.unlock()
+            }
+        }
+    }
+
+    func waitUntilCancelled() async {
+        await withCheckedContinuation { continuation in
+            condition.lock()
+            if cancelled {
+                condition.unlock()
+                continuation.resume()
+            } else {
+                cancellationWaiters.append(continuation)
+                condition.unlock()
+            }
+        }
+    }
+}
 
 private func XCTAssertEqual(
     _ actual: [Double],

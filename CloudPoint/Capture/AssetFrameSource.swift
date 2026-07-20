@@ -1,6 +1,7 @@
 import AVFoundation
 import CoreImage
 import CoreVideo
+import Darwin
 import Foundation
 import ImageIO
 import UniformTypeIdentifiers
@@ -24,10 +25,108 @@ enum AssetFrameSourceError: Error, Equatable, Sendable {
 
 struct AssetFrameSource: Sendable {
     let assetURL: URL
+    private let readerFactory: any AssetReaderSessionFactory
+
+    init(
+        assetURL: URL,
+        readerFactory: any AssetReaderSessionFactory = AVAssetReaderSessionFactory()
+    ) {
+        self.assetURL = assetURL
+        self.readerFactory = readerFactory
+    }
 
     func frames(at timestamps: [CMTime]) -> AsyncThrowingStream<CapturedFrame, Error> {
-        let state = AssetReaderState(assetURL: assetURL, timestamps: timestamps)
-        return AsyncThrowingStream(unfolding: { try await state.next() })
+        let state = AssetReaderState(
+            assetURL: assetURL,
+            timestamps: timestamps,
+            readerFactory: readerFactory
+        )
+        return AsyncThrowingStream(bufferingPolicy: .bufferingOldest(1)) { continuation in
+            let producer = Task {
+                do {
+                    while let frame = try await state.next() {
+                        try Task.checkCancellation()
+                        var enqueued = false
+                        while !enqueued {
+                            try Task.checkCancellation()
+                            switch continuation.yield(frame) {
+                            case .enqueued:
+                                enqueued = true
+                            case .dropped:
+                                await Task.yield()
+                            case .terminated:
+                                state.cancel()
+                                return
+                            @unknown default:
+                                state.cancel()
+                                return
+                            }
+                        }
+                    }
+                    state.cancel()
+                    continuation.finish()
+                } catch is CancellationError {
+                    state.cancel()
+                    continuation.finish()
+                } catch {
+                    state.cancel()
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { @Sendable _ in
+                producer.cancel()
+                state.cancel()
+            }
+        }
+    }
+}
+
+struct AssetReaderSample: @unchecked Sendable {
+    let timestamp: CMTime
+    let pixelBuffer: CVPixelBuffer
+    let sequence: Int
+}
+
+protocol AssetReaderSession: Sendable {
+    var duration: CMTime { get }
+    var preferredTransform: CGAffineTransform { get }
+
+    func start() throws
+    func nextSample() throws -> AssetReaderSample?
+    func cancel()
+}
+
+protocol AssetReaderSessionFactory: Sendable {
+    func makeSession(for assetURL: URL) async throws -> any AssetReaderSession
+}
+
+struct AVAssetReaderSessionFactory: AssetReaderSessionFactory {
+    func makeSession(for assetURL: URL) async throws -> any AssetReaderSession {
+        let asset = AVURLAsset(url: assetURL)
+        async let loadedDuration = asset.load(.duration)
+        async let loadedTracks = asset.loadTracks(withMediaType: .video)
+        let (duration, tracks) = try await (loadedDuration, loadedTracks)
+        guard duration.isNumeric, CMTimeCompare(duration, .zero) > 0 else {
+            throw AssetFrameSourceError.invalidAssetDuration
+        }
+        guard let track = tracks.first else { throw AssetFrameSourceError.missingVideoTrack }
+        let preferredTransform = try await track.load(.preferredTransform)
+
+        let reader = try AVAssetReader(asset: asset)
+        let settings: [String: Any] = [
+            kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
+            kCVPixelBufferIOSurfacePropertiesKey as String: [:],
+        ]
+        let output = AVAssetReaderTrackOutput(track: track, outputSettings: settings)
+        output.alwaysCopiesSampleData = false
+        guard reader.canAdd(output) else { throw AssetFrameSourceError.cannotReadVideoTrack }
+        reader.add(output)
+        return AVAssetReaderSession(
+            reader: reader,
+            output: output,
+            duration: duration,
+            preferredTransform: preferredTransform
+        )
     }
 }
 
@@ -40,16 +139,42 @@ enum FramePersistenceError: Error, Equatable, Sendable {
     case invalidFrame
     case jpegEncodingFailed
     case cannotCreatePartial
+    case ioFailure(Int32)
 }
 
 actor JPEGFramePersistence: FramePersistence {
-    private let packageURL: URL
-    private let fileManager: FileManager
+    private let packageDescriptor: Int32
+    private let framesDescriptor: Int32
     private let context = CIContext(options: [.cacheIntermediates: false])
 
-    init(packageURL: URL, fileManager: FileManager = .default) {
-        self.packageURL = packageURL
-        self.fileManager = fileManager
+    init(packageURL: URL) throws {
+        let packageDescriptor = Darwin.open(
+            packageURL.path,
+            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+        )
+        guard packageDescriptor >= 0 else {
+            throw FramePersistenceError.unsafePackageLayout
+        }
+
+        let framesDescriptor = "Frames".withCString {
+            Darwin.openat(
+                packageDescriptor,
+                $0,
+                O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+            )
+        }
+        guard framesDescriptor >= 0 else {
+            Darwin.close(packageDescriptor)
+            throw FramePersistenceError.unsafePackageLayout
+        }
+
+        self.packageDescriptor = packageDescriptor
+        self.framesDescriptor = framesDescriptor
+    }
+
+    deinit {
+        Darwin.close(framesDescriptor)
+        Darwin.close(packageDescriptor)
     }
 
     func persist(_ frame: CapturedFrame) async throws -> PersistedFrame {
@@ -61,42 +186,61 @@ actor JPEGFramePersistence: FramePersistence {
             throw FramePersistenceError.invalidFrame
         }
 
-        let framesURL = packageURL.appending(path: "Frames", directoryHint: .isDirectory)
-        try validateLayout(packageURL: packageURL, framesURL: framesURL)
         let filename = String(format: "%08u.jpg", UInt32(frame.index))
-        let finalURL = framesURL.appending(path: filename)
-        let partialURL = framesURL.appending(path: filename + ".partial")
-        guard !fileManager.fileExists(atPath: partialURL.path) else {
-            throw FramePersistenceError.cannotCreatePartial
-        }
+        let partialName = filename + ".partial"
 
         let jpeg = try makeOrientedJPEG(frame)
         try Task.checkCancellation()
-        guard fileManager.createFile(atPath: partialURL.path, contents: nil) else {
-            throw FramePersistenceError.cannotCreatePartial
+        let partialDescriptor = partialName.withCString {
+            Darwin.openat(
+                framesDescriptor,
+                $0,
+                O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+                mode_t(S_IRUSR | S_IWUSR)
+            )
+        }
+        guard partialDescriptor >= 0 else {
+            if errno == EEXIST { throw FramePersistenceError.cannotCreatePartial }
+            throw FramePersistenceError.ioFailure(errno)
         }
 
+        var descriptorIsOpen = true
         var renamed = false
-        let handle: FileHandle
         do {
-            handle = try FileHandle(forWritingTo: partialURL)
-        } catch {
-            try? fileManager.removeItem(at: partialURL)
-            throw error
-        }
-
-        do {
-            try handle.write(contentsOf: jpeg)
-            try handle.synchronize()
-            try handle.close()
+            try writeAll(jpeg, to: partialDescriptor)
+            guard Darwin.fsync(partialDescriptor) == 0 else {
+                throw FramePersistenceError.ioFailure(errno)
+            }
+            guard Darwin.close(partialDescriptor) == 0 else {
+                descriptorIsOpen = false
+                throw FramePersistenceError.ioFailure(errno)
+            }
+            descriptorIsOpen = false
             try Task.checkCancellation()
-            try fileManager.moveItem(at: partialURL, to: finalURL)
+            let renameResult = partialName.withCString { partialPath in
+                filename.withCString { finalPath in
+                    renameatx_np(
+                        framesDescriptor,
+                        partialPath,
+                        framesDescriptor,
+                        finalPath,
+                        UInt32(RENAME_EXCL)
+                    )
+                }
+            }
+            guard renameResult == 0 else { throw FramePersistenceError.ioFailure(errno) }
             renamed = true
+            guard Darwin.fsync(framesDescriptor) == 0 else {
+                throw FramePersistenceError.ioFailure(errno)
+            }
             try Task.checkCancellation()
         } catch {
-            try? handle.close()
-            try? fileManager.removeItem(at: partialURL)
-            if renamed { try? fileManager.removeItem(at: finalURL) }
+            if descriptorIsOpen { Darwin.close(partialDescriptor) }
+            partialName.withCString { _ = Darwin.unlinkat(framesDescriptor, $0, 0) }
+            if renamed {
+                filename.withCString { _ = Darwin.unlinkat(framesDescriptor, $0, 0) }
+                _ = Darwin.fsync(framesDescriptor)
+            }
             throw error
         }
 
@@ -105,6 +249,28 @@ actor JPEGFramePersistence: FramePersistence {
             sourceTimestamp: frame.presentationTimestamp.seconds,
             relativePath: "Frames/\(filename)"
         )
+    }
+
+    private func writeAll(_ data: Data, to descriptor: Int32) throws {
+        try data.withUnsafeBytes { bytes in
+            guard let baseAddress = bytes.baseAddress else { return }
+            var written = 0
+            while written < bytes.count {
+                if Task.isCancelled { throw CancellationError() }
+                let result = Darwin.write(
+                    descriptor,
+                    baseAddress.advanced(by: written),
+                    bytes.count - written
+                )
+                if result > 0 {
+                    written += result
+                } else if result == -1, errno == EINTR {
+                    continue
+                } else {
+                    throw FramePersistenceError.ioFailure(errno)
+                }
+            }
+        }
     }
 
     private func makeOrientedJPEG(_ frame: CapturedFrame) throws -> Data {
@@ -145,24 +311,6 @@ actor JPEGFramePersistence: FramePersistence {
         return data as Data
     }
 
-    private func validateLayout(packageURL: URL, framesURL: URL) throws {
-        guard try isDirectoryWithoutSymlink(packageURL),
-              try isDirectoryWithoutSymlink(framesURL) else {
-            throw FramePersistenceError.unsafePackageLayout
-        }
-        let resolvedPackage = packageURL.resolvingSymlinksInPath().standardizedFileURL
-        let resolvedFramesParent = framesURL.resolvingSymlinksInPath()
-            .deletingLastPathComponent()
-            .standardizedFileURL
-        guard resolvedPackage == resolvedFramesParent else {
-            throw FramePersistenceError.unsafePackageLayout
-        }
-    }
-
-    private func isDirectoryWithoutSymlink(_ url: URL) throws -> Bool {
-        let values = try url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
-        return values.isDirectory == true && values.isSymbolicLink != true
-    }
 }
 
 private final class AssetReaderState: @unchecked Sendable {
@@ -174,22 +322,24 @@ private final class AssetReaderState: @unchecked Sendable {
 
     private let assetURL: URL
     private let timestamps: [CMTime]
+    private let readerFactory: any AssetReaderSessionFactory
     private let lock = NSLock()
 
-    private var reader: AVAssetReader?
-    private var output: AVAssetReaderTrackOutput?
-    private var transform = CGAffineTransform.identity
-    private var setupComplete = false
+    private var reader: (any AssetReaderSession)?
     private var cancelled = false
     private var targetIndex = 0
     private var emittedIndex = 0
-    private var decodedSequence = 0
     private var prior: Sample?
     private var current: Sample?
 
-    init(assetURL: URL, timestamps: [CMTime]) {
+    init(
+        assetURL: URL,
+        timestamps: [CMTime],
+        readerFactory: any AssetReaderSessionFactory
+    ) {
         self.assetURL = assetURL
         self.timestamps = timestamps
+        self.readerFactory = readerFactory
     }
 
     deinit {
@@ -199,60 +349,44 @@ private final class AssetReaderState: @unchecked Sendable {
     func next() async throws -> CapturedFrame? {
         try checkCancellation()
         guard targetIndex < timestamps.count else {
-            cancelReaderAfterCompletion()
+            cancel()
             return nil
         }
-        try validateTimestamps()
-        if !setupComplete { try await setUpReader() }
+        if reader == nil { try await setUpReader() }
         try checkCancellation()
         return try nextSelectedFrame()
     }
 
     func cancel() {
-        let activeReader = lock.withLock { () -> AVAssetReader? in
+        let activeReader = lock.withLock { () -> (any AssetReaderSession)? in
             cancelled = true
             return reader
         }
-        activeReader?.cancelReading()
+        activeReader?.cancel()
     }
 
     private func setUpReader() async throws {
-        let asset = AVURLAsset(url: assetURL)
-        async let loadedDuration = asset.load(.duration)
-        async let loadedTracks = asset.loadTracks(withMediaType: .video)
-        let (duration, tracks) = try await (loadedDuration, loadedTracks)
+        let newReader = try await readerFactory.makeSession(for: assetURL)
         try checkCancellation()
-        guard duration.isNumeric, CMTimeCompare(duration, .zero) > 0 else {
+        guard newReader.duration.isNumeric, CMTimeCompare(newReader.duration, .zero) > 0 else {
             throw AssetFrameSourceError.invalidAssetDuration
         }
-        guard let track = tracks.first else { throw AssetFrameSourceError.missingVideoTrack }
-        let preferredTransform = try await track.load(.preferredTransform)
-        try checkCancellation()
-
-        let newReader = try AVAssetReader(asset: asset)
-        let settings: [String: Any] = [
-            kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
-            kCVPixelBufferIOSurfacePropertiesKey as String: [:],
-        ]
-        let newOutput = AVAssetReaderTrackOutput(track: track, outputSettings: settings)
-        newOutput.alwaysCopiesSampleData = false
-        guard newReader.canAdd(newOutput) else { throw AssetFrameSourceError.cannotReadVideoTrack }
-        newReader.add(newOutput)
+        try validateTimestamps(against: newReader.duration)
 
         let wasCancelled = lock.withLock { () -> Bool in
             guard !cancelled else { return true }
             reader = newReader
-            output = newOutput
-            transform = preferredTransform
-            setupComplete = true
             return false
         }
         guard !wasCancelled else {
-            newReader.cancelReading()
+            newReader.cancel()
             throw CancellationError()
         }
-        guard newReader.startReading() else {
-            throw newReader.error ?? AssetFrameSourceError.readerFailed
+        do {
+            try newReader.start()
+        } catch {
+            newReader.cancel()
+            throw error
         }
     }
 
@@ -284,49 +418,41 @@ private final class AssetReaderState: @unchecked Sendable {
             selected = after
             current = nil
         } else {
-            cancelReaderAfterCompletion()
+            cancel()
             return nil
         }
 
+        guard let reader else { throw AssetFrameSourceError.readerFailed }
         let frame = CapturedFrame(
             index: emittedIndex,
             presentationTimestamp: selected.timestamp,
             pixelBuffer: selected.pixelBuffer,
-            orientation: transform,
+            orientation: reader.preferredTransform,
             sourceSampleSequence: selected.sequence
         )
         emittedIndex += 1
         targetIndex += 1
-        if targetIndex == timestamps.count { cancelReaderAfterCompletion() }
+        if targetIndex == timestamps.count { cancel() }
         return frame
     }
 
     private func readSample() throws -> Sample? {
         try checkCancellation()
-        guard let output, let reader else { throw AssetFrameSourceError.readerFailed }
-        guard let sampleBuffer = output.copyNextSampleBuffer() else {
-            switch reader.status {
-            case .failed: throw reader.error ?? AssetFrameSourceError.readerFailed
-            case .cancelled: throw CancellationError()
-            default: return nil
-            }
-        }
-        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
-            throw AssetFrameSourceError.missingPixelBuffer
-        }
-        let sample = Sample(
-            timestamp: CMSampleBufferGetPresentationTimeStamp(sampleBuffer),
-            pixelBuffer: pixelBuffer,
-            sequence: decodedSequence
+        guard let reader else { throw AssetFrameSourceError.readerFailed }
+        guard let sample = try reader.nextSample() else { return nil }
+        return Sample(
+            timestamp: sample.timestamp,
+            pixelBuffer: sample.pixelBuffer,
+            sequence: sample.sequence
         )
-        decodedSequence += 1
-        return sample
     }
 
-    private func validateTimestamps() throws {
+    private func validateTimestamps(against duration: CMTime) throws {
         var previous: CMTime?
         for timestamp in timestamps {
-            guard timestamp.isNumeric, CMTimeCompare(timestamp, .zero) >= 0 else {
+            guard timestamp.isNumeric,
+                  CMTimeCompare(timestamp, .zero) >= 0,
+                  CMTimeCompare(timestamp, duration) < 0 else {
                 throw AssetFrameSourceError.invalidRequestedTimestamps
             }
             if let previous, CMTimeCompare(timestamp, previous) <= 0 {
@@ -342,10 +468,65 @@ private final class AssetReaderState: @unchecked Sendable {
             throw CancellationError()
         }
     }
+}
 
-    private func cancelReaderAfterCompletion() {
-        let activeReader = lock.withLock { reader }
-        if activeReader?.status == .reading { activeReader?.cancelReading() }
+private final class AVAssetReaderSession: AssetReaderSession, @unchecked Sendable {
+    let duration: CMTime
+    let preferredTransform: CGAffineTransform
+
+    private let reader: AVAssetReader
+    private let output: AVAssetReaderTrackOutput
+    private let lock = NSLock()
+    private var sequence = 0
+    private var cancelled = false
+
+    init(
+        reader: AVAssetReader,
+        output: AVAssetReaderTrackOutput,
+        duration: CMTime,
+        preferredTransform: CGAffineTransform
+    ) {
+        self.reader = reader
+        self.output = output
+        self.duration = duration
+        self.preferredTransform = preferredTransform
+    }
+
+    func start() throws {
+        guard !lock.withLock({ cancelled }) else { throw CancellationError() }
+        guard reader.startReading() else {
+            throw reader.error ?? AssetFrameSourceError.readerFailed
+        }
+    }
+
+    func nextSample() throws -> AssetReaderSample? {
+        guard !lock.withLock({ cancelled }) else { throw CancellationError() }
+        guard let sampleBuffer = output.copyNextSampleBuffer() else {
+            switch reader.status {
+            case .failed: throw reader.error ?? AssetFrameSourceError.readerFailed
+            case .cancelled: throw CancellationError()
+            default: return nil
+            }
+        }
+        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
+            throw AssetFrameSourceError.missingPixelBuffer
+        }
+        let result = AssetReaderSample(
+            timestamp: CMSampleBufferGetPresentationTimeStamp(sampleBuffer),
+            pixelBuffer: pixelBuffer,
+            sequence: sequence
+        )
+        sequence += 1
+        return result
+    }
+
+    func cancel() {
+        let shouldCancel = lock.withLock { () -> Bool in
+            guard !cancelled else { return false }
+            cancelled = true
+            return true
+        }
+        if shouldCancel { reader.cancelReading() }
     }
 }
 
