@@ -110,9 +110,7 @@ def _aggregator_specs(config: ModelConfig) -> list[WeightSpec]:
     dimension = config.embed_dim
     specs = [
         _spec("aggregator.camera_token", (1, 2, 1, dimension)),
-        _spec(
-            "aggregator.register_token", (1, 2, config.register_tokens, dimension)
-        ),
+        _spec("aggregator.register_token", (1, 2, config.register_tokens, dimension)),
         _spec("aggregator.scale_token", (1, 2, 1, dimension)),
     ]
     specs.extend(_backbone_specs(config))

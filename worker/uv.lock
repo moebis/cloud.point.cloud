@@ -43,6 +43,7 @@ dependencies = [
     { name = "numpy" },
     { name = "pillow" },
     { name = "safetensors" },
+    { name = "tqdm" },
 ]
 
 [package.optional-dependencies]
@@ -55,7 +56,6 @@ reference = [
     { name = "scipy" },
     { name = "torch" },
     { name = "torchvision" },
-    { name = "tqdm" },
 ]
 
 [package.dev-dependencies]
@@ -78,7 +78,7 @@ requires-dist = [
     { name = "torch", marker = "extra == 'model-prep'", specifier = "==2.8.0" },
     { name = "torch", marker = "extra == 'reference'", specifier = "==2.8.0" },
     { name = "torchvision", marker = "extra == 'reference'", specifier = "==0.23.0" },
-    { name = "tqdm", marker = "extra == 'reference'", specifier = "==4.67.1" },
+    { name = "tqdm", specifier = "==4.67.1" },
 ]
 provides-extras = ["model-prep", "reference"]
 
