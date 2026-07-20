@@ -93,6 +93,91 @@ final class WorkerProcessTests: XCTestCase {
         XCTAssertEqual(errno, ESRCH)
     }
 
+    func testLauncherBlocksTargetUntilParentAcknowledgesVerifiedProcessGroup() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let marker = directory.appendingPathComponent("target-started")
+        let process = Process()
+        let input = Pipe()
+        let output = Pipe()
+        let diagnostics = Pipe()
+        process.executableURL = try launcherURL()
+        process.arguments = [try mockWorkerURL().path, "--mode", "immediate-exit"]
+        process.environment = ProcessInfo.processInfo.environment.merging([
+            "CLOUDPOINT_MOCK_START_MARKER": marker.path,
+        ]) { _, supplied in supplied }
+        process.standardInput = input
+        process.standardOutput = output
+        process.standardError = diagnostics
+
+        try process.run()
+        let pid = process.processIdentifier
+        input.fileHandleForReading.closeFile()
+        output.fileHandleForWriting.closeFile()
+        diagnostics.fileHandleForWriting.closeFile()
+        defer {
+            _ = kill(-pid, SIGKILL)
+            _ = kill(pid, SIGKILL)
+            input.fileHandleForWriting.closeFile()
+            output.fileHandleForReading.closeFile()
+            diagnostics.fileHandleForReading.closeFile()
+        }
+
+        let ready = String(decoding: diagnostics.fileHandleForReading.availableData, as: UTF8.self)
+        XCTAssertTrue(ready.contains("CLOUDPOINT_LAUNCHER_READY:\(pid)"))
+        let acknowledgementDeadline = ContinuousClock.now + .milliseconds(200)
+        while ContinuousClock.now < acknowledgementDeadline,
+              !FileManager.default.fileExists(atPath: marker.path) {
+            await Task.yield()
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+
+        XCTAssertEqual(fcntl(input.fileHandleForWriting.fileDescriptor, F_SETNOSIGPIPE, 1), 0)
+        var acknowledgement: UInt8 = 0x06
+        XCTAssertEqual(Darwin.write(input.fileHandleForWriting.fileDescriptor, &acknowledgement, 1), 1)
+        input.fileHandleForWriting.closeFile()
+
+        let targetDeadline = ContinuousClock.now + .seconds(1)
+        while ContinuousClock.now < targetDeadline,
+              !FileManager.default.fileExists(atPath: marker.path) {
+            await Task.yield()
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path))
+        process.waitUntilExit()
+        XCTAssertEqual(process.terminationStatus, 24)
+    }
+
+    func testImmediateExitAfterHandshakeCleansInheritedOutputDescendantPromptly() async throws {
+        let worker = try await startWorker(
+            mode: "immediate-exit",
+            environment: ["CLOUDPOINT_MOCK_SPAWN_CHILD": "1"]
+        )
+        var diagnostics = worker.diagnostics().makeAsyncIterator()
+        let reportedChildPID = await childPID(from: &diagnostics)
+        let childPID = try XCTUnwrap(reportedChildPID)
+        let terminalReached = expectation(description: "immediate target exit reaches terminal state")
+        let collection = Task { () -> [WorkerProcessEvent] in
+            var received: [WorkerProcessEvent] = []
+            do {
+                for try await event in worker.events() { received.append(event) }
+            } catch {}
+            terminalReached.fulfill()
+            return received
+        }
+
+        await fulfillment(of: [terminalReached], timeout: 1)
+        if kill(childPID, 0) == 0 { _ = kill(childPID, SIGKILL) }
+        let received = await collection.value
+        let exits: [Int32] = received.compactMap {
+            if case let .processExited(status) = $0 { status } else { nil }
+        }
+        XCTAssertEqual(exits, [24])
+        XCTAssertEqual(kill(childPID, 0), -1)
+        XCTAssertEqual(errno, ESRCH)
+    }
+
     func testStderrDiagnosticsNeverEnterProtocolDecoder() async throws {
         let worker = try await startWorker(mode: "heartbeat")
         var events = worker.events().makeAsyncIterator()
@@ -318,6 +403,63 @@ final class WorkerProcessTests: XCTestCase {
         XCTAssertLessThanOrEqual(try openFileDescriptorCount(), baseline)
     }
 
+    func testLauncherEOFBeforeReadyFailsPromptlyAndClosesDescriptors() async throws {
+        let baseline = try openFileDescriptorCount()
+        do {
+            _ = try await WorkerProcess.start(
+                executable: mockWorkerURL(),
+                launcherExecutable: URL(fileURLWithPath: "/usr/bin/true")
+            )
+            XCTFail("Expected launcher EOF failure")
+        } catch let error as WorkerProcessError {
+            guard case let .launchFailed(reason) = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+            XCTAssertTrue(reason.contains("launcher exited with status 0"))
+        }
+        XCTAssertLessThanOrEqual(try openFileDescriptorCount(), baseline + 1)
+    }
+
+    func testLauncherHandshakeTimeoutKillsUnverifiedGroupAndDescendant() async throws {
+        let baseline = try openFileDescriptorCount()
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let childPIDFile = directory.appendingPathComponent("child-pid")
+
+        do {
+            _ = try await WorkerProcess.start(
+                executable: mockWorkerURL(),
+                arguments: ["--mode", "silent"],
+                environment: [
+                    "CLOUDPOINT_MOCK_CHILD_PID_FILE": childPIDFile.path,
+                    "CLOUDPOINT_MOCK_SET_PROCESS_GROUP": "1",
+                    "CLOUDPOINT_MOCK_SPAWN_CHILD": "1",
+                ],
+                launcherExecutable: mockWorkerURL(),
+                launcherHandshakeTimeout: .seconds(1)
+            )
+            XCTFail("Expected launcher handshake timeout")
+        } catch let error as WorkerProcessError {
+            guard case let .launchFailed(reason) = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+            XCTAssertTrue(reason.contains("handshake timed out"))
+        }
+
+        let childPIDText = try String(contentsOf: childPIDFile, encoding: .utf8)
+        let childPID = try XCTUnwrap(pid_t(childPIDText))
+        let disappearanceDeadline = ContinuousClock.now + .seconds(1)
+        while ContinuousClock.now < disappearanceDeadline, kill(childPID, 0) == 0 {
+            await Task.yield()
+        }
+        if kill(childPID, 0) == 0 { _ = kill(childPID, SIGKILL) }
+        XCTAssertEqual(kill(childPID, 0), -1)
+        XCTAssertEqual(errno, ESRCH)
+        XCTAssertLessThanOrEqual(try openFileDescriptorCount(), baseline + 1)
+    }
+
     func testDefaultStartUsesLauncherBundledWithApplication() async throws {
         let worker = try await WorkerProcess.start(
             executable: mockWorkerURL(),
@@ -358,6 +500,17 @@ final class WorkerProcessTests: XCTestCase {
             Bundle(for: Self.self).object(forInfoDictionaryKey: "CloudPointWorkerLauncherExecutable") as? String,
             "CloudPointWorkerLauncherExecutable must be injected by build settings"
         ))
+    }
+
+    private func childPID(
+        from diagnostics: inout AsyncStream<String>.Iterator
+    ) async -> pid_t? {
+        while let line = await diagnostics.next() {
+            if line.hasPrefix("child-pid:"), let value = Int32(line.dropFirst("child-pid:".count)) {
+                return value
+            }
+        }
+        return nil
     }
 
     private func startWorker(

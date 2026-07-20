@@ -6,6 +6,7 @@ enum MockWorkerMode: String {
     case heartbeat
     case crashAfterReady = "crash-after-ready"
     case fragmentedFinal = "fragmented-final"
+    case immediateExit = "immediate-exit"
     case ignoreTerm = "ignore-term"
     case silent
 }
@@ -16,6 +17,20 @@ let modeName = modeIndex.flatMap { arguments.indices.contains($0 + 1) ? argument
 guard let mode = MockWorkerMode(rawValue: modeName) else {
     FileHandle.standardError.write(Data("unknown mode: \(modeName)\n".utf8))
     exit(64)
+}
+
+if ProcessInfo.processInfo.environment["CLOUDPOINT_MOCK_SET_PROCESS_GROUP"] == "1",
+   setpgid(0, 0) != 0,
+   getpgrp() != getpid() {
+    FileHandle.standardError.write(Data("mock setpgid failed: \(errno)\n".utf8))
+    exit(71)
+}
+
+if let markerPath = ProcessInfo.processInfo.environment["CLOUDPOINT_MOCK_START_MARKER"] {
+    guard FileManager.default.createFile(atPath: markerPath, contents: Data()) else {
+        FileHandle.standardError.write(Data("start marker creation failed\n".utf8))
+        exit(73)
+    }
 }
 
 if mode == .ignoreTerm { Darwin.signal(SIGTERM, SIG_IGN) }
@@ -61,7 +76,16 @@ if ProcessInfo.processInfo.environment["CLOUDPOINT_MOCK_SPAWN_CHILD"] == "1" {
         exit(71)
     }
     FileHandle.standardError.write(Data("child-pid:\(pid)\n".utf8))
+    if let childPIDPath = ProcessInfo.processInfo.environment["CLOUDPOINT_MOCK_CHILD_PID_FILE"] {
+        do { try Data("\(pid)".utf8).write(to: URL(fileURLWithPath: childPIDPath)) }
+        catch {
+            FileHandle.standardError.write(Data("child pid file failed: \(error)\n".utf8))
+            exit(73)
+        }
+    }
 }
+
+if mode == .immediateExit { exit(24) }
 
 if mode != .silent {
     writeEnvelope(.event(.ready(

@@ -17,6 +17,20 @@ guard getpgrp() == getpid() else {
 
 FileHandle.standardError.write(Data("CLOUDPOINT_LAUNCHER_READY:\(getpid())\n".utf8))
 
+var acknowledgement: UInt8 = 0
+while true {
+    let bytesRead = Darwin.read(STDIN_FILENO, &acknowledgement, 1)
+    if bytesRead == 1 { break }
+    if bytesRead < 0, errno == EINTR { continue }
+    let reason = bytesRead == 0 ? "stdin closed" : "read failed: \(errno)"
+    FileHandle.standardError.write(Data("launcher acknowledgement \(reason)\n".utf8))
+    exit(72)
+}
+guard acknowledgement == 0x06 else {
+    FileHandle.standardError.write(Data("launcher acknowledgement mismatch\n".utf8))
+    exit(72)
+}
+
 let targetArguments = Array(CommandLine.arguments.dropFirst())
 let executable = strdup(targetArguments[0])!
 var arguments: [UnsafeMutablePointer<CChar>?] = targetArguments.map { strdup($0) }

@@ -189,6 +189,7 @@ private actor BoundedWorkerInputWriter {
 }
 
 actor WorkerProcess {
+    private static let launcherAcknowledgement: UInt8 = 0x06
     static let heartbeatInterval: Duration = .seconds(5)
     static let missedHeartbeatLimit = 3
     static let maximumPendingInputBytes = 2 * 1_048_576
@@ -204,11 +205,13 @@ actor WorkerProcess {
     private let standardError = Pipe()
     private let decoder = WorkerFrameDecoder()
     private let clock: any WorkerProcessClock
+    private let launcherHandshakeTimeout: Duration
     private let writer: BoundedWorkerInputWriter
 
     private var stdoutTask: Task<Void, Never>?
     private var stderrTask: Task<Void, Never>?
     private var heartbeatTask: Task<Void, Never>?
+    private var launcherTimeoutTask: Task<Void, Never>?
     private var escalationTask: Task<Void, Never>?
     private var cleanupTask: Task<Void, Never>?
     private var launcherWaiter: CheckedContinuation<Void, Error>?
@@ -227,7 +230,7 @@ actor WorkerProcess {
     private var didEmitTerminal = false
     private var missedHeartbeats = 0
 
-    private init(clock: any WorkerProcessClock) throws {
+    private init(clock: any WorkerProcessClock, launcherHandshakeTimeout: Duration) throws {
         let events = AsyncThrowingStream.makeStream(
             of: WorkerProcessEvent.self,
             bufferingPolicy: .bufferingOldest(256)
@@ -241,6 +244,7 @@ actor WorkerProcess {
         diagnosticStream = diagnostics.stream
         diagnosticContinuation = diagnostics.continuation
         self.clock = clock
+        self.launcherHandshakeTimeout = launcherHandshakeTimeout
         writer = try BoundedWorkerInputWriter(
             handle: standardInput.fileHandleForWriting,
             maximumQueuedBytes: Self.maximumPendingInputBytes
@@ -252,12 +256,13 @@ actor WorkerProcess {
         arguments: [String] = [],
         environment: [String: String] = [:],
         launcherExecutable: URL? = nil,
+        launcherHandshakeTimeout: Duration = .seconds(5),
         clock: any WorkerProcessClock = ContinuousWorkerProcessClock()
     ) async throws -> WorkerProcess {
         try validateExecutable(executable)
         let resolvedLauncher = try launcherExecutable ?? bundledLauncherExecutable()
         try validateExecutable(resolvedLauncher)
-        let worker = try WorkerProcess(clock: clock)
+        let worker = try WorkerProcess(clock: clock, launcherHandshakeTimeout: launcherHandshakeTimeout)
         do {
             try await worker.launch(
                 executable: executable,
@@ -344,13 +349,11 @@ actor WorkerProcess {
         catch { throw WorkerProcessError.launchFailed(error.localizedDescription) }
 
         isRunning = true
-        acceptsWrites = true
         standardInput.fileHandleForReading.closeFile()
         standardOutput.fileHandleForWriting.closeFile()
         standardError.fileHandleForWriting.closeFile()
-        await writer.start()
         startReaders()
-        startHeartbeatSupervision()
+        startLauncherTimeout()
     }
 
     private func startReaders() {
@@ -380,6 +383,7 @@ actor WorkerProcess {
 
     private func waitForLauncher() async throws {
         if launcherReady { return }
+        if let terminalFailure { throw terminalFailure }
         if let processExitStatus { throw WorkerProcessError.launchFailed("launcher exited with status \(processExitStatus)") }
         try await withCheckedThrowingContinuation { launcherWaiter = $0 }
     }
@@ -435,12 +439,24 @@ actor WorkerProcess {
         if line.hasPrefix("CLOUDPOINT_LAUNCHER_READY:") {
             guard let pid = pid_t(line.dropFirst("CLOUDPOINT_LAUNCHER_READY:".count)),
                   pid == process.processIdentifier,
-                  getpgid(pid) == pid else {
+                  getpgid(pid) == pid,
+                  !launcherReady else {
                 await initiateFailure(.launchFailed("launcher did not establish the worker process group"))
                 return
             }
-            launcherReady = true
             verifiedProcessGroupID = pid
+            launcherTimeoutTask?.cancel()
+            do { try acknowledgeLauncher() }
+            catch {
+                await initiateFailure(.launchFailed("launcher acknowledgement failed"))
+                return
+            }
+            launcherReady = true
+            await writer.start()
+            if isRunning, terminalFailure == nil {
+                acceptsWrites = true
+                startHeartbeatSupervision()
+            }
             launcherWaiter?.resume()
             launcherWaiter = nil
         } else {
@@ -456,7 +472,8 @@ actor WorkerProcess {
         isRunning = false
         acceptsWrites = false
         heartbeatTask?.cancel()
-        signalVerifiedProcessGroup(SIGKILL)
+        launcherTimeoutTask?.cancel()
+        signalProcessTreeForCleanup(SIGKILL)
         if !launcherReady {
             launcherWaiter?.resume(throwing: WorkerProcessError.launchFailed("launcher exited with status \(status)"))
             launcherWaiter = nil
@@ -475,6 +492,22 @@ actor WorkerProcess {
         }
     }
 
+    private func startLauncherTimeout() {
+        let ticks = clock.timer(interval: launcherHandshakeTimeout)
+        launcherTimeoutTask = Task { [weak self] in
+            for await _ in ticks {
+                guard !Task.isCancelled else { return }
+                await self?.launcherHandshakeTimedOut()
+                return
+            }
+        }
+    }
+
+    private func launcherHandshakeTimedOut() async {
+        guard !launcherReady, processExitStatus == nil, terminalFailure == nil else { return }
+        await initiateFailure(.launchFailed("launcher handshake timed out"))
+    }
+
     private func heartbeatTick() async {
         guard isRunning, !cleanupStarted, !terminationRequested else { return }
         missedHeartbeats += 1
@@ -485,8 +518,12 @@ actor WorkerProcess {
         guard terminalFailure == nil, !cleanupStarted else { return }
         terminalFailure = error
         acceptsWrites = false
+        if !launcherReady {
+            launcherWaiter?.resume(throwing: error)
+            launcherWaiter = nil
+        }
         await writer.close()
-        signalVerifiedProcessGroup(SIGKILL)
+        signalProcessTreeForCleanup(SIGKILL)
         await beginCleanupIfReady()
     }
 
@@ -512,10 +549,32 @@ actor WorkerProcess {
         _ = Darwin.kill(-processGroupID, signal)
     }
 
+    private func signalProcessTreeForCleanup(_ signal: Int32) {
+        if verifiedProcessGroupID != nil {
+            signalVerifiedProcessGroup(signal)
+            return
+        }
+        let pid = process.processIdentifier
+        guard pid > 0 else { return }
+        _ = Darwin.kill(-pid, signal)
+        _ = Darwin.kill(pid, signal)
+    }
+
+    private func acknowledgeLauncher() throws {
+        var acknowledgement = Self.launcherAcknowledgement
+        while true {
+            let written = Darwin.write(standardInput.fileHandleForWriting.fileDescriptor, &acknowledgement, 1)
+            if written == 1 { return }
+            if written < 0, errno == EINTR { continue }
+            throw WorkerProcessError.launchFailed(String(cString: strerror(errno)))
+        }
+    }
+
     private func beginCleanupIfReady() async {
         guard processExitStatus != nil, stdoutEnded, !cleanupStarted else { return }
         cleanupStarted = true
         heartbeatTask?.cancel()
+        launcherTimeoutTask?.cancel()
         escalationTask?.cancel()
         await writer.close()
         standardOutput.fileHandleForReading.closeFile()
@@ -525,11 +584,13 @@ actor WorkerProcess {
         let stdoutTask = self.stdoutTask
         let stderrTask = self.stderrTask
         let heartbeatTask = self.heartbeatTask
+        let launcherTimeoutTask = self.launcherTimeoutTask
         let escalationTask = self.escalationTask
         cleanupTask = Task { [weak self] in
             _ = await stdoutTask?.value
             _ = await stderrTask?.value
             _ = await heartbeatTask?.value
+            _ = await launcherTimeoutTask?.value
             _ = await escalationTask?.value
             await self?.writer.join()
             await self?.completeTerminal()
@@ -543,6 +604,7 @@ actor WorkerProcess {
         stdoutTask = nil
         stderrTask = nil
         heartbeatTask = nil
+        launcherTimeoutTask = nil
         escalationTask = nil
         cleanupTask = nil
         if !diagnosticBuffer.isEmpty {
@@ -583,20 +645,19 @@ actor WorkerProcess {
         isRunning = false
         launcherWaiter?.resume(throwing: WorkerProcessError.launchFailed("launch aborted"))
         launcherWaiter = nil
-        if process.isRunning {
-            if verifiedProcessGroupID != nil { signalVerifiedProcessGroup(SIGKILL) }
-            else { _ = Darwin.kill(process.processIdentifier, SIGKILL) }
-        }
+        signalProcessTreeForCleanup(SIGKILL)
         await writer.close()
         standardOutput.fileHandleForReading.closeFile()
         standardError.fileHandleForReading.closeFile()
         stdoutTask?.cancel()
         stderrTask?.cancel()
         heartbeatTask?.cancel()
+        launcherTimeoutTask?.cancel()
         escalationTask?.cancel()
         _ = await stdoutTask?.value
         _ = await stderrTask?.value
         _ = await heartbeatTask?.value
+        _ = await launcherTimeoutTask?.value
         _ = await escalationTask?.value
         await writer.join()
         eventContinuation.finish()
@@ -607,11 +668,19 @@ actor WorkerProcess {
         stdoutTask?.cancel()
         stderrTask?.cancel()
         heartbeatTask?.cancel()
+        launcherTimeoutTask?.cancel()
         escalationTask?.cancel()
         cleanupTask?.cancel()
-        if process.isRunning {
-            if let processGroupID = verifiedProcessGroupID { _ = Darwin.kill(-processGroupID, SIGKILL) }
-            else { _ = Darwin.kill(process.processIdentifier, SIGKILL) }
+        if !didEmitTerminal {
+            if let processGroupID = verifiedProcessGroupID {
+                _ = Darwin.kill(-processGroupID, SIGKILL)
+            } else {
+                let pid = process.processIdentifier
+                if pid > 0 {
+                    _ = Darwin.kill(-pid, SIGKILL)
+                    _ = Darwin.kill(pid, SIGKILL)
+                }
+            }
         }
         standardInput.fileHandleForWriting.closeFile()
         standardOutput.fileHandleForReading.closeFile()
