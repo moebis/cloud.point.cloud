@@ -110,6 +110,8 @@ schemes:
         - CloudPointTests
       environmentVariables:
         CLOUDPOINT_SMOKE_VIDEO: "$(CLOUDPOINT_SMOKE_VIDEO)"
+        CLOUDPOINT_WORKER_RUNTIME: "$(CLOUDPOINT_WORKER_RUNTIME)"
+        CLOUDPOINT_REAL_MODEL_DIR: "$(CLOUDPOINT_REAL_MODEL_DIR)"
   CloudPointTests:
     build:
       targets:
