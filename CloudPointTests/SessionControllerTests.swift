@@ -2,6 +2,73 @@ import XCTest
 @testable import CloudPoint
 
 final class SessionControllerTests: XCTestCase {
+    func testInterruptedRecordingResumesAtDurableSampleCursorWithoutFinishingPrefix() async throws {
+        let package = try TemporaryProjectPackage.make()
+        let first = try WorkspaceTestFiles.writeJPEG(frameIndex: 0, in: package.url)
+        let second = try WorkspaceTestFiles.writeJPEG(frameIndex: 1, in: package.url)
+        var manifest = ProjectManifest.fixture()
+        manifest.recordingSource = RecordingSourceReference(
+            bookmarkData: Data("recording".utf8),
+            originalFilename: "recording.mov",
+            fingerprint: RecordingSourceFingerprint(
+                byteCount: 42,
+                sha256: String(repeating: "b", count: 64)
+            ),
+            durationSeconds: 2,
+            framesPerSecond: 1,
+            expectedSampleCount: 2,
+            nextSampleOrdinal: 1
+        )
+        manifest.frames = [first]
+        manifest.sessionState = SessionState(
+            phase: .importing,
+            capturedCount: 1,
+            queuedCount: 1
+        )
+        try manifest.writeAtomically(to: package.url)
+
+        let importer = CursorRecordingImporter(frames: [second])
+        let engine = HarnessEngine(packageURL: package.url)
+        let effects = HarnessEffects()
+        let controller = SessionController(
+            manifest: manifest,
+            packageURL: package.url,
+            dependencies: SessionControllerDependencies(
+                engineFactory: { engine },
+                manifestStore: HarnessManifestStore(),
+                recordingImporter: importer,
+                jpegValidator: ProductionJPEGValidator(),
+                pointChunkOpener: ProductionPointChunkOpener(),
+                effects: SessionControllerEffects(
+                    adoptManifest: { await effects.adopt($0) },
+                    appendPointChunk: { await effects.append($0) },
+                    publishSnapshot: { await effects.publish($0) }
+                )
+            )
+        )
+        defer { Task { await controller.close() } }
+
+        try await controller.open()
+        await controller.flush()
+        let finishCountBeforeResume = await engine.finishInputCount
+        XCTAssertEqual(finishCountBeforeResume, 0)
+
+        try await controller.importRecording(
+            URL(filePath: "/recording.mov"),
+            framesPerSecond: 1
+        )
+        _ = try await effects.next { $0.queuedCount == 2 }
+        await controller.flush()
+
+        let requestedOrdinals = await importer.requestedOrdinals()
+        XCTAssertEqual(requestedOrdinals, [1])
+        let disk = try ProjectManifest.load(from: package.url)
+        XCTAssertEqual(disk.recordingSource?.nextSampleOrdinal, 2)
+        XCTAssertEqual(disk.frames.map(\.index), [0, 1])
+        let finishCountAfterResume = await engine.finishInputCount
+        XCTAssertEqual(finishCountAfterResume, 1)
+    }
+
     func testInterruptedProjectRunsDurableTailToTerminalCompletion() async throws {
         let package = try TemporaryProjectPackage.make()
         let frame = try WorkspaceTestFiles.writeJPEG(frameIndex: 0, in: package.url)

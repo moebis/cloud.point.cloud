@@ -2,30 +2,213 @@
 import Metal
 import SwiftUI
 
+enum WorkspaceSourceMode: Sendable, Equatable {
+    case recording
+    case cameraPreflight
+    case camera
+    case project
+}
+
+enum WorkspaceRecoveryAction: Sendable, Equatable {
+    case locateOriginal
+    case chooseAnotherVideo
+    case repairModel
+    case resumeFromCheckpoint
+
+    var title: String {
+        switch self {
+        case .locateOriginal: "Locate Original…"
+        case .chooseAnotherVideo: "Choose Another Video…"
+        case .repairModel: "Repair Model"
+        case .resumeFromCheckpoint: "Resume from Last Checkpoint"
+        }
+    }
+}
+
+struct WorkspaceProgressPresentation: Sendable, Equatable {
+    let title: String
+    let completedCount: UInt64
+    let totalCount: UInt64?
+
+    static func make(
+        phase: SessionPhase,
+        source: WorkspaceSourceMode,
+        sampledCount: UInt64,
+        queuedCount: UInt64,
+        processedCount: UInt64,
+        expectedCount: UInt64?
+    ) -> WorkspaceProgressPresentation {
+        switch phase {
+        case .empty where source == .cameraPreflight,
+             .ready where source == .cameraPreflight:
+            WorkspaceProgressPresentation(
+                title: "Ready to capture",
+                completedCount: 0,
+                totalCount: nil
+            )
+        case .empty, .ready:
+            WorkspaceProgressPresentation(
+                title: "Ready",
+                completedCount: 0,
+                totalCount: expectedCount
+            )
+        case .preparing:
+            WorkspaceProgressPresentation(
+                title: "Preparing reconstruction model",
+                completedCount: 0,
+                totalCount: nil
+            )
+        case .importing:
+            WorkspaceProgressPresentation(
+                title: "Reading video",
+                completedCount: sampledCount,
+                totalCount: expectedCount
+            )
+        case .capturing:
+            WorkspaceProgressPresentation(
+                title: "Capturing live frames",
+                completedCount: sampledCount,
+                totalCount: nil
+            )
+        case .processing where source == .camera || source == .cameraPreflight:
+            WorkspaceProgressPresentation(
+                title: "Processing remaining camera frames",
+                completedCount: processedCount,
+                totalCount: queuedCount
+            )
+        case .processing:
+            WorkspaceProgressPresentation(
+                title: "Reconstructing scene",
+                completedCount: processedCount,
+                totalCount: expectedCount ?? queuedCount
+            )
+        case .paused:
+            WorkspaceProgressPresentation(
+                title: "Paused",
+                completedCount: processedCount,
+                totalCount: expectedCount ?? queuedCount
+            )
+        case .finalizing:
+            WorkspaceProgressPresentation(
+                title: "Finalizing point cloud",
+                completedCount: processedCount,
+                totalCount: expectedCount ?? queuedCount
+            )
+        case .completed:
+            WorkspaceProgressPresentation(
+                title: "Complete",
+                completedCount: processedCount,
+                totalCount: expectedCount ?? queuedCount
+            )
+        case .cancelled:
+            WorkspaceProgressPresentation(
+                title: "Cancelled",
+                completedCount: processedCount,
+                totalCount: expectedCount ?? queuedCount
+            )
+        case .failed:
+            WorkspaceProgressPresentation(
+                title: "Reconstruction stopped",
+                completedCount: processedCount,
+                totalCount: expectedCount ?? queuedCount
+            )
+        }
+    }
+}
+
 @MainActor
 final class WorkspaceViewModel: ObservableObject {
     @Published private(set) var snapshot: WorkspaceSnapshot
     @Published private(set) var cameras: [CameraDescriptor] = []
     @Published var selectedCameraID: String?
+    @Published private(set) var sourceMode: WorkspaceSourceMode
+    @Published private(set) var recoveryAction: WorkspaceRecoveryAction?
+    @Published private(set) var sourceErrorText: String?
 
     /// Stable UI-owned capture session. It deliberately is not part of the
     /// equatable WorkspaceSnapshot value.
     let previewSession: AVCaptureSession
+    let preflightPreviewSession: AVCaptureSession
     let renderer: PointCloudRenderer?
 
     private let document: CloudPointDocument
+    private let preflightPreview: CameraPreflightPreviewController
+    private let recordingSources: any RecordingSourceManaging
+    private let panelPresenter: any InputPanelPresenting
+    private let onChooseAnotherVideo: () -> Void
+    private let onRepairModel: () -> Void
+    private let packageScope: any SecurityScopedResourceAccessing
+    private let packageScopeURL: URL
+    private let didStartPackageScope: Bool
     private var controller: SessionController?
     private var initialSource: WorkspaceInitialSource?
+    private var didResolvePersistedRecording = false
     private var didStart = false
+
+    var requiresCloseConfirmation: Bool { snapshot.isCapturing }
+    var projectURL: URL { packageScopeURL }
+
+    var presentedErrorText: String? { sourceErrorText ?? snapshot.errorText }
+
+    var progress: WorkspaceProgressPresentation {
+        WorkspaceProgressPresentation.make(
+            phase: snapshot.phase,
+            source: sourceMode,
+            sampledCount: snapshot.nextInputOrdinal ?? snapshot.capturedCount,
+            queuedCount: snapshot.queuedCount,
+            processedCount: snapshot.processedCount,
+            expectedCount: snapshot.expectedInputCount
+        )
+    }
 
     init(
         document: CloudPointDocument,
         packageURL: URL,
+        packageBookmarkData: Data? = nil,
         initialSource: WorkspaceInitialSource? = nil,
+        recordingSources: any RecordingSourceManaging = SystemRecordingSourceManager(),
+        panelPresenter: any InputPanelPresenting = SystemInputPanelPresenter(),
+        bookmarks: any SecurityScopedBookmarking = SystemSecurityScopedBookmarks(),
+        packageScope: any SecurityScopedResourceAccessing = SystemSecurityScopedResourceAccess(),
+        onChooseAnotherVideo: @escaping () -> Void = {},
+        onRepairModel: @escaping () -> Void = {},
         arguments: [String] = ProcessInfo.processInfo.arguments
     ) {
         self.document = document
+        self.recordingSources = recordingSources
+        self.panelPresenter = panelPresenter
+        self.onChooseAnotherVideo = onChooseAnotherVideo
+        self.onRepairModel = onRepairModel
+        self.packageScope = packageScope
+        let resolvedPackageURL: URL
+        if let packageBookmarkData,
+           let resolution = try? bookmarks.resolve(packageBookmarkData) {
+            resolvedPackageURL = resolution.url
+        } else {
+            resolvedPackageURL = packageURL
+        }
+        packageScopeURL = resolvedPackageURL
+        didStartPackageScope = packageScope.startAccessing(resolvedPackageURL)
         self.initialSource = initialSource
+        recoveryAction = nil
+        sourceErrorText = nil
+        switch initialSource {
+        case let .camera(deviceID, _):
+            sourceMode = .cameraPreflight
+            selectedCameraID = deviceID
+            self.initialSource = nil
+        case .recording:
+            sourceMode = .recording
+        case nil where document.manifest.recordingSource != nil:
+            sourceMode = .recording
+        case nil where document.manifest.cameraSource != nil:
+            sourceMode = Self.stateMode(for: document.manifest.sessionState)
+        case nil:
+            sourceMode = .project
+        }
+        let preflightPreview = CameraPreflightPreviewController()
+        self.preflightPreview = preflightPreview
+        preflightPreviewSession = preflightPreview.session
         let cameraCaptureSession = AVCameraCaptureSession()
         previewSession = cameraCaptureSession.previewSession
         if let device = MTLCreateSystemDefaultDevice() {
@@ -43,6 +226,8 @@ final class WorkspaceViewModel: ObservableObject {
             processedCount: state.processedCount,
             failedCount: state.failedCount,
             currentWindow: state.currentWindow,
+            expectedInputCount: document.manifest.recordingSource?.expectedSampleCount,
+            nextInputOrdinal: document.manifest.recordingSource?.nextSampleOrdinal,
             setupText: nil,
             errorText: nil,
             samplingRate: 2,
@@ -70,13 +255,21 @@ final class WorkspaceViewModel: ObservableObject {
                     self.snapshot = snapshot
                     self.renderer?.setPointSize(snapshot.pointSize)
                     self.renderer?.setConfidenceThreshold(snapshot.confidenceThreshold)
+                    if snapshot.setupText != nil,
+                       self.sourceErrorText == nil,
+                       self.recoveryAction == nil {
+                        self.recoveryAction = .repairModel
+                    } else if snapshot.setupText == nil,
+                              self.recoveryAction == .repairModel {
+                        self.recoveryAction = nil
+                    }
                     self.beginInitialRecordingIfReady()
                 }
             }
         )
         controller = SessionController(
             manifest: document.manifest,
-            packageURL: packageURL,
+            packageURL: resolvedPackageURL,
             dependencies: SessionControllerDependencies(
                 engineFactory: {
 #if DEBUG
@@ -100,7 +293,15 @@ final class WorkspaceViewModel: ObservableObject {
 
     deinit {
         let controllerToClose = controller
-        Task { await controllerToClose?.close() }
+        let previewToClose = preflightPreview
+        let scope = packageScope
+        let scopeURL = packageScopeURL
+        let shouldStopScope = didStartPackageScope
+        Task {
+            await controllerToClose?.close()
+            await previewToClose.stop()
+            if shouldStopScope { scope.stopAccessing(scopeURL) }
+        }
     }
 
     static func shouldUseMockEngine(arguments: [String]) -> Bool {
@@ -120,20 +321,29 @@ final class WorkspaceViewModel: ObservableObject {
             catch { await MainActor.run { self.report(error) } }
         }
         Task {
+            await resolvePersistedRecordingIfNeeded()
+        }
+        guard sourceMode == .camera || sourceMode == .cameraPreflight else { return }
+        Task {
             let values = await CameraCatalog.devices()
             await MainActor.run {
                 cameras = values
                 selectedCameraID = selectedCameraID ?? values.first?.id
+            }
+            if let selectedCameraID {
+                await showCameraPreflight(deviceID: selectedCameraID)
             }
         }
     }
 
     private func beginInitialRecordingIfReady() {
         guard snapshot.capabilities.canImportRecording,
-              case let .recording(url, framesPerSecond) = initialSource else {
+              case let .recording(url, framesPerSecond, _) = initialSource else {
             return
         }
         initialSource = nil
+        sourceErrorText = nil
+        recoveryAction = nil
         Task { [controller] in
             do {
                 try await controller?.importRecording(
@@ -149,15 +359,65 @@ final class WorkspaceViewModel: ObservableObject {
         guard snapshot.capabilities.canUseCamera,
               let selectedCameraID else { return }
         let rate = snapshot.samplingRate
-        Task { [controller] in
+        sourceMode = .camera
+        Task { [controller, preflightPreview] in
+            await preflightPreview.stop()
             do {
                 try await controller?.useCamera(
                     deviceID: selectedCameraID,
                     sampleRate: rate
                 )
             } catch {
-                await MainActor.run { self.report(error) }
+                await MainActor.run {
+                    self.sourceMode = .cameraPreflight
+                    self.report(error)
+                }
             }
+        }
+    }
+
+    func selectCamera(_ deviceID: String?) {
+        guard selectedCameraID != deviceID else { return }
+        selectedCameraID = deviceID
+        guard sourceMode == .cameraPreflight, let deviceID else { return }
+        Task { await showCameraPreflight(deviceID: deviceID) }
+    }
+
+    func performRecoveryAction() {
+        switch recoveryAction {
+        case .locateOriginal:
+            guard let url = panelPresenter.chooseVideo() else { return }
+            Task { await locateOriginal(at: url) }
+        case .chooseAnotherVideo:
+            onChooseAnotherVideo()
+        case .repairModel:
+            onRepairModel()
+        case .resumeFromCheckpoint:
+            resume()
+        case nil:
+            break
+        }
+    }
+
+    func locateOriginal(at url: URL) async {
+        guard let source = document.manifest.recordingSource else { return }
+        do {
+            let replacement = try await recordingSources.replacement(
+                for: url,
+                preserving: source
+            )
+            try await controller?.replaceRecordingSource(replacement)
+            initialSource = .recording(
+                url,
+                framesPerSecond: replacement.framesPerSecond,
+                expectedSampleCount: replacement.expectedSampleCount
+            )
+            sourceErrorText = nil
+            recoveryAction = nil
+            beginInitialRecordingIfReady()
+        } catch {
+            sourceErrorText = error.localizedDescription
+            recoveryAction = .locateOriginal
         }
     }
 
@@ -165,6 +425,17 @@ final class WorkspaceViewModel: ObservableObject {
         Task { [controller] in
             do { try await controller?.stopCamera() }
             catch { await MainActor.run { self.report(error) } }
+        }
+    }
+
+    func stopCapture(then action: @escaping @MainActor () -> Void) {
+        Task { [controller] in
+            do {
+                try await controller?.stopCamera()
+                await MainActor.run { action() }
+            } catch {
+                await MainActor.run { self.report(error) }
+            }
         }
     }
 
@@ -204,5 +475,114 @@ final class WorkspaceViewModel: ObservableObject {
 
     private func report(_ error: Error) {
         snapshot.errorText = error.localizedDescription
+        if error is RecordingSourceAccessError {
+            recoveryAction = .locateOriginal
+        } else {
+            recoveryAction = sourceMode == .recording
+                ? .chooseAnotherVideo
+                : .resumeFromCheckpoint
+        }
+    }
+
+    private func resolvePersistedRecordingIfNeeded() async {
+        guard !didResolvePersistedRecording,
+              initialSource == nil,
+              let source = document.manifest.recordingSource,
+              source.nextSampleOrdinal < source.expectedSampleCount else {
+            return
+        }
+        didResolvePersistedRecording = true
+        do {
+            let url = try await recordingSources.resolve(source)
+            initialSource = .recording(
+                url,
+                framesPerSecond: source.framesPerSecond,
+                expectedSampleCount: source.expectedSampleCount
+            )
+            beginInitialRecordingIfReady()
+        } catch {
+            sourceErrorText = error.localizedDescription
+            recoveryAction = .locateOriginal
+        }
+    }
+
+    private func showCameraPreflight(deviceID: String) async {
+        do {
+            try await preflightPreview.show(deviceID: deviceID)
+            sourceErrorText = nil
+        } catch {
+            sourceErrorText = "Camera preview is unavailable. Choose another camera and try again."
+        }
+    }
+
+    private static func stateMode(for state: SessionState) -> WorkspaceSourceMode {
+        state.isCapturing || state.capturedCount > 0 ? .camera : .cameraPreflight
+    }
+}
+
+private final class CameraPreflightPreviewController: @unchecked Sendable {
+    let session = AVCaptureSession()
+
+    private let queue = DispatchQueue(label: "cloud.point.cloud.camera.preflight")
+    private let queueKey = DispatchSpecificKey<UInt8>()
+
+    init() {
+        queue.setSpecific(key: queueKey, value: 1)
+    }
+
+    func show(deviceID: String) async throws {
+        try await withCheckedThrowingContinuation { continuation in
+            queue.async { [self] in
+                do {
+                    tearDown()
+                    let discovery = AVCaptureDevice.DiscoverySession(
+                        deviceTypes: [.builtInWideAngleCamera, .continuityCamera, .external],
+                        mediaType: .video,
+                        position: .unspecified
+                    )
+                    guard let device = discovery.devices.first(where: { $0.uniqueID == deviceID }) else {
+                        throw CameraPreflightError.noCamera
+                    }
+                    let input = try AVCaptureDeviceInput(device: device)
+                    session.beginConfiguration()
+                    session.sessionPreset = .high
+                    guard session.canAddInput(input) else {
+                        session.commitConfiguration()
+                        throw CameraCaptureSessionError.cannotAddInput
+                    }
+                    session.addInput(input)
+                    session.commitConfiguration()
+                    session.startRunning()
+                    continuation.resume()
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    func stop() async {
+        await withCheckedContinuation { continuation in
+            queue.async { [self] in
+                tearDown()
+                continuation.resume()
+            }
+        }
+    }
+
+    deinit {
+        if DispatchQueue.getSpecific(key: queueKey) != nil {
+            tearDown()
+        } else {
+            queue.sync { tearDown() }
+        }
+    }
+
+    private func tearDown() {
+        if session.isRunning { session.stopRunning() }
+        session.beginConfiguration()
+        for output in session.outputs { session.removeOutput(output) }
+        for input in session.inputs { session.removeInput(input) }
+        session.commitConfiguration()
     }
 }

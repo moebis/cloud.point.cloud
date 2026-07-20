@@ -5,20 +5,62 @@ struct ManagedProject: Identifiable, Sendable, Equatable {
     let id: UUID
     let displayName: String
     let packageURL: URL
+    let packageBookmarkData: Data?
     let manifest: ProjectManifest
     let lastOpenedAt: Date
+
+    init(
+        id: UUID,
+        displayName: String,
+        packageURL: URL,
+        packageBookmarkData: Data? = nil,
+        manifest: ProjectManifest,
+        lastOpenedAt: Date
+    ) {
+        self.id = id
+        self.displayName = displayName
+        self.packageURL = packageURL
+        self.packageBookmarkData = packageBookmarkData
+        self.manifest = manifest
+        self.lastOpenedAt = lastOpenedAt
+    }
 }
 
 struct RecentProject: Identifiable, Sendable, Equatable {
     let id: UUID
     let displayName: String
     let packageURL: URL
+    let packageBookmarkData: Data?
     let phase: SessionPhase
     let lastOpenedAt: Date
+
+    init(
+        id: UUID,
+        displayName: String,
+        packageURL: URL,
+        packageBookmarkData: Data? = nil,
+        phase: SessionPhase,
+        lastOpenedAt: Date
+    ) {
+        self.id = id
+        self.displayName = displayName
+        self.packageURL = packageURL
+        self.packageBookmarkData = packageBookmarkData
+        self.phase = phase
+        self.lastOpenedAt = lastOpenedAt
+    }
 }
 
 protocol ManagedProjectStoring: Sendable {
     func createProject(sourceName: String) async throws -> ManagedProject
+    func createRecordingProject(
+        sourceName: String,
+        source: RecordingSourceReference
+    ) async throws -> ManagedProject
+    func createCameraProject(
+        sourceName: String,
+        source: CameraSourceReference
+    ) async throws -> ManagedProject
     func openProject(at url: URL) async throws -> ManagedProject
     func recentProjects() async throws -> [RecentProject]
 }
@@ -45,21 +87,28 @@ actor ManagedProjectStore: ManagedProjectStoring {
         let id: UUID
         var displayName: String
         var packagePath: String
+        var packageBookmarkData: Data?
         var phase: SessionPhase
         var lastOpenedAt: Date
     }
 
     private let fileManager = FileManager.default
     private let applicationSupportDirectory: URL
+    private let bookmarks: any SecurityScopedBookmarking
+    private let scope: any SecurityScopedResourceAccessing
     private let now: @Sendable () -> Date
     private let makeUUID: @Sendable () -> UUID
 
     init(
         applicationSupportDirectory: URL,
+        bookmarks: any SecurityScopedBookmarking = SystemSecurityScopedBookmarks(),
+        scope: any SecurityScopedResourceAccessing = SystemSecurityScopedResourceAccess(),
         now: @escaping @Sendable () -> Date = Date.init,
         makeUUID: @escaping @Sendable () -> UUID = UUID.init
     ) {
         self.applicationSupportDirectory = applicationSupportDirectory.standardizedFileURL
+        self.bookmarks = bookmarks
+        self.scope = scope
         self.now = now
         self.makeUUID = makeUUID
     }
@@ -77,6 +126,28 @@ actor ManagedProjectStore: ManagedProjectStoring {
     }
 
     func createProject(sourceName: String) throws -> ManagedProject {
+        try createProject(sourceName: sourceName, recordingSource: nil, cameraSource: nil)
+    }
+
+    func createRecordingProject(
+        sourceName: String,
+        source: RecordingSourceReference
+    ) async throws -> ManagedProject {
+        try createProject(sourceName: sourceName, recordingSource: source, cameraSource: nil)
+    }
+
+    func createCameraProject(
+        sourceName: String,
+        source: CameraSourceReference
+    ) async throws -> ManagedProject {
+        try createProject(sourceName: sourceName, recordingSource: nil, cameraSource: source)
+    }
+
+    private func createProject(
+        sourceName: String,
+        recordingSource: RecordingSourceReference?,
+        cameraSource: CameraSourceReference?
+    ) throws -> ManagedProject {
         let projectID = makeUUID()
         let openedAt = now()
         let displayName = Self.displayName(for: sourceName)
@@ -104,7 +175,9 @@ actor ManagedProjectStore: ManagedProjectStoring {
         let manifest = ProjectManifest(
             projectID: projectID,
             createdAt: openedAt,
-            updatedAt: openedAt
+            updatedAt: openedAt,
+            recordingSource: recordingSource,
+            cameraSource: cameraSource
         )
         try manifest.writeAtomically(to: stagingURL)
         try Self.renameExclusively(from: stagingURL, to: packageURL)
@@ -115,6 +188,7 @@ actor ManagedProjectStore: ManagedProjectStoring {
                 id: projectID,
                 displayName: displayName,
                 packagePath: packageURL.path,
+                packageBookmarkData: nil,
                 phase: manifest.sessionState.phase,
                 lastOpenedAt: openedAt
             ))
@@ -134,6 +208,8 @@ actor ManagedProjectStore: ManagedProjectStoring {
 
     func openProject(at url: URL) throws -> ManagedProject {
         let packageURL = url.standardizedFileURL
+        let didStartScope = scope.startAccessing(packageURL)
+        defer { if didStartScope { scope.stopAccessing(packageURL) } }
         guard packageURL.pathExtension.lowercased() == "cloudpoint",
               (try packageURL.resourceValues(forKeys: [.isDirectoryKey])).isDirectory == true else {
             throw ManagedProjectStoreError.invalidProjectPackage
@@ -146,10 +222,14 @@ actor ManagedProjectStore: ManagedProjectStoring {
             forProjectPackage: packageURL,
             projectID: manifest.projectID
         )
+        let bookmarkData = Self.isDescendant(packageURL, of: projectsDirectory)
+            ? nil
+            : try bookmarks.makeBookmark(for: packageURL)
         try upsertRecent(RecentRecord(
             id: manifest.projectID,
             displayName: displayName,
             packagePath: packageURL.path,
+            packageBookmarkData: bookmarkData,
             phase: manifest.sessionState.phase,
             lastOpenedAt: openedAt
         ))
@@ -157,6 +237,7 @@ actor ManagedProjectStore: ManagedProjectStoring {
             id: manifest.projectID,
             displayName: displayName,
             packageURL: packageURL,
+            packageBookmarkData: bookmarkData,
             manifest: manifest,
             lastOpenedAt: openedAt
         )
@@ -166,10 +247,22 @@ actor ManagedProjectStore: ManagedProjectStoring {
         let records = try loadRecentRecords()
         var refreshed: [RecentRecord] = []
         for var record in records {
-            let packageURL = URL(
-                filePath: record.packagePath,
-                directoryHint: .isDirectory
-            ).standardizedFileURL
+            let packageURL: URL
+            if let bookmark = record.packageBookmarkData,
+               let resolution = try? bookmarks.resolve(bookmark) {
+                packageURL = resolution.url.standardizedFileURL
+                record.packagePath = packageURL.path
+                if resolution.isStale {
+                    record.packageBookmarkData = try? bookmarks.makeBookmark(for: packageURL)
+                }
+            } else {
+                packageURL = URL(
+                    filePath: record.packagePath,
+                    directoryHint: .isDirectory
+                ).standardizedFileURL
+            }
+            let didStartScope = scope.startAccessing(packageURL)
+            defer { if didStartScope { scope.stopAccessing(packageURL) } }
             guard fileManager.fileExists(atPath: packageURL.path),
                   let manifest = try? ProjectManifest.load(from: packageURL),
                   manifest.projectID == record.id else {
@@ -185,6 +278,7 @@ actor ManagedProjectStore: ManagedProjectStoring {
                 id: $0.id,
                 displayName: $0.displayName,
                 packageURL: URL(filePath: $0.packagePath, directoryHint: .isDirectory),
+                packageBookmarkData: $0.packageBookmarkData,
                 phase: $0.phase,
                 lastOpenedAt: $0.lastOpenedAt
             )
@@ -275,6 +369,12 @@ actor ManagedProjectStore: ManagedProjectStoring {
         }.joined()
         let trimmed = mapped.trimmingCharacters(in: .whitespacesAndNewlines)
         return String((trimmed.isEmpty ? "CloudPoint Project" : trimmed).prefix(80))
+    }
+
+    private static func isDescendant(_ candidate: URL, of directory: URL) -> Bool {
+        let candidateComponents = candidate.standardizedFileURL.pathComponents
+        let directoryComponents = directory.standardizedFileURL.pathComponents
+        return candidateComponents.starts(with: directoryComponents)
     }
 
     private static func renameExclusively(from source: URL, to destination: URL) throws {

@@ -25,7 +25,11 @@ final class AppCoordinatorTests: XCTestCase {
         let probe = CoordinatorVideoProbe(
             result: VideoProbeResult(durationSeconds: 10.6, sampledFrameCount: 22)
         )
-        let coordinator = AppCoordinator(projectStore: store, videoProbe: probe)
+        let coordinator = AppCoordinator(
+            projectStore: store,
+            videoProbe: probe,
+            recordingSources: CoordinatorRecordingSources()
+        )
 
         await coordinator.openInput(video)
 
@@ -39,7 +43,62 @@ final class AppCoordinatorTests: XCTestCase {
         XCTAssertEqual(launch.projectID, project.id)
         XCTAssertEqual(launch.packageURL, package)
         XCTAssertEqual(launch.sourceTitle, "IMG_2285")
-        XCTAssertEqual(launch.initialSource, .recording(video, framesPerSecond: 2))
+        XCTAssertEqual(
+            launch.initialSource,
+            .recording(video, framesPerSecond: 2, expectedSampleCount: 22)
+        )
+        let recordingSources = await store.requestedRecordingSources()
+        XCTAssertEqual(recordingSources.first?.expectedSampleCount, 22)
+        XCTAssertEqual(recordingSources.first?.nextSampleOrdinal, 0)
+    }
+
+    func testCameraRoutePreflightsBeforeCreatingProjectAndCarriesSelectedDevice() async {
+        let store = CoordinatorStore(project: .fixture())
+        let preflight = CoordinatorCameraPreflight(
+            result: CameraPreflightResult(
+                deviceID: "continuity-camera",
+                deviceName: "Moebis’s iPhone"
+            )
+        )
+        let coordinator = AppCoordinator(
+            projectStore: store,
+            videoProbe: CoordinatorVideoProbe(
+                result: VideoProbeResult(durationSeconds: 1, sampledFrameCount: 2)
+            ),
+            cameraPreflight: preflight
+        )
+
+        await coordinator.useCamera()
+
+        let preflightRequestCount = await preflight.requestCount()
+        let requestedSourceNames = await store.requestedSourceNames()
+        XCTAssertEqual(preflightRequestCount, 1)
+        XCTAssertEqual(requestedSourceNames, ["Moebis’s iPhone Capture"])
+        guard case let .workspace(launch) = coordinator.destination else {
+            return XCTFail("Expected camera preflight workspace")
+        }
+        XCTAssertEqual(
+            launch.initialSource,
+            .camera(deviceID: "continuity-camera", deviceName: "Moebis’s iPhone")
+        )
+    }
+
+    func testCameraFailureDoesNotCreateOrListAnEmptyProject() async {
+        let store = CoordinatorStore(project: .fixture())
+        let coordinator = AppCoordinator(
+            projectStore: store,
+            videoProbe: CoordinatorVideoProbe(
+                result: VideoProbeResult(durationSeconds: 1, sampledFrameCount: 2)
+            ),
+            cameraPreflight: CoordinatorCameraPreflight(error: CameraPreflightError.permissionDenied)
+        )
+
+        await coordinator.useCamera()
+
+        let requestedSourceNames = await store.requestedSourceNames()
+        XCTAssertEqual(requestedSourceNames, [])
+        XCTAssertEqual(coordinator.destination, .welcome)
+        XCTAssertEqual(coordinator.errorMessage, CameraPreflightError.permissionDenied.localizedDescription)
     }
 
     func testDroppedAndFinderMoviesUseTheSameValidatedVideoRoute() async {
@@ -49,7 +108,11 @@ final class AppCoordinatorTests: XCTestCase {
         let probe = CoordinatorVideoProbe(
             result: VideoProbeResult(durationSeconds: 1, sampledFrameCount: 2)
         )
-        let coordinator = AppCoordinator(projectStore: store, videoProbe: probe)
+        let coordinator = AppCoordinator(
+            projectStore: store,
+            videoProbe: probe,
+            recordingSources: CoordinatorRecordingSources()
+        )
 
         await coordinator.openDroppedItems([first])
         await coordinator.openExternalURL(second)
@@ -86,11 +149,31 @@ private actor CoordinatorStore: ManagedProjectStoring {
     let project: ManagedProject
     private(set) var createdSourceNames: [String] = []
     private(set) var openedURLs: [URL] = []
+    private(set) var recordingSources: [RecordingSourceReference] = []
+    private(set) var cameraSources: [CameraSourceReference] = []
 
     init(project: ManagedProject) { self.project = project }
 
     func createProject(sourceName: String) -> ManagedProject {
         createdSourceNames.append(sourceName)
+        return project
+    }
+
+    func createRecordingProject(
+        sourceName: String,
+        source: RecordingSourceReference
+    ) -> ManagedProject {
+        createdSourceNames.append(sourceName)
+        recordingSources.append(source)
+        return project
+    }
+
+    func createCameraProject(
+        sourceName: String,
+        source: CameraSourceReference
+    ) -> ManagedProject {
+        createdSourceNames.append(sourceName)
+        cameraSources.append(source)
         return project
     }
 
@@ -104,6 +187,8 @@ private actor CoordinatorStore: ManagedProjectStoring {
     func requestedSourceNames() -> [String] { createdSourceNames }
 
     func requestedProjectURLs() -> [URL] { openedURLs }
+
+    func requestedRecordingSources() -> [RecordingSourceReference] { recordingSources }
 }
 
 private actor CoordinatorVideoProbe: VideoMetadataProbing {
@@ -118,6 +203,55 @@ private actor CoordinatorVideoProbe: VideoMetadataProbing {
     }
 
     func requestedURLs() -> [URL] { probedURLs }
+}
+
+private struct CoordinatorRecordingSources: RecordingSourceManaging {
+    func makeReference(
+        for url: URL,
+        probe: VideoProbeResult,
+        framesPerSecond: Int
+    ) async throws -> RecordingSourceReference {
+        RecordingSourceReference(
+            bookmarkData: Data(url.path.utf8),
+            originalFilename: url.lastPathComponent,
+            fingerprint: RecordingSourceFingerprint(
+                byteCount: 1,
+                sha256: String(repeating: "a", count: 64)
+            ),
+            durationSeconds: probe.durationSeconds,
+            framesPerSecond: framesPerSecond,
+            expectedSampleCount: UInt64(probe.sampledFrameCount),
+            nextSampleOrdinal: 0
+        )
+    }
+
+    func resolve(_ reference: RecordingSourceReference) async throws -> URL {
+        URL(filePath: String(decoding: reference.bookmarkData, as: UTF8.self))
+    }
+
+    func replacement(
+        for url: URL,
+        preserving reference: RecordingSourceReference
+    ) async throws -> RecordingSourceReference {
+        var result = reference
+        result.bookmarkData = Data(url.path.utf8)
+        return result
+    }
+}
+
+private actor CoordinatorCameraPreflight: CameraPreflighting {
+    private let outcome: Result<CameraPreflightResult, Error>
+    private var requests = 0
+
+    init(result: CameraPreflightResult) { outcome = .success(result) }
+    init(error: Error) { outcome = .failure(error) }
+
+    func preflight() async throws -> CameraPreflightResult {
+        requests += 1
+        return try outcome.get()
+    }
+
+    func requestCount() -> Int { requests }
 }
 
 private extension ManagedProject {

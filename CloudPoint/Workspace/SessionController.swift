@@ -210,6 +210,8 @@ struct WorkspaceSnapshot: Sendable, Equatable {
     var processedCount: UInt64
     var failedCount: UInt64
     var currentWindow: UInt32?
+    var expectedInputCount: UInt64?
+    var nextInputOrdinal: UInt64?
     var setupText: String?
     var errorText: String?
     var samplingRate: Int
@@ -233,6 +235,7 @@ protocol RecordingImporting: Sendable {
         from recordingURL: URL,
         into packageURL: URL,
         startingIndex: UInt32,
+        startingSampleOrdinal: UInt64,
         framesPerSecond: Int,
         receive: @escaping @Sendable (PersistedFrame) async throws -> Void
     ) async throws
@@ -278,6 +281,7 @@ struct AssetRecordingImporter: RecordingImporting {
         from recordingURL: URL,
         into packageURL: URL,
         startingIndex: UInt32,
+        startingSampleOrdinal: UInt64,
         framesPerSecond: Int,
         receive: @escaping @Sendable (PersistedFrame) async throws -> Void
     ) async throws {
@@ -287,10 +291,14 @@ struct AssetRecordingImporter: RecordingImporting {
         let asset = AVURLAsset(url: recordingURL)
         let duration = try await asset.load(.duration)
         let plan = try FrameSamplingPlan(duration: duration, framesPerSecond: framesPerSecond)
+        guard let resumeOrdinal = Int(exactly: startingSampleOrdinal),
+              resumeOrdinal <= plan.timestamps.count else {
+            throw SessionControllerError.invalidSourceFrame
+        }
         let source = AssetFrameSource(assetURL: recordingURL)
         let persistence = try JPEGFramePersistence(packageURL: packageURL)
 
-        for try await sourceFrame in source.frames(at: plan.timestamps) {
+        for try await sourceFrame in source.frames(at: Array(plan.timestamps.dropFirst(resumeOrdinal))) {
             try Task.checkCancellation()
             guard let sourceOffset = UInt32(exactly: sourceFrame.index) else {
                 throw SessionControllerError.invalidSourceFrame
@@ -673,6 +681,23 @@ final class SessionController: @unchecked Sendable {
         try await submit { $0.manifest }
     }
 
+    func replaceRecordingSource(_ replacement: RecordingSourceReference) async throws {
+        try await submit { controller in
+            guard let current = controller.manifest.recordingSource,
+                  replacement.fingerprint == current.fingerprint,
+                  replacement.durationSeconds == current.durationSeconds,
+                  replacement.framesPerSecond == current.framesPerSecond,
+                  replacement.expectedSampleCount == current.expectedSampleCount,
+                  replacement.nextSampleOrdinal == current.nextSampleOrdinal else {
+                throw RecordingSourceAccessError.changed
+            }
+            var staged = controller.manifest
+            staged.recordingSource = replacement
+            staged.updatedAt = controller.dependencies.now()
+            try await controller.commit(staged)
+        }
+    }
+
     func setSamplingRate(_ value: Int) async {
         _ = try? await submit { controller in
             guard (1...10).contains(value), controller.capabilities.canEditSamplingRate else { return }
@@ -795,7 +820,12 @@ final class SessionController: @unchecked Sendable {
             || manifest.sessionState.capturedCount > 0
             || manifest.sessionState.queuedCount > 0
             || manifest.sessionState.processedCount > 0
-        finiteResumeGeneration = hasDurableWork ? activeGeneration : nil
+        let hasIncompleteRecording = manifest.recordingSource.map {
+            $0.nextSampleOrdinal < $0.expectedSampleCount
+        } ?? false
+        finiteResumeGeneration = hasDurableWork && !hasIncompleteRecording
+            ? activeGeneration
+            : nil
         startEngineEvents(createdEngine, generation: activeGeneration)
 
         var staged = manifest
@@ -936,6 +966,7 @@ final class SessionController: @unchecked Sendable {
             startingIndex = 0
         }
         let importer = dependencies.recordingImporter
+        let startingSampleOrdinal = manifest.recordingSource?.nextSampleOrdinal ?? 0
         recordingTask?.cancel()
         recordingTaskSourceGeneration = activeSourceGeneration
         recordingTask = Task { [weak self] in
@@ -945,12 +976,14 @@ final class SessionController: @unchecked Sendable {
                     from: url,
                     into: packageURL,
                     startingIndex: startingIndex,
+                    startingSampleOrdinal: startingSampleOrdinal,
                     framesPerSecond: framesPerSecond
                 ) { frame in
                     try await controller.submit { mailboxOwner in
                         try await mailboxOwner.acceptPersistedFrame(
                             frame,
-                            sourceGeneration: activeSourceGeneration
+                            sourceGeneration: activeSourceGeneration,
+                            advancesRecordingCursor: true
                         )
                     }
                 }
@@ -1060,7 +1093,8 @@ final class SessionController: @unchecked Sendable {
             do {
                 try await acceptPersistedFrame(
                     payload.frame,
-                    sourceGeneration: sourceGeneration
+                    sourceGeneration: sourceGeneration,
+                    advancesRecordingCursor: false
                 )
                 cameraEventCounts[payload.lifecycleID] = try checkedAdd(received, 1)
                 await finishCameraIfDrained(sourceGeneration: sourceGeneration)
@@ -1132,7 +1166,8 @@ final class SessionController: @unchecked Sendable {
             }
             try await acceptPersistedFrame(
                 payload.frame,
-                sourceGeneration: sourceGeneration
+                sourceGeneration: sourceGeneration,
+                advancesRecordingCursor: false
             )
             received = try checkedAdd(received, 1)
             cameraEventCounts[completion.lifecycleID] = received
@@ -1163,7 +1198,8 @@ final class SessionController: @unchecked Sendable {
 
     private func acceptPersistedFrame(
         _ frame: PersistedFrame,
-        sourceGeneration: UInt64
+        sourceGeneration: UInt64,
+        advancesRecordingCursor: Bool
     ) async throws {
         guard sourceGeneration == self.sourceGeneration, !closed else { return }
         guard let packageURL, let engine else { throw SessionControllerError.engineUnavailable }
@@ -1175,6 +1211,14 @@ final class SessionController: @unchecked Sendable {
         var captured = manifest
         captured.frames.append(frame)
         captured.sessionState = try captured.sessionState.applying(.durableFrameCommitted)
+        if advancesRecordingCursor, var source = captured.recordingSource {
+            let (nextOrdinal, overflow) = source.nextSampleOrdinal.addingReportingOverflow(1)
+            guard !overflow, nextOrdinal <= source.expectedSampleCount else {
+                throw SessionControllerError.invalidSourceFrame
+            }
+            source.nextSampleOrdinal = nextOrdinal
+            captured.recordingSource = source
+        }
         captured.updatedAt = dependencies.now()
         do {
             try await commit(captured)
@@ -1624,6 +1668,8 @@ final class SessionController: @unchecked Sendable {
             processedCount: state.processedCount,
             failedCount: state.failedCount,
             currentWindow: state.currentWindow,
+            expectedInputCount: manifest.recordingSource?.expectedSampleCount,
+            nextInputOrdinal: manifest.recordingSource?.nextSampleOrdinal,
             setupText: packageURL == nil ? SessionControllerError.packageNotSaved.localizedDescription : setupText,
             errorText: errorText,
             samplingRate: samplingRate,

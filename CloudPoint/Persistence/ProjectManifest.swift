@@ -11,7 +11,29 @@ enum ProjectManifestError: Error, Equatable, Sendable {
     case invalidArtifact
     case invalidArtifactOrder
     case invalidSessionState
+    case invalidRecordingSource
+    case invalidCameraSource
     case checkpointWindowIndexOverflow
+}
+
+struct RecordingSourceFingerprint: Codable, Sendable, Equatable {
+    var byteCount: UInt64
+    var sha256: String
+}
+
+struct RecordingSourceReference: Codable, Sendable, Equatable {
+    var bookmarkData: Data
+    var originalFilename: String
+    var fingerprint: RecordingSourceFingerprint
+    var durationSeconds: Double
+    var framesPerSecond: Int
+    var expectedSampleCount: UInt64
+    var nextSampleOrdinal: UInt64
+}
+
+struct CameraSourceReference: Codable, Sendable, Equatable {
+    var deviceID: String
+    var deviceName: String
 }
 
 struct ProjectManifest: Codable, Sendable, Equatable {
@@ -22,6 +44,8 @@ struct ProjectManifest: Codable, Sendable, Equatable {
     var createdAt: Date
     var updatedAt: Date
     var engineConfiguration: EngineConfiguration
+    var recordingSource: RecordingSourceReference?
+    var cameraSource: CameraSourceReference?
     var frames: [PersistedFrame]
     var completedWindows: [CompletedWindow]
     var sessionState: SessionState
@@ -32,6 +56,8 @@ struct ProjectManifest: Codable, Sendable, Equatable {
         createdAt: Date = Date(),
         updatedAt: Date = Date(),
         engineConfiguration: EngineConfiguration = EngineConfiguration(),
+        recordingSource: RecordingSourceReference? = nil,
+        cameraSource: CameraSourceReference? = nil,
         frames: [PersistedFrame] = [],
         completedWindows: [CompletedWindow] = [],
         sessionState: SessionState = .empty
@@ -41,6 +67,8 @@ struct ProjectManifest: Codable, Sendable, Equatable {
         self.createdAt = createdAt
         self.updatedAt = updatedAt
         self.engineConfiguration = engineConfiguration
+        self.recordingSource = recordingSource
+        self.cameraSource = cameraSource
         self.frames = frames
         self.completedWindows = completedWindows
         self.sessionState = sessionState
@@ -113,6 +141,30 @@ struct ProjectManifest: Codable, Sendable, Equatable {
         }
         do { try manifest.engineConfiguration.validate() }
         catch { throw ProjectManifestError.invalidConfiguration }
+        guard manifest.recordingSource == nil || manifest.cameraSource == nil else {
+            throw ProjectManifestError.invalidRecordingSource
+        }
+        if let source = manifest.recordingSource {
+            guard !source.bookmarkData.isEmpty,
+                  !source.originalFilename.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  source.fingerprint.byteCount > 0,
+                  source.fingerprint.sha256.count == 64,
+                  source.fingerprint.sha256.allSatisfy({ $0.isHexDigit && !$0.isUppercase }),
+                  source.durationSeconds.isFinite,
+                  source.durationSeconds > 0,
+                  (1...10).contains(source.framesPerSecond),
+                  source.expectedSampleCount > 0,
+                  source.nextSampleOrdinal <= source.expectedSampleCount,
+                  source.nextSampleOrdinal == manifest.sessionState.capturedCount else {
+                throw ProjectManifestError.invalidRecordingSource
+            }
+        }
+        if let source = manifest.cameraSource {
+            guard !source.deviceID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  !source.deviceName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw ProjectManifestError.invalidCameraSource
+            }
+        }
         guard manifest.sessionState.processedCount <= manifest.sessionState.queuedCount,
               manifest.sessionState.queuedCount <= manifest.sessionState.capturedCount,
               UInt64(exactly: manifest.frames.count) == manifest.sessionState.capturedCount else {

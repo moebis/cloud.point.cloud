@@ -104,7 +104,7 @@ struct WelcomeView: View {
                 subtitle: "Create a live spatial capture",
                 systemImage: "video.fill",
                 prominent: false,
-                action: coordinator.useCamera
+                action: { Task { await coordinator.useCamera() } }
             )
 
             WelcomeActionButton(

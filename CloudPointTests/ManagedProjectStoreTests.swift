@@ -2,6 +2,26 @@ import XCTest
 @testable import CloudPoint
 
 final class ManagedProjectStoreTests: XCTestCase {
+    func testExternalRecentProjectPersistsAndResolvesSecurityScopedBookmark() async throws {
+        let support = try TemporaryDirectory.make()
+        let external = try TemporaryProjectPackage.make()
+        let manifest = ProjectManifest.fixture()
+        try manifest.writeAtomically(to: external.url)
+        let bookmarks = ProjectBookmarkHarness()
+        let store = ManagedProjectStore(
+            applicationSupportDirectory: support.url,
+            bookmarks: bookmarks
+        )
+
+        let opened = try await store.openProject(at: external.url)
+        let recent = try await store.recentProjects()
+
+        XCTAssertEqual(opened.packageBookmarkData, Data(external.url.path.utf8))
+        XCTAssertEqual(recent.first?.packageBookmarkData, opened.packageBookmarkData)
+        XCTAssertEqual(recent.first?.packageURL.standardizedFileURL, external.url.standardizedFileURL)
+        XCTAssertGreaterThanOrEqual(bookmarks.resolveCount, 1)
+    }
+
     func testCreateProjectAtomicallyBuildsAutosavedPackageUnderApplicationSupport() async throws {
         let support = try TemporaryDirectory.make()
         let projectID = UUID(uuidString: "00000000-0000-0000-0000-000000000101")!
@@ -30,6 +50,45 @@ final class ManagedProjectStoreTests: XCTestCase {
             ["Manifest.json", "Frames", "Predictions", "Points", "Logs"]
         )
         XCTAssertEqual(try partialFiles(beneath: support.url), [])
+    }
+
+    func testRecordingProjectAtomicallyPersistsBookmarkFingerprintAndSamplingPlan() async throws {
+        let support = try TemporaryDirectory.make()
+        let store = ManagedProjectStore(applicationSupportDirectory: support.url)
+        let source = RecordingSourceReference(
+            bookmarkData: Data("video-bookmark".utf8),
+            originalFilename: "Atrium.mov",
+            fingerprint: RecordingSourceFingerprint(
+                byteCount: 1_024,
+                sha256: String(repeating: "d", count: 64)
+            ),
+            durationSeconds: 11,
+            framesPerSecond: 2,
+            expectedSampleCount: 22,
+            nextSampleOrdinal: 0
+        )
+
+        let project = try await store.createRecordingProject(
+            sourceName: "Atrium.mov",
+            source: source
+        )
+
+        XCTAssertEqual(project.manifest.recordingSource, source)
+        XCTAssertEqual(try ProjectManifest.load(from: project.packageURL).recordingSource, source)
+    }
+
+    func testCameraProjectPersistsPreflightSelection() async throws {
+        let support = try TemporaryDirectory.make()
+        let store = ManagedProjectStore(applicationSupportDirectory: support.url)
+        let source = CameraSourceReference(deviceID: "camera-42", deviceName: "Studio Camera")
+
+        let project = try await store.createCameraProject(
+            sourceName: "Studio Camera Capture",
+            source: source
+        )
+
+        XCTAssertEqual(project.manifest.cameraSource, source)
+        XCTAssertEqual(try ProjectManifest.load(from: project.packageURL).cameraSource, source)
     }
 
     func testOpenProjectLoadsCommittedManifestAndRefreshesRecentState() async throws {
@@ -97,6 +156,23 @@ final class ManagedProjectStoreTests: XCTestCase {
         return enumerator.compactMap { ($0 as? URL)?.lastPathComponent }
             .filter { $0.hasSuffix(".partial") }
             .sorted()
+    }
+}
+
+private final class ProjectBookmarkHarness: SecurityScopedBookmarking, @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedResolveCount = 0
+
+    var resolveCount: Int { lock.withLock { storedResolveCount } }
+
+    func makeBookmark(for url: URL) throws -> Data { Data(url.path.utf8) }
+
+    func resolve(_ bookmark: Data) throws -> SecurityScopedBookmarkResolution {
+        lock.withLock { storedResolveCount += 1 }
+        return SecurityScopedBookmarkResolution(
+            url: URL(filePath: String(decoding: bookmark, as: UTF8.self), directoryHint: .isDirectory),
+            isStale: false
+        )
     }
 }
 

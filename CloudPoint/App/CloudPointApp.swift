@@ -13,7 +13,7 @@ struct CloudPointApp: App {
             CommandGroup(replacing: .newItem) {
                 Button("Open Video…") { coordinator.chooseVideo() }
                     .keyboardShortcut("o", modifiers: .command)
-                Button("Use Camera") { coordinator.useCamera() }
+                Button("Use Camera") { Task { await coordinator.useCamera() } }
                 Divider()
                 Button("Open CloudPoint Project…") { coordinator.chooseProject() }
                     .keyboardShortcut("o", modifiers: [.command, .option])
@@ -35,6 +35,7 @@ private struct CloudPointRootView: View {
                 WorkspaceView(
                     document: CloudPointDocument(manifest: launch.manifest),
                     packageURL: launch.packageURL,
+                    packageBookmarkData: launch.packageBookmarkData,
                     initialSource: launch.initialSource,
                     sourceTitle: launch.sourceTitle,
                     onOpenVideo: coordinator.chooseVideo,

@@ -2,6 +2,39 @@ import XCTest
 @testable import CloudPoint
 
 final class ProjectManifestTests: XCTestCase {
+    func testRecordingSourceCursorRoundTripsAndRejectsOutOfRangeProgress() throws {
+        var manifest = ProjectManifest.fixture()
+        manifest.recordingSource = RecordingSourceReference(
+            bookmarkData: Data("bookmark".utf8),
+            originalFilename: "Atrium.mov",
+            fingerprint: RecordingSourceFingerprint(
+                byteCount: 42,
+                sha256: String(repeating: "a", count: 64)
+            ),
+            durationSeconds: 5,
+            framesPerSecond: 2,
+            expectedSampleCount: 10,
+            nextSampleOrdinal: 4
+        )
+        manifest.frames = (0..<4).map {
+            PersistedFrame(
+                index: UInt32($0),
+                sourceTimestamp: Double($0) / 2,
+                relativePath: String(format: "Frames/%08u.jpg", $0)
+            )
+        }
+        manifest.sessionState = SessionState(phase: .importing, capturedCount: 4)
+
+        let decoded = try ProjectManifest.decode(ProjectManifest.encode(manifest))
+
+        XCTAssertEqual(decoded.recordingSource, manifest.recordingSource)
+
+        manifest.recordingSource?.nextSampleOrdinal = 11
+        XCTAssertThrowsError(try ProjectManifest.validate(manifest)) {
+            XCTAssertEqual($0 as? ProjectManifestError, .invalidRecordingSource)
+        }
+    }
+
     func testManifestEnforcesDurableAndCommittedCounterOwnership() throws {
         var capturedMismatch = ProjectManifest.fixture()
         capturedMismatch.frames = [.fixture(index: 0)]

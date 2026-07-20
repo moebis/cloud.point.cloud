@@ -78,8 +78,49 @@ struct AVFoundationVideoMetadataProbe: VideoMetadataProbing {
 }
 
 enum WorkspaceInitialSource: Sendable, Equatable {
-    case recording(URL, framesPerSecond: Int)
-    case camera
+    case recording(URL, framesPerSecond: Int, expectedSampleCount: UInt64)
+    case camera(deviceID: String, deviceName: String)
+}
+
+struct CameraPreflightResult: Sendable, Equatable {
+    let deviceID: String
+    let deviceName: String
+}
+
+protocol CameraPreflighting: Sendable {
+    func preflight() async throws -> CameraPreflightResult
+}
+
+enum CameraPreflightError: Error, LocalizedError, Equatable, Sendable {
+    case permissionDenied
+    case noCamera
+
+    var errorDescription: String? {
+        switch self {
+        case .permissionDenied:
+            "Camera access is off. Allow CloudPoint in System Settings, then try again."
+        case .noCamera:
+            "No camera is available. Connect a camera, then try again."
+        }
+    }
+}
+
+struct SystemCameraPreflight: CameraPreflighting {
+    private let authority: any CameraAuthorizing
+
+    init(authority: any CameraAuthorizing = SystemCameraAuthority()) {
+        self.authority = authority
+    }
+
+    func preflight() async throws -> CameraPreflightResult {
+        guard case .authorized = await authority.requestAccess() else {
+            throw CameraPreflightError.permissionDenied
+        }
+        guard let camera = await CameraCatalog.devices().first else {
+            throw CameraPreflightError.noCamera
+        }
+        return CameraPreflightResult(deviceID: camera.id, deviceName: camera.name)
+    }
 }
 
 struct WorkspaceLaunch: Identifiable, Sendable, Equatable {
@@ -88,6 +129,7 @@ struct WorkspaceLaunch: Identifiable, Sendable, Equatable {
     let projectID: UUID
     let sourceTitle: String
     let packageURL: URL
+    let packageBookmarkData: Data?
     let manifest: ProjectManifest
     let initialSource: WorkspaceInitialSource?
 }
@@ -146,18 +188,24 @@ final class AppCoordinator: ObservableObject {
 
     private let projectStore: any ManagedProjectStoring
     private let videoProbe: any VideoMetadataProbing
+    private let recordingSources: any RecordingSourceManaging
+    private let cameraPreflight: any CameraPreflighting
     private let panelPresenter: any InputPanelPresenting
     private var didStart = false
 
     init(
         projectStore: any ManagedProjectStoring,
         videoProbe: any VideoMetadataProbing,
+        recordingSources: any RecordingSourceManaging = SystemRecordingSourceManager(),
+        cameraPreflight: any CameraPreflighting = SystemCameraPreflight(),
         panelPresenter: any InputPanelPresenting = SystemInputPanelPresenter(),
         engineState: WelcomeEngineState = .setupRequired,
         initialError: String? = nil
     ) {
         self.projectStore = projectStore
         self.videoProbe = videoProbe
+        self.recordingSources = recordingSources
+        self.cameraPreflight = cameraPreflight
         self.panelPresenter = panelPresenter
         self.engineState = engineState
         errorMessage = initialError
@@ -194,8 +242,8 @@ final class AppCoordinator: ObservableObject {
         Task { await openInput(url) }
     }
 
-    func useCamera() {
-        Task { await createCameraProject() }
+    func useCamera() async {
+        await createCameraProject()
     }
 
     func openInput(_ url: URL) async {
@@ -232,16 +280,25 @@ final class AppCoordinator: ObservableObject {
 
     private func openVideo(_ url: URL) async {
         await performRoute {
-            _ = try await videoProbe.probe(
+            let probe = try await videoProbe.probe(
                 url,
                 framesPerSecond: Self.defaultSamplingRate
             )
-            let project = try await projectStore.createProject(sourceName: url.lastPathComponent)
+            let reference = try await recordingSources.makeReference(
+                for: url,
+                probe: probe,
+                framesPerSecond: Self.defaultSamplingRate
+            )
+            let project = try await projectStore.createRecordingProject(
+                sourceName: url.lastPathComponent,
+                source: reference
+            )
             destination = .workspace(Self.launch(
                 project,
                 initialSource: .recording(
                     url,
-                    framesPerSecond: Self.defaultSamplingRate
+                    framesPerSecond: Self.defaultSamplingRate,
+                    expectedSampleCount: UInt64(probe.sampledFrameCount)
                 )
             ))
         }
@@ -256,8 +313,22 @@ final class AppCoordinator: ObservableObject {
 
     private func createCameraProject() async {
         await performRoute {
-            let project = try await projectStore.createProject(sourceName: "Camera Capture")
-            destination = .workspace(Self.launch(project, initialSource: .camera))
+            let preflight = try await cameraPreflight.preflight()
+            let source = CameraSourceReference(
+                deviceID: preflight.deviceID,
+                deviceName: preflight.deviceName
+            )
+            let project = try await projectStore.createCameraProject(
+                sourceName: "\(preflight.deviceName) Capture",
+                source: source
+            )
+            destination = .workspace(Self.launch(
+                project,
+                initialSource: .camera(
+                    deviceID: preflight.deviceID,
+                    deviceName: preflight.deviceName
+                )
+            ))
         }
     }
 
@@ -287,6 +358,7 @@ final class AppCoordinator: ObservableObject {
             projectID: project.id,
             sourceTitle: project.displayName,
             packageURL: project.packageURL,
+            packageBookmarkData: project.packageBookmarkData,
             manifest: project.manifest,
             initialSource: initialSource
         )
@@ -299,6 +371,14 @@ private actor UnavailableManagedProjectStore: ManagedProjectStoring {
     init(error: Error) { self.error = error }
 
     func createProject(sourceName: String) throws -> ManagedProject { throw error }
+    func createRecordingProject(
+        sourceName: String,
+        source: RecordingSourceReference
+    ) throws -> ManagedProject { throw error }
+    func createCameraProject(
+        sourceName: String,
+        source: CameraSourceReference
+    ) throws -> ManagedProject { throw error }
     func openProject(at url: URL) throws -> ManagedProject { throw error }
     func recentProjects() throws -> [RecentProject] { throw error }
 }

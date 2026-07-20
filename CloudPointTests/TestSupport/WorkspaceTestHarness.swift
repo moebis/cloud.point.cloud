@@ -267,11 +267,33 @@ struct HarnessRecordingImporter: RecordingImporting {
         from recordingURL: URL,
         into packageURL: URL,
         startingIndex: UInt32,
+        startingSampleOrdinal: UInt64,
         framesPerSecond: Int,
         receive: @escaping @Sendable (PersistedFrame) async throws -> Void
     ) async throws {
         for frame in frames { try await receive(frame) }
     }
+}
+
+actor CursorRecordingImporter: RecordingImporting {
+    private let frames: [PersistedFrame]
+    private var ordinals: [UInt64] = []
+
+    init(frames: [PersistedFrame]) { self.frames = frames }
+
+    func importFrames(
+        from recordingURL: URL,
+        into packageURL: URL,
+        startingIndex: UInt32,
+        startingSampleOrdinal: UInt64,
+        framesPerSecond: Int,
+        receive: @escaping @Sendable (PersistedFrame) async throws -> Void
+    ) async throws {
+        ordinals.append(startingSampleOrdinal)
+        for frame in frames { try await receive(frame) }
+    }
+
+    func requestedOrdinals() -> [UInt64] { ordinals }
 }
 
 actor BlockingRecordingImporter: RecordingImporting {
@@ -300,6 +322,7 @@ actor BlockingRecordingImporter: RecordingImporting {
         from recordingURL: URL,
         into packageURL: URL,
         startingIndex: UInt32,
+        startingSampleOrdinal: UInt64,
         framesPerSecond: Int,
         receive: @escaping @Sendable (PersistedFrame) async throws -> Void
     ) async throws {
