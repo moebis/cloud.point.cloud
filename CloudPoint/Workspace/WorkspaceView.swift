@@ -17,6 +17,7 @@ struct WorkspaceView: View {
         packageBookmarkData: Data? = nil,
         initialSource: WorkspaceInitialSource? = nil,
         sourceTitle: String = "CloudPoint Project",
+        engineFactory: (@Sendable () throws -> any ReconstructionEngine)? = nil,
         onOpenVideo: @escaping () -> Void = {},
         onRepairModel: @escaping () -> Void = {},
         onShowWelcome: @escaping () -> Void = {}
@@ -30,6 +31,7 @@ struct WorkspaceView: View {
                 packageURL: packageURL,
                 packageBookmarkData: packageBookmarkData,
                 initialSource: initialSource,
+                engineFactory: engineFactory,
                 onChooseAnotherVideo: onOpenVideo,
                 onRepairModel: onRepairModel
             )
@@ -43,10 +45,14 @@ struct WorkspaceView: View {
 
             viewport
                 .frame(minWidth: 520)
+
+            if inspectorPresented {
+                inspector
+                    .frame(minWidth: 250, idealWidth: 290, maxWidth: 360)
+            }
         }
         .frame(minWidth: 820, minHeight: 600)
         .background(Color(nsColor: .windowBackgroundColor))
-        .inspector(isPresented: $inspectorPresented) { inspector }
         .task { viewModel.start() }
         .background {
             WorkspaceWindowCloseGuard(isEnabled: viewModel.requiresCloseConfirmation) { close in
@@ -218,7 +224,7 @@ struct WorkspaceView: View {
             .disabled(viewModel.snapshot.isCapturing)
 
             Stepper(
-                "Sampling: (viewModel.snapshot.samplingRate) fps",
+                "Sampling: \(viewModel.snapshot.samplingRate) fps",
                 value: Binding(
                     get: { viewModel.snapshot.samplingRate },
                     set: { viewModel.setSamplingRate($0) }
@@ -405,6 +411,23 @@ struct WorkspaceView: View {
                 )
                 .allowsHitTesting(false)
             }
+
+            if viewModel.snapshot.processedCount > 0 {
+                Label(
+                    "Drag to orbit  •  Shift-drag to pan  •  Scroll to zoom",
+                    systemImage: "move.3d"
+                )
+                .font(.caption.weight(.medium))
+                .foregroundStyle(.white.opacity(0.76))
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(.ultraThinMaterial, in: Capsule())
+                .padding(18)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+                .allowsHitTesting(false)
+                .accessibilityLabel("Point cloud controls")
+                .accessibilityValue("Drag to orbit. Shift-drag to pan. Scroll to zoom.")
+            }
         }
         .background(
             LinearGradient(
@@ -494,7 +517,6 @@ struct WorkspaceView: View {
             }
         }
         .formStyle(.grouped)
-        .inspectorColumnWidth(min: 250, ideal: 290, max: 360)
     }
 
     private var sourceIcon: String {

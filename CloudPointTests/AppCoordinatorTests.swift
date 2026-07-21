@@ -143,6 +143,102 @@ final class AppCoordinatorTests: XCTestCase {
         }
         XCTAssertNil(launch.initialSource)
     }
+
+    func testMissingModelDefersVideoProjectCreationAndPresentsSetup() async {
+        let video = URL(filePath: "/tmp/pending.mov")
+        let store = CoordinatorStore(project: .fixture())
+        let installer = CoordinatorModelInstaller(health: .absent)
+        let coordinator = AppCoordinator(
+            projectStore: store,
+            videoProbe: CoordinatorVideoProbe(
+                result: VideoProbeResult(durationSeconds: 2, sampledFrameCount: 4)
+            ),
+            recordingSources: CoordinatorRecordingSources(),
+            modelInstaller: installer,
+            engineContext: .fixture()
+        )
+        await coordinator.start()
+
+        await coordinator.openInput(video)
+
+        let requestedSourceNames = await store.requestedSourceNames()
+        XCTAssertEqual(requestedSourceNames, [])
+        XCTAssertEqual(coordinator.destination, .welcome)
+        XCTAssertEqual(coordinator.engineState, .setupRequired)
+        XCTAssertTrue(coordinator.isModelSetupPresented)
+    }
+
+    func testMissingModelDefersIncompleteProjectWorkspaceAndPresentsSetup() async {
+        let package = URL(filePath: "/tmp/Pending.cloudpoint", directoryHint: .isDirectory)
+        let store = CoordinatorStore(project: .fixture(packageURL: package))
+        let installer = CoordinatorModelInstaller(health: .absent)
+        let coordinator = AppCoordinator(
+            projectStore: store,
+            videoProbe: CoordinatorVideoProbe(
+                result: VideoProbeResult(durationSeconds: 2, sampledFrameCount: 4)
+            ),
+            modelInstaller: installer,
+            engineContext: .fixture()
+        )
+        await coordinator.start()
+
+        await coordinator.openInput(package)
+
+        let openedURLs = await store.requestedProjectURLs()
+        XCTAssertEqual(openedURLs, [package])
+        XCTAssertEqual(coordinator.destination, .welcome)
+        XCTAssertEqual(coordinator.engineState, .setupRequired)
+        XCTAssertTrue(coordinator.isModelSetupPresented)
+    }
+
+    func testCompletedProjectOpensForViewingWithoutInstalledModel() async {
+        let package = URL(filePath: "/tmp/Complete.cloudpoint", directoryHint: .isDirectory)
+        var manifest = ProjectManifest()
+        manifest.sessionState = SessionState(phase: .completed)
+        let store = CoordinatorStore(
+            project: .fixture(packageURL: package, manifest: manifest)
+        )
+        let coordinator = AppCoordinator(
+            projectStore: store,
+            videoProbe: CoordinatorVideoProbe(
+                result: VideoProbeResult(durationSeconds: 2, sampledFrameCount: 4)
+            ),
+            modelInstaller: CoordinatorModelInstaller(health: .absent),
+            engineContext: .fixture()
+        )
+        await coordinator.start()
+
+        await coordinator.openInput(package)
+
+        guard case let .workspace(launch) = coordinator.destination else {
+            return XCTFail("Expected the completed project workspace")
+        }
+        XCTAssertEqual(launch.packageURL, package)
+        XCTAssertFalse(coordinator.isModelSetupPresented)
+    }
+
+    func testReadyModelPublishesEngineStateAndAllowsVideoRoute() async {
+        let video = URL(filePath: "/tmp/ready.mov")
+        let store = CoordinatorStore(project: .fixture())
+        let installer = CoordinatorModelInstaller(health: .ready(.fixture()))
+        let coordinator = AppCoordinator(
+            projectStore: store,
+            videoProbe: CoordinatorVideoProbe(
+                result: VideoProbeResult(durationSeconds: 2, sampledFrameCount: 4)
+            ),
+            recordingSources: CoordinatorRecordingSources(),
+            modelInstaller: installer,
+            engineContext: .fixture()
+        )
+        await coordinator.start()
+
+        await coordinator.openInput(video)
+
+        let requestedSourceNames = await store.requestedSourceNames()
+        XCTAssertEqual(requestedSourceNames, ["ready.mov"])
+        XCTAssertEqual(coordinator.engineState, .ready)
+        XCTAssertFalse(coordinator.isModelSetupPresented)
+    }
 }
 
 private actor CoordinatorStore: ManagedProjectStoring {
@@ -254,15 +350,53 @@ private actor CoordinatorCameraPreflight: CameraPreflighting {
     func requestCount() -> Int { requests }
 }
 
+private actor CoordinatorModelInstaller: ModelInstalling {
+    let currentHealth: ModelHealth
+
+    init(health: ModelHealth) { currentHealth = health }
+
+    func health() -> ModelHealth { currentHealth }
+
+    func prepare() -> AsyncThrowingStream<ModelSetupEvent, Error> {
+        AsyncThrowingStream { continuation in continuation.finish() }
+    }
+
+    func cancel() {}
+}
+
+private extension ModelInstallation {
+    static func fixture() -> ModelInstallation {
+        ModelInstallation(
+            directory: URL(filePath: "/tmp/model", directoryHint: .isDirectory),
+            sourceRevision: "fixture",
+            sourceSHA256: String(repeating: "a", count: 64),
+            convertedSHA256: String(repeating: "b", count: 64),
+            engineVersion: "fixture"
+        )
+    }
+}
+
+private extension ProductionReconstructionContext {
+    static func fixture() -> ProductionReconstructionContext {
+        ProductionReconstructionContext(
+            runtime: .unchecked(
+                root: URL(filePath: "/tmp/runtime", directoryHint: .isDirectory)
+            ),
+            modelDirectory: URL(filePath: "/tmp/model", directoryHint: .isDirectory)
+        )
+    }
+}
+
 private extension ManagedProject {
     static func fixture(
-        packageURL: URL = URL(filePath: "/tmp/Test.cloudpoint", directoryHint: .isDirectory)
+        packageURL: URL = URL(filePath: "/tmp/Test.cloudpoint", directoryHint: .isDirectory),
+        manifest: ProjectManifest = ProjectManifest()
     ) -> ManagedProject {
         ManagedProject(
             id: UUID(uuidString: "00000000-0000-0000-0000-000000000122")!,
             displayName: "Test",
             packageURL: packageURL,
-            manifest: ProjectManifest(),
+            manifest: manifest,
             lastOpenedAt: Date(timeIntervalSinceReferenceDate: 1)
         )
     }

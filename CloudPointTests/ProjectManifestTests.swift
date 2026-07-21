@@ -2,6 +2,17 @@ import XCTest
 @testable import CloudPoint
 
 final class ProjectManifestTests: XCTestCase {
+    func testManifestEncodesProjectIDAsLowercaseCanonicalUUIDForWorker() throws {
+        var manifest = ProjectManifest.fixture()
+        manifest.projectID = UUID(uuidString: "ABCDEF01-2345-4678-9ABC-DEF012345678")!
+
+        let data = try ProjectManifest.encode(manifest)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+
+        XCTAssertEqual(object["projectID"] as? String, "abcdef01-2345-4678-9abc-def012345678")
+        XCTAssertEqual(try ProjectManifest.decode(data).projectID, manifest.projectID)
+    }
+
     func testRecordingSourceCursorRoundTripsAndRejectsOutOfRangeProgress() throws {
         var manifest = ProjectManifest.fixture()
         manifest.recordingSource = RecordingSourceReference(

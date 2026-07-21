@@ -170,6 +170,7 @@ final class WorkspaceViewModel: ObservableObject {
         panelPresenter: any InputPanelPresenting = SystemInputPanelPresenter(),
         bookmarks: any SecurityScopedBookmarking = SystemSecurityScopedBookmarks(),
         packageScope: any SecurityScopedResourceAccessing = SystemSecurityScopedResourceAccess(),
+        engineFactory injectedEngineFactory: (@Sendable () throws -> any ReconstructionEngine)? = nil,
         onChooseAnotherVideo: @escaping () -> Void = {},
         onRepairModel: @escaping () -> Void = {},
         arguments: [String] = ProcessInfo.processInfo.arguments
@@ -267,18 +268,24 @@ final class WorkspaceViewModel: ObservableObject {
                 }
             }
         )
+        let reconstructionEngineFactory: @Sendable () throws -> any ReconstructionEngine
+        if let injectedEngineFactory {
+            reconstructionEngineFactory = injectedEngineFactory
+        } else {
+            reconstructionEngineFactory = {
+#if DEBUG
+                guard useMock else { throw SessionControllerError.engineUnavailable }
+                return MockReconstructionEngine()
+#else
+                throw SessionControllerError.engineUnavailable
+#endif
+            }
+        }
         controller = SessionController(
             manifest: document.manifest,
             packageURL: resolvedPackageURL,
             dependencies: SessionControllerDependencies(
-                engineFactory: {
-#if DEBUG
-                    guard useMock else { throw SessionControllerError.engineUnavailable }
-                    return MockReconstructionEngine()
-#else
-                    throw SessionControllerError.engineUnavailable
-#endif
-                },
+                engineFactory: reconstructionEngineFactory,
                 cameraFactory: { packageURL, startingIndex in
                     CameraFrameSource(
                         persistence: try JPEGFramePersistence(packageURL: packageURL),

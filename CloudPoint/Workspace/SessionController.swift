@@ -1,6 +1,12 @@
 @preconcurrency import AVFoundation
 import Darwin
 import Foundation
+import OSLog
+
+private let cloudPointSessionLogger = Logger(
+    subsystem: "cloud.point.cloud.CloudPoint",
+    category: "ReconstructionSession"
+)
 import ImageIO
 
 private final class WeakSessionController: @unchecked Sendable {
@@ -967,6 +973,9 @@ final class SessionController: @unchecked Sendable {
         }
         let importer = dependencies.recordingImporter
         let startingSampleOrdinal = manifest.recordingSource?.nextSampleOrdinal ?? 0
+        cloudPointSessionLogger.info(
+            "Starting recording import generation \(activeSourceGeneration) at frame \(startingIndex), sample \(startingSampleOrdinal)"
+        )
         recordingTask?.cancel()
         recordingTaskSourceGeneration = activeSourceGeneration
         recordingTask = Task { [weak self] in
@@ -1603,6 +1612,10 @@ final class SessionController: @unchecked Sendable {
     private func failDurably(_ error: Error, generation: UInt64) async {
         guard generation == self.generation, !closed else { return }
         guard !engineInterruptions.hasPendingRequest(for: generation) else { return }
+        let diagnostic = String(reflecting: error)
+        cloudPointSessionLogger.error(
+            "Reconstruction failed: \(diagnostic, privacy: .public)"
+        )
         errorText = error.localizedDescription
         engineReady = false
         engineInterruptions.clearActiveEngine(generation: generation)

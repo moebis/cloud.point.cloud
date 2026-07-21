@@ -38,7 +38,9 @@ private struct CloudPointRootView: View {
                     packageBookmarkData: launch.packageBookmarkData,
                     initialSource: launch.initialSource,
                     sourceTitle: launch.sourceTitle,
+                    engineFactory: coordinator.reconstructionEngineFactory,
                     onOpenVideo: coordinator.chooseVideo,
+                    onRepairModel: coordinator.repairModel,
                     onShowWelcome: coordinator.showWelcome
                 )
                 .id(launch.id)
@@ -47,6 +49,13 @@ private struct CloudPointRootView: View {
         .task { await coordinator.start() }
         .onOpenURL { url in
             Task { await coordinator.openExternalURL(url) }
+        }
+        .sheet(isPresented: $coordinator.isModelSetupPresented) {
+            if let model = coordinator.modelSetupViewModel {
+                ModelSetupView(model: model) {
+                    Task { await coordinator.continueAfterModelSetup() }
+                }
+            }
         }
     }
 }

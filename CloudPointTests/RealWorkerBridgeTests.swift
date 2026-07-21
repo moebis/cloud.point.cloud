@@ -6,7 +6,10 @@ final class RealWorkerBridgeTests: XCTestCase {
     func testPreparedLingbotWorkerCompletesNineFrameFixture() async throws {
         let environment = ProcessInfo.processInfo.environment
         guard let runtimePath = environment["CLOUDPOINT_WORKER_RUNTIME"],
-              let modelPath = environment["CLOUDPOINT_REAL_MODEL_DIR"] else {
+              let modelPath = environment["CLOUDPOINT_REAL_MODEL_DIR"],
+              runtimePath.hasPrefix("/"),
+              modelPath.hasPrefix("/"),
+              FileManager.default.fileExists(atPath: modelPath) else {
             throw XCTSkip(
                 "Set CLOUDPOINT_WORKER_RUNTIME and CLOUDPOINT_REAL_MODEL_DIR for the real MLX bridge test"
             )

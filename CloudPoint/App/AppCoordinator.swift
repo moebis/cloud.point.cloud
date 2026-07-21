@@ -180,18 +180,30 @@ final class AppCoordinator: ObservableObject {
 
     static let defaultSamplingRate = 2
 
+    private enum PendingModelRoute {
+        case recording(URL, VideoProbeResult)
+        case camera(CameraPreflightResult)
+        case project(URL)
+    }
+
     @Published private(set) var destination: Destination = .welcome
     @Published private(set) var recentProjects: [RecentProject] = []
     @Published private(set) var isBusy = false
     @Published private(set) var errorMessage: String?
     @Published var engineState: WelcomeEngineState
+    @Published var isModelSetupPresented = false
+
+    let modelSetupViewModel: ModelSetupViewModel?
 
     private let projectStore: any ManagedProjectStoring
     private let videoProbe: any VideoMetadataProbing
     private let recordingSources: any RecordingSourceManaging
     private let cameraPreflight: any CameraPreflighting
     private let panelPresenter: any InputPanelPresenting
+    private let modelInstaller: (any ModelInstalling)?
+    private let engineContext: ProductionReconstructionContext?
     private var didStart = false
+    private var pendingModelRoute: PendingModelRoute?
 
     init(
         projectStore: any ManagedProjectStoring,
@@ -199,6 +211,8 @@ final class AppCoordinator: ObservableObject {
         recordingSources: any RecordingSourceManaging = SystemRecordingSourceManager(),
         cameraPreflight: any CameraPreflighting = SystemCameraPreflight(),
         panelPresenter: any InputPanelPresenting = SystemInputPanelPresenter(),
+        modelInstaller: (any ModelInstalling)? = nil,
+        engineContext: ProductionReconstructionContext? = nil,
         engineState: WelcomeEngineState = .setupRequired,
         initialError: String? = nil
     ) {
@@ -207,16 +221,47 @@ final class AppCoordinator: ObservableObject {
         self.recordingSources = recordingSources
         self.cameraPreflight = cameraPreflight
         self.panelPresenter = panelPresenter
+        self.modelInstaller = modelInstaller
+        self.engineContext = engineContext
+        modelSetupViewModel = modelInstaller.map(ModelSetupViewModel.init(installer:))
         self.engineState = engineState
         errorMessage = initialError
     }
 
     static func live() -> AppCoordinator {
         do {
-            return AppCoordinator(
-                projectStore: try ManagedProjectStore.live(),
-                videoProbe: AVFoundationVideoMetadataProbe()
-            )
+            let store = try ManagedProjectStore.live()
+            do {
+                let runtime = try WorkerRuntime.resolve(
+                    bundleValue: Bundle.main.object(
+                        forInfoDictionaryKey: "CloudPointWorkerRuntime"
+                    ) as? String,
+                    environment: ProcessInfo.processInfo.environment
+                )
+                let directories = try ModelDirectories.live()
+                let installer = ModelInstaller(
+                    directories: directories,
+                    downloader: URLSessionModelDownloader(),
+                    converter: ProcessModelConverter(runtime: runtime)
+                )
+                return AppCoordinator(
+                    projectStore: store,
+                    videoProbe: AVFoundationVideoMetadataProbe(),
+                    modelInstaller: installer,
+                    engineContext: ProductionReconstructionContext(
+                        runtime: runtime,
+                        modelDirectory: directories.converted
+                    )
+                )
+            } catch {
+                return AppCoordinator(
+                    projectStore: store,
+                    videoProbe: AVFoundationVideoMetadataProbe(),
+                    modelInstaller: UnavailableModelInstaller(error: error),
+                    engineState: .repairRequired,
+                    initialError: "The CloudPoint MLX runtime is unavailable. Reinstall or rebuild the app."
+                )
+            }
         } catch {
             return AppCoordinator(
                 projectStore: UnavailableManagedProjectStore(error: error),
@@ -229,6 +274,7 @@ final class AppCoordinator: ObservableObject {
     func start() async {
         guard !didStart else { return }
         didStart = true
+        await refreshEngineHealth()
         await refreshRecentProjects()
     }
 
@@ -278,57 +324,139 @@ final class AppCoordinator: ObservableObject {
         Task { await refreshRecentProjects() }
     }
 
+    func repairModel() {
+        pendingModelRoute = nil
+        isModelSetupPresented = true
+    }
+
+    func continueAfterModelSetup() async {
+        await refreshEngineHealth()
+        guard engineState == .ready, engineContext != nil else { return }
+        isModelSetupPresented = false
+        let route = pendingModelRoute
+        pendingModelRoute = nil
+        guard let route else { return }
+        await performRoute {
+            switch route {
+            case let .recording(url, probe):
+                try await finishOpenVideo(url, probe: probe)
+            case let .camera(preflight):
+                try await finishCameraProject(preflight)
+            case let .project(url):
+                try await finishOpenProject(url)
+            }
+        }
+    }
+
+    var reconstructionEngineFactory: @Sendable () throws -> any ReconstructionEngine {
+        guard let engineContext else {
+            return { throw SessionControllerError.engineUnavailable }
+        }
+        return { try engineContext.makeEngine() }
+    }
+
     private func openVideo(_ url: URL) async {
         await performRoute {
             let probe = try await videoProbe.probe(
                 url,
                 framesPerSecond: Self.defaultSamplingRate
             )
-            let reference = try await recordingSources.makeReference(
-                for: url,
-                probe: probe,
-                framesPerSecond: Self.defaultSamplingRate
-            )
-            let project = try await projectStore.createRecordingProject(
-                sourceName: url.lastPathComponent,
-                source: reference
-            )
-            destination = .workspace(Self.launch(
-                project,
-                initialSource: .recording(
-                    url,
-                    framesPerSecond: Self.defaultSamplingRate,
-                    expectedSampleCount: UInt64(probe.sampledFrameCount)
-                )
-            ))
+            guard await requireReadyModel(for: .recording(url, probe)) else { return }
+            try await finishOpenVideo(url, probe: probe)
         }
+    }
+
+    private func finishOpenVideo(_ url: URL, probe: VideoProbeResult) async throws {
+        let reference = try await recordingSources.makeReference(
+            for: url,
+            probe: probe,
+            framesPerSecond: Self.defaultSamplingRate
+        )
+        let project = try await projectStore.createRecordingProject(
+            sourceName: url.lastPathComponent,
+            source: reference
+        )
+        destination = .workspace(Self.launch(
+            project,
+            initialSource: .recording(
+                url,
+                framesPerSecond: Self.defaultSamplingRate,
+                expectedSampleCount: UInt64(probe.sampledFrameCount)
+            )
+        ))
     }
 
     private func openProject(_ url: URL) async {
         await performRoute {
             let project = try await projectStore.openProject(at: url)
+            let phase = project.manifest.sessionState.phase
+            if ![SessionPhase.completed, .cancelled, .failed].contains(phase) {
+                guard await requireReadyModel(for: .project(url)) else { return }
+            }
             destination = .workspace(Self.launch(project, initialSource: nil))
         }
+    }
+
+    private func finishOpenProject(_ url: URL) async throws {
+        let project = try await projectStore.openProject(at: url)
+        destination = .workspace(Self.launch(project, initialSource: nil))
     }
 
     private func createCameraProject() async {
         await performRoute {
             let preflight = try await cameraPreflight.preflight()
-            let source = CameraSourceReference(
+            guard await requireReadyModel(for: .camera(preflight)) else { return }
+            try await finishCameraProject(preflight)
+        }
+    }
+
+    private func finishCameraProject(_ preflight: CameraPreflightResult) async throws {
+        let source = CameraSourceReference(
+            deviceID: preflight.deviceID,
+            deviceName: preflight.deviceName
+        )
+        let project = try await projectStore.createCameraProject(
+            sourceName: "\(preflight.deviceName) Capture",
+            source: source
+        )
+        destination = .workspace(Self.launch(
+            project,
+            initialSource: .camera(
                 deviceID: preflight.deviceID,
                 deviceName: preflight.deviceName
             )
-            let project = try await projectStore.createCameraProject(
-                sourceName: "\(preflight.deviceName) Capture",
-                source: source
-            )
-            destination = .workspace(Self.launch(
-                project,
-                initialSource: .camera(
-                    deviceID: preflight.deviceID,
-                    deviceName: preflight.deviceName
-                )
-            ))
+        ))
+    }
+
+    private func requireReadyModel(for route: PendingModelRoute) async -> Bool {
+        guard modelInstaller != nil else { return true }
+        await refreshEngineHealth()
+        guard engineState == .ready, engineContext != nil else {
+            pendingModelRoute = route
+            isModelSetupPresented = true
+            return false
+        }
+        return true
+    }
+
+    private func refreshEngineHealth() async {
+        guard let modelInstaller else { return }
+        engineState = Self.welcomeState(for: await modelInstaller.health())
+    }
+
+    private static func welcomeState(for health: ModelHealth) -> WelcomeEngineState {
+        switch health {
+        case .absent: .setupRequired
+        case let .preparing(event):
+            switch event {
+            case let .downloading(received, expected),
+                 let .verifying(received, expected):
+                .downloading(progress: expected > 0 ? Double(received) / Double(expected) : 0)
+            case .converting, .validating: .converting(progress: 0)
+            case .ready: .ready
+            }
+        case .ready: .ready
+        case .invalid: .repairRequired
         }
     }
 
@@ -381,4 +509,20 @@ private actor UnavailableManagedProjectStore: ManagedProjectStoring {
     ) throws -> ManagedProject { throw error }
     func openProject(at url: URL) throws -> ManagedProject { throw error }
     func recentProjects() throws -> [RecentProject] { throw error }
+}
+
+private actor UnavailableModelInstaller: ModelInstalling {
+    let error: Error
+
+    init(error: Error) { self.error = error }
+
+    func health() -> ModelHealth {
+        .invalid(.operationFailed(String(describing: error)))
+    }
+
+    func prepare() -> AsyncThrowingStream<ModelSetupEvent, Error> {
+        AsyncThrowingStream { continuation in continuation.finish(throwing: error) }
+    }
+
+    func cancel() {}
 }

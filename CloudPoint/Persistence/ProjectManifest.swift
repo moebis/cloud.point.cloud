@@ -39,6 +39,19 @@ struct CameraSourceReference: Codable, Sendable, Equatable {
 struct ProjectManifest: Codable, Sendable, Equatable {
     static let currentFormatVersion = 2
 
+    private enum CodingKeys: String, CodingKey {
+        case formatVersion
+        case projectID
+        case createdAt
+        case updatedAt
+        case engineConfiguration
+        case recordingSource
+        case cameraSource
+        case frames
+        case completedWindows
+        case sessionState
+    }
+
     var formatVersion: Int
     var projectID: UUID
     var createdAt: Date
@@ -72,6 +85,54 @@ struct ProjectManifest: Codable, Sendable, Equatable {
         self.frames = frames
         self.completedWindows = completedWindows
         self.sessionState = sessionState
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        formatVersion = try container.decode(Int.self, forKey: .formatVersion)
+        let projectIDText = try container.decode(String.self, forKey: .projectID)
+        guard let decodedProjectID = UUID(uuidString: projectIDText) else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .projectID,
+                in: container,
+                debugDescription: "projectID must be a canonical UUID"
+            )
+        }
+        projectID = decodedProjectID
+        createdAt = try container.decode(Date.self, forKey: .createdAt)
+        updatedAt = try container.decode(Date.self, forKey: .updatedAt)
+        engineConfiguration = try container.decode(
+            EngineConfiguration.self,
+            forKey: .engineConfiguration
+        )
+        recordingSource = try container.decodeIfPresent(
+            RecordingSourceReference.self,
+            forKey: .recordingSource
+        )
+        cameraSource = try container.decodeIfPresent(
+            CameraSourceReference.self,
+            forKey: .cameraSource
+        )
+        frames = try container.decode([PersistedFrame].self, forKey: .frames)
+        completedWindows = try container.decode(
+            [CompletedWindow].self,
+            forKey: .completedWindows
+        )
+        sessionState = try container.decode(SessionState.self, forKey: .sessionState)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(formatVersion, forKey: .formatVersion)
+        try container.encode(projectID.uuidString.lowercased(), forKey: .projectID)
+        try container.encode(createdAt, forKey: .createdAt)
+        try container.encode(updatedAt, forKey: .updatedAt)
+        try container.encode(engineConfiguration, forKey: .engineConfiguration)
+        try container.encodeIfPresent(recordingSource, forKey: .recordingSource)
+        try container.encodeIfPresent(cameraSource, forKey: .cameraSource)
+        try container.encode(frames, forKey: .frames)
+        try container.encode(completedWindows, forKey: .completedWindows)
+        try container.encode(sessionState, forKey: .sessionState)
     }
 
     static func load(from packageURL: URL) throws -> ProjectManifest {
