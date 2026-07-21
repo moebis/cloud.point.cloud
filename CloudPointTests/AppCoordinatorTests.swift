@@ -127,6 +127,9 @@ final class AppCoordinatorTests: XCTestCase {
             recordingSources: CoordinatorRecordingSources(),
             videoKeyFrameSelector: selector,
             modelInstaller: CoordinatorModelInstaller(health: .absent),
+            sharpModelInstaller: CoordinatorSharpModelInstaller(
+                health: .ready(.fixture())
+            ),
             engineContext: nil
         )
 
@@ -621,6 +624,23 @@ private actor CoordinatorModelInstaller: ModelInstalling {
     func cancel() {}
 }
 
+private actor CoordinatorSharpModelInstaller: SharpModelInstalling {
+    private let configuredHealth: SharpModelHealth
+
+    init(health: SharpModelHealth) { configuredHealth = health }
+
+    func health() -> SharpModelHealth { configuredHealth }
+
+    func prepare(
+        acceptingLicense: Bool
+    ) -> AsyncThrowingStream<SharpModelSetupEvent, Error> {
+        _ = acceptingLicense
+        return AsyncThrowingStream { continuation in continuation.finish() }
+    }
+
+    func cancel() {}
+}
+
 private extension ModelInstallation {
     static func fixture() -> ModelInstallation {
         ModelInstallation(
@@ -640,6 +660,18 @@ private extension ProductionReconstructionContext {
                 root: URL(filePath: "/tmp/runtime", directoryHint: .isDirectory)
             ),
             modelDirectory: URL(filePath: "/tmp/model", directoryHint: .isDirectory)
+        )
+    }
+}
+
+private extension SharpModelInstallation {
+    static func fixture() -> SharpModelInstallation {
+        let directory = URL(filePath: "/tmp/sharp-model", directoryHint: .isDirectory)
+        return SharpModelInstallation(
+            directory: directory,
+            checkpoint: directory.appending(path: "sharp.pt"),
+            checkpointSHA256: String(repeating: "a", count: 64),
+            sourceCommit: "fixture"
         )
     }
 }

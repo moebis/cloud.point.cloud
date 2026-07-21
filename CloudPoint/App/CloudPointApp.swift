@@ -63,5 +63,12 @@ private struct CloudPointRootView: View {
         )) { request in
             NewReconstructionView(coordinator: coordinator, request: request)
         }
+        .sheet(isPresented: $coordinator.isSharpModelSetupPresented) {
+            if let model = coordinator.sharpModelSetupViewModel {
+                SharpModelSetupView(model: model) {
+                    Task { await coordinator.continueAfterSharpModelSetup() }
+                }
+            }
+        }
     }
 }

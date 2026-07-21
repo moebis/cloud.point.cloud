@@ -217,6 +217,12 @@ final class AppCoordinator: ObservableObject {
         case recent(RecentProject)
     }
 
+    private struct PendingSharpRoute {
+        let url: URL
+        let probe: VideoProbeResult
+        let selectedFrame: VideoKeyFrameCandidate
+    }
+
     private struct WorkspaceIdentity: Equatable {
         let projectID: UUID
         let packageURL: URL
@@ -239,8 +245,10 @@ final class AppCoordinator: ObservableObject {
     @Published private(set) var pendingReconstruction: PendingReconstructionRequest?
     @Published var engineState: WelcomeEngineState
     @Published var isModelSetupPresented = false
+    @Published var isSharpModelSetupPresented = false
 
     let modelSetupViewModel: ModelSetupViewModel?
+    let sharpModelSetupViewModel: SharpModelSetupViewModel?
 
     private let projectStore: any ManagedProjectStoring
     private let videoProbe: any VideoMetadataProbing
@@ -249,9 +257,11 @@ final class AppCoordinator: ObservableObject {
     private let cameraPreflight: any CameraPreflighting
     private let panelPresenter: any InputPanelPresenting
     private let modelInstaller: (any ModelInstalling)?
+    private let sharpModelInstaller: (any SharpModelInstalling)?
     private let engineContext: ProductionReconstructionContext?
     private var didStart = false
     private var pendingModelRoute: PendingModelRoute?
+    private var pendingSharpRoute: PendingSharpRoute?
     private var ownedWorkspace: OwnedWorkspace?
 
     init(
@@ -262,6 +272,8 @@ final class AppCoordinator: ObservableObject {
         cameraPreflight: any CameraPreflighting = SystemCameraPreflight(),
         panelPresenter: any InputPanelPresenting = SystemInputPanelPresenter(),
         modelInstaller: (any ModelInstalling)? = nil,
+        sharpModelInstaller: (any SharpModelInstalling)? = nil,
+        sharpLicenseText: String = "",
         engineContext: ProductionReconstructionContext? = nil,
         engineState: WelcomeEngineState = .setupRequired,
         initialError: String? = nil
@@ -273,8 +285,12 @@ final class AppCoordinator: ObservableObject {
         self.cameraPreflight = cameraPreflight
         self.panelPresenter = panelPresenter
         self.modelInstaller = modelInstaller
+        self.sharpModelInstaller = sharpModelInstaller
         self.engineContext = engineContext
         modelSetupViewModel = modelInstaller.map(ModelSetupViewModel.init(installer:))
+        sharpModelSetupViewModel = sharpModelInstaller.map {
+            SharpModelSetupViewModel(installer: $0, licenseText: sharpLicenseText)
+        }
         self.engineState = engineState
         errorMessage = initialError
     }
@@ -295,10 +311,19 @@ final class AppCoordinator: ObservableObject {
                     downloader: URLSessionModelDownloader(),
                     converter: ProcessModelConverter(runtime: runtime)
                 )
+                let sharpDirectories = try SharpModelDirectories.live()
+                let sharpLicenseText = try SharpModelLicenseAgreement.load()
+                let sharpInstaller = SharpModelInstaller(
+                    directories: sharpDirectories,
+                    downloader: URLSessionModelDownloader(),
+                    licenseText: sharpLicenseText
+                )
                 return AppCoordinator(
                     projectStore: store,
                     videoProbe: AVFoundationVideoMetadataProbe(),
                     modelInstaller: installer,
+                    sharpModelInstaller: sharpInstaller,
+                    sharpLicenseText: sharpLicenseText,
                     engineContext: ProductionReconstructionContext(
                         runtime: runtime,
                         modelDirectory: directories.converted
@@ -402,18 +427,25 @@ final class AppCoordinator: ObservableObject {
             return
         }
         await performRoute {
-            let reference = try await recordingSources.makeReference(
-                for: url,
-                probe: probe,
-                framesPerSecond: Self.defaultSamplingRate
-            )
-            let project = try await projectStore.createSharpRecordingProject(
-                sourceName: url.lastPathComponent,
-                source: reference,
-                selectedFrame: selectedFrame
-            )
-            pendingReconstruction = nil
-            await presentWorkspace(Self.launch(project, initialSource: nil))
+            guard let sharpModelInstaller else {
+                throw SharpModelInstallerError.invalidInstallation
+            }
+            switch await sharpModelInstaller.health() {
+            case .ready:
+                try await finishSharpReconstruction(
+                    url: url,
+                    probe: probe,
+                    selectedFrame: selectedFrame
+                )
+            case .absent, .invalid, .preparing:
+                pendingSharpRoute = PendingSharpRoute(
+                    url: url,
+                    probe: probe,
+                    selectedFrame: selectedFrame
+                )
+                pendingReconstruction = nil
+                isSharpModelSetupPresented = true
+            }
         }
     }
 
@@ -498,6 +530,22 @@ final class AppCoordinator: ObservableObject {
         }
     }
 
+    func continueAfterSharpModelSetup() async {
+        guard let sharpModelInstaller,
+              case .ready = await sharpModelInstaller.health() else { return }
+        isSharpModelSetupPresented = false
+        let route = pendingSharpRoute
+        pendingSharpRoute = nil
+        guard let route else { return }
+        await performRoute {
+            try await finishSharpReconstruction(
+                url: route.url,
+                probe: route.probe,
+                selectedFrame: route.selectedFrame
+            )
+        }
+    }
+
     func workspaceViewModel(for launch: WorkspaceLaunch) -> WorkspaceViewModel {
         let identity = WorkspaceIdentity(
             projectID: launch.projectID,
@@ -560,6 +608,25 @@ final class AppCoordinator: ObservableObject {
                 expectedSampleCount: UInt64(probe.sampledFrameCount)
             )
         ))
+    }
+
+    private func finishSharpReconstruction(
+        url: URL,
+        probe: VideoProbeResult,
+        selectedFrame: VideoKeyFrameCandidate
+    ) async throws {
+        let reference = try await recordingSources.makeReference(
+            for: url,
+            probe: probe,
+            framesPerSecond: Self.defaultSamplingRate
+        )
+        let project = try await projectStore.createSharpRecordingProject(
+            sourceName: url.lastPathComponent,
+            source: reference,
+            selectedFrame: selectedFrame
+        )
+        pendingReconstruction = nil
+        await presentWorkspace(Self.launch(project, initialSource: nil))
     }
 
     private func openProject(_ url: URL) async {

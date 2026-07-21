@@ -208,6 +208,7 @@ final class URLSessionModelDownloader: NSObject, ModelDownloading,
             || host.hasSuffix(".huggingface.co")
             || host == "hf.co"
             || host.hasSuffix(".hf.co")
+            || host == "ml-site.cdn-apple.com"
     }
 
     private static func isCancellation(_ error: Error) -> Bool {
