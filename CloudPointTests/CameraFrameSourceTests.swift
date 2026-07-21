@@ -1216,19 +1216,32 @@ final class CameraFrameSourceTests: XCTestCase {
     func testPreviewLayerTracksSessionResizesAndTearsDown() {
         let first = AVCaptureSession()
         let second = AVCaptureSession()
-        let view = CameraPreviewNSView(session: first)
+        let view = CameraPreviewNSView(session: first, mirrorDisplay: true)
         view.frame = NSRect(x: 0, y: 0, width: 640, height: 360)
         view.layout()
 
         XCTAssertTrue(view.previewLayer.session === first)
         XCTAssertEqual(view.previewLayer.videoGravity, .resizeAspect)
         XCTAssertEqual(view.previewLayer.frame, view.bounds)
+        XCTAssertTrue(view.mirrorDisplay)
 
         view.setSession(second)
         XCTAssertTrue(view.previewLayer.session === second)
+        view.setMirrorDisplay(false)
+        XCTAssertFalse(view.mirrorDisplay)
         view.tearDown()
         XCTAssertNil(view.previewLayer.session)
         XCTAssertNil(view.layer)
+    }
+
+    func testCameraDisplayPolicyMirrorsPreviewButNeverPersistedFrames() {
+        let mirrored = CameraDisplayPolicy(mirrorDisplay: true)
+        let unmirrored = CameraDisplayPolicy(mirrorDisplay: false)
+
+        XCTAssertTrue(mirrored.shouldMirrorVideo(for: .preview))
+        XCTAssertFalse(mirrored.shouldMirrorVideo(for: .frameOutput))
+        XCTAssertFalse(unmirrored.shouldMirrorVideo(for: .preview))
+        XCTAssertFalse(unmirrored.shouldMirrorVideo(for: .frameOutput))
     }
 }
 

@@ -218,6 +218,15 @@ struct WorkspaceView: View {
             )
             .disabled(!viewModel.snapshot.capabilities.canEditSamplingRate)
 
+            Toggle(
+                "Mirror camera view",
+                isOn: Binding(
+                    get: { viewModel.mirrorDisplay },
+                    set: { viewModel.setMirrorDisplay($0) }
+                )
+            )
+            .accessibilityHint("Mirrors the preview and 3D result without changing saved geometry")
+
             if viewModel.snapshot.isCapturing {
                 Button("Stop Capture", systemImage: "stop.fill") { viewModel.stopCapture() }
                     .buttonStyle(.borderedProminent)
@@ -376,7 +385,10 @@ struct WorkspaceView: View {
                viewModel.snapshot.capturedCount == 0 {
                 cameraPreflightSurface
             } else if viewModel.snapshot.isCapturing {
-                CameraPreviewView(session: viewModel.previewSession)
+                CameraPreviewView(
+                    session: viewModel.previewSession,
+                    mirrorDisplay: viewModel.mirrorDisplay
+                )
                     .background(.black)
                     .clipShape(RoundedRectangle(cornerRadius: 14))
                     .overlay {
@@ -431,7 +443,10 @@ struct WorkspaceView: View {
             ZStack {
                 RoundedRectangle(cornerRadius: 22)
                     .fill(.black.opacity(0.5))
-                CameraPreviewView(session: viewModel.preflightPreviewSession)
+                CameraPreviewView(
+                    session: viewModel.preflightPreviewSession,
+                    mirrorDisplay: viewModel.mirrorDisplay
+                )
                     .clipShape(RoundedRectangle(cornerRadius: 22))
             }
             .aspectRatio(16 / 9, contentMode: .fit)

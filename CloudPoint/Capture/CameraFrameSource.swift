@@ -1354,7 +1354,9 @@ final class AVCameraCaptureSession: NSObject, CameraCaptureSession, @unchecked S
         }
         previewSession.addOutput(output)
         output.setSampleBufferDelegate(outputDelegate, queue: delegateQueue)
-        probeIntrinsicMatrixDelivery(on: output.connection(with: .video))
+        let videoConnection = output.connection(with: .video)
+        CameraDisplayPolicy(mirrorDisplay: false).configure(videoConnection, for: .frameOutput)
+        probeIntrinsicMatrixDelivery(on: videoConnection)
 
         let token = NotificationCenter.default.addObserver(
             forName: AVCaptureDevice.wasDisconnectedNotification,

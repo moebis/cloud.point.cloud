@@ -124,6 +124,7 @@ final class WorkspaceViewModel: ObservableObject {
     @Published private(set) var sourceMode: WorkspaceSourceMode
     @Published private(set) var recoveryAction: WorkspaceRecoveryAction?
     @Published private(set) var sourceErrorText: String?
+    @Published private(set) var mirrorDisplay: Bool
 
     /// Stable UI-owned capture session. It deliberately is not part of the
     /// equatable WorkspaceSnapshot value.
@@ -185,6 +186,8 @@ final class WorkspaceViewModel: ObservableObject {
         self.onRepairModel = onRepairModel
         self.onRetryProject = onRetryProject
         self.packageScope = packageScope
+        let initialMirrorDisplay = document.manifest.cameraSource?.mirrorDisplay ?? false
+        mirrorDisplay = initialMirrorDisplay
         let resolvedPackageURL: URL
         if let packageBookmarkData,
            let resolution = try? bookmarks.resolve(packageBookmarkData) {
@@ -216,11 +219,14 @@ final class WorkspaceViewModel: ObservableObject {
         preflightPreviewSession = preflightPreview.session
         let cameraCaptureSession = AVCameraCaptureSession()
         previewSession = cameraCaptureSession.previewSession
+        let pointCloudRenderer: PointCloudRenderer?
         if let device = MTLCreateSystemDefaultDevice() {
-            renderer = try? PointCloudRenderer(device: device)
+            pointCloudRenderer = try? PointCloudRenderer(device: device)
         } else {
-            renderer = nil
+            pointCloudRenderer = nil
         }
+        pointCloudRenderer?.setMirrorDisplay(initialMirrorDisplay)
+        renderer = pointCloudRenderer
         let state = document.manifest.sessionState
         snapshot = WorkspaceSnapshot(
             revision: 0,
@@ -493,6 +499,15 @@ final class WorkspaceViewModel: ObservableObject {
     func setConfidenceThreshold(_ value: Float) {
         renderer?.setConfidenceThreshold(value)
         Task { [controller] in await controller?.setConfidenceThreshold(value) }
+    }
+
+    func setMirrorDisplay(_ value: Bool) {
+        mirrorDisplay = value
+        renderer?.setMirrorDisplay(value)
+        Task { [controller] in
+            do { try await controller?.setCameraMirrorDisplay(value) }
+            catch { await MainActor.run { self.report(error) } }
+        }
     }
 
     func resetView() { renderer?.resetCamera() }

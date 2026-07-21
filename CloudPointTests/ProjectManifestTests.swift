@@ -46,6 +46,28 @@ final class ProjectManifestTests: XCTestCase {
         }
     }
 
+    func testCameraDisplayMirroringRoundTripsAndDefaultsOnForLegacyProjects() throws {
+        var manifest = ProjectManifest.fixture()
+        manifest.cameraSource = CameraSourceReference(
+            deviceID: "studio-display",
+            deviceName: "Studio Display Camera",
+            mirrorDisplay: false
+        )
+
+        let encoded = try ProjectManifest.encode(manifest)
+        XCTAssertFalse(try ProjectManifest.decode(encoded).cameraSource?.mirrorDisplay ?? true)
+
+        var object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: encoded) as? [String: Any]
+        )
+        var legacyCamera = try XCTUnwrap(object["cameraSource"] as? [String: Any])
+        legacyCamera.removeValue(forKey: "mirrorDisplay")
+        object["cameraSource"] = legacyCamera
+        let legacy = try JSONSerialization.data(withJSONObject: object)
+
+        XCTAssertTrue(try XCTUnwrap(ProjectManifest.decode(legacy).cameraSource).mirrorDisplay)
+    }
+
     func testManifestEnforcesDurableAndCommittedCounterOwnership() throws {
         var capturedMismatch = ProjectManifest.fixture()
         capturedMismatch.frames = [.fixture(index: 0)]

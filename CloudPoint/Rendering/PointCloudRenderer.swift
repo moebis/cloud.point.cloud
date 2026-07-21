@@ -51,6 +51,7 @@ final class PointCloudRenderer: NSObject, MTKViewDelegate {
     private(set) var pointSize: Float = 3
     private(set) var confidenceThreshold: Float = 1.5
     private(set) var cameraState: PointCloudCameraState = .default
+    private(set) var mirrorDisplay = false
 
     private let commandQueue: any MTLCommandQueue
     private let pipelineState: any MTLRenderPipelineState
@@ -157,6 +158,10 @@ final class PointCloudRenderer: NSObject, MTKViewDelegate {
         pointSize = min(max(value, 1), 64)
     }
 
+    func setMirrorDisplay(_ value: Bool) {
+        mirrorDisplay = value
+    }
+
     func orbit(deltaX: Float, deltaY: Float) {
         let x = Self.finiteInput(deltaX)
         let y = Self.finiteInput(deltaY)
@@ -214,7 +219,10 @@ final class PointCloudRenderer: NSObject, MTKViewDelegate {
             near: 0.01,
             far: 100_000
         )
-        return projection * view * Self.openCVToMetal
+        let mirror = simd_float4x4(
+            diagonal: SIMD4<Float>(mirrorDisplay ? -1 : 1, 1, 1, 1)
+        )
+        return projection * view * mirror * Self.openCVToMetal
     }
 
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}

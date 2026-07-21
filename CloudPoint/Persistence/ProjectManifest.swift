@@ -32,8 +32,28 @@ struct RecordingSourceReference: Codable, Sendable, Equatable {
 }
 
 struct CameraSourceReference: Codable, Sendable, Equatable {
+    private enum CodingKeys: String, CodingKey {
+        case deviceID
+        case deviceName
+        case mirrorDisplay
+    }
+
     var deviceID: String
     var deviceName: String
+    var mirrorDisplay: Bool
+
+    init(deviceID: String, deviceName: String, mirrorDisplay: Bool = true) {
+        self.deviceID = deviceID
+        self.deviceName = deviceName
+        self.mirrorDisplay = mirrorDisplay
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        deviceID = try container.decode(String.self, forKey: .deviceID)
+        deviceName = try container.decode(String.self, forKey: .deviceName)
+        mirrorDisplay = try container.decodeIfPresent(Bool.self, forKey: .mirrorDisplay) ?? true
+    }
 }
 
 struct ProjectManifest: Codable, Sendable, Equatable {

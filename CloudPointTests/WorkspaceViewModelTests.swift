@@ -76,6 +76,33 @@ final class WorkspaceViewModelTests: XCTestCase {
         XCTAssertEqual(viewModel.selectedCameraID, "camera-7")
         XCTAssertFalse(viewModel.snapshot.isCapturing)
         XCTAssertTrue(viewModel.requiresCloseConfirmation == false)
+        XCTAssertTrue(viewModel.mirrorDisplay)
+        XCTAssertTrue(viewModel.renderer?.mirrorDisplay == true)
+    }
+
+    func testCameraMirrorToggleUpdatesViewerAndPersistsProjectPreference() async throws {
+        let package = try TemporaryProjectPackage.make()
+        let manifest = ProjectManifest(
+            cameraSource: CameraSourceReference(
+                deviceID: "camera-7",
+                deviceName: "Studio Camera"
+            )
+        )
+        try manifest.writeAtomically(to: package.url)
+        let viewModel = WorkspaceViewModel(
+            document: CloudPointDocument(manifest: manifest),
+            packageURL: package.url,
+            arguments: []
+        )
+
+        viewModel.setMirrorDisplay(false)
+        let didPersist = await waitUntil {
+            viewModel.renderer?.mirrorDisplay == false
+                && (try? ProjectManifest.load(from: package.url).cameraSource?.mirrorDisplay) == false
+        }
+
+        XCTAssertTrue(didPersist)
+        XCTAssertFalse(viewModel.mirrorDisplay)
     }
 
     func testMissingRecordingBookmarkOffersLocateOriginalRecovery() async throws {

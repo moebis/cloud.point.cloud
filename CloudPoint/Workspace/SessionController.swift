@@ -728,6 +728,18 @@ final class SessionController: @unchecked Sendable {
         }
     }
 
+    func setCameraMirrorDisplay(_ value: Bool) async throws {
+        try await submit { controller in
+            guard var source = controller.manifest.cameraSource else { return }
+            guard source.mirrorDisplay != value else { return }
+            source.mirrorDisplay = value
+            var staged = controller.manifest
+            staged.cameraSource = source
+            staged.updatedAt = controller.dependencies.now()
+            try await controller.commit(staged)
+        }
+    }
+
     private func submit<Result: Sendable>(
         _ operation: @escaping @Sendable (SessionController) async throws -> Result
     ) async throws -> Result {

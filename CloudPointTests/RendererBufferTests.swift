@@ -115,6 +115,26 @@ final class RendererBufferTests: XCTestCase {
         XCTAssertEqual(resetCenter.z, center.z, accuracy: 0.000_001)
     }
 
+    func testDisplayMirroringFlipsOnlyImageHorizontalDirection() throws {
+        let renderer = try makeRenderer(displayLimit: 10)
+        let unmirrored = renderer.viewProjectionMatrix(aspectRatio: 1)
+        let center = try projectedNDC(SIMD3<Float>(0, 0, 1), matrix: unmirrored)
+        let imageRight = try projectedNDC(SIMD3<Float>(1, 0, 1), matrix: unmirrored)
+        XCTAssertGreaterThan(imageRight.x, center.x)
+
+        renderer.setMirrorDisplay(true)
+        let mirrored = renderer.viewProjectionMatrix(aspectRatio: 1)
+        let mirroredCenter = try projectedNDC(SIMD3<Float>(0, 0, 1), matrix: mirrored)
+        let mirroredImageRight = try projectedNDC(SIMD3<Float>(1, 0, 1), matrix: mirrored)
+        let mirroredImageDown = try projectedNDC(SIMD3<Float>(0, 1, 1), matrix: mirrored)
+        let mirroredFarther = try projectedNDC(SIMD3<Float>(0, 0, 2), matrix: mirrored)
+
+        XCTAssertTrue(renderer.mirrorDisplay)
+        XCTAssertLessThan(mirroredImageRight.x, mirroredCenter.x)
+        XCTAssertLessThan(mirroredImageDown.y, mirroredCenter.y)
+        XCTAssertGreaterThan(mirroredFarther.z, mirroredCenter.z)
+    }
+
     func testLargeTargetCloseZoomObliqueOrbitAndSubnormalAspectRemainFinite() throws {
         let renderer = try makeRenderer(displayLimit: 10)
 
