@@ -77,6 +77,21 @@ def _directory_flags() -> int:
     return os.O_RDONLY | no_follow | directory | getattr(os, "O_CLOEXEC", 0)
 
 
+def _absolute_directory_flags() -> int | None:
+    no_follow_any = getattr(os, "O_NOFOLLOW_ANY", 0)
+    directory = getattr(os, "O_DIRECTORY", 0)
+    if no_follow_any == 0:
+        return None
+    if directory == 0:
+        raise OSError(errno.ENOTSUP, "safe directory traversal is unavailable")
+    return (
+        os.O_RDONLY
+        | no_follow_any
+        | directory
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+
+
 def _path_components(path: Path) -> tuple[str, ...]:
     if not path.is_absolute() or path.anchor not in {"/", "//"}:
         raise OSError(errno.EINVAL, "path must be absolute")
@@ -92,6 +107,36 @@ def _open_directory_fd(path: Path, *, create_leaf: bool = False) -> int:
     """Open every directory component without following symbolic links."""
 
     components = _path_components(path)
+    absolute_flags = _absolute_directory_flags()
+    if absolute_flags is not None:
+        try:
+            return os.open(path, absolute_flags)
+        except FileNotFoundError:
+            if not create_leaf or not components:
+                raise
+
+        parent_descriptor = os.open(path.parent, absolute_flags)
+        leaf_descriptor = -1
+        try:
+            created = False
+            try:
+                os.mkdir(components[-1], mode=0o700, dir_fd=parent_descriptor)
+                created = True
+            except FileExistsError:
+                pass
+            leaf_descriptor = os.open(
+                components[-1], _directory_flags(), dir_fd=parent_descriptor
+            )
+            if created:
+                os.fsync(parent_descriptor)
+            return leaf_descriptor
+        except BaseException:
+            if leaf_descriptor >= 0:
+                os.close(leaf_descriptor)
+            raise
+        finally:
+            os.close(parent_descriptor)
+
     flags = _directory_flags()
     descriptor = os.open(path.anchor, flags)
     try:

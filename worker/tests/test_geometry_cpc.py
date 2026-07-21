@@ -3,6 +3,7 @@ from __future__ import annotations
 import errno
 import json
 import os
+import stat
 import struct
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -12,6 +13,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+import cloudpoint_worker.cpc as cpc_module
 import cloudpoint_worker.outputs as outputs_module
 from cloudpoint_worker.cpc import CPCVertex, read_cpc, reduce_vertices, write_cpc
 from cloudpoint_worker.errors import WorkerFault
@@ -236,6 +238,83 @@ def test_cpc_reader_checks_size_before_allocating(
     monkeypatch.setattr(Path, "read_bytes", unexpected_path_read)
     with pytest.raises(WorkerFault, match="INVALID_POINT_CHUNK"):
         read_cpc(oversized)
+
+
+@pytest.mark.skipif(
+    getattr(os, "O_NOFOLLOW_ANY", 0) == 0,
+    reason="macOS O_NOFOLLOW_ANY is required for direct sandbox-safe path opens",
+)
+def test_directory_open_does_not_enumerate_sandbox_denied_ancestors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "authorized.cloudpoint"
+    target.mkdir()
+    original_open = os.open
+    calls: list[tuple[str, int, int | None]] = []
+
+    def sandboxed_open(
+        path: os.PathLike[str] | str,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        value = os.fspath(path)
+        calls.append((value, flags, dir_fd))
+        if dir_fd is None and Path(value).is_absolute() and Path(value) != target:
+            raise PermissionError(errno.EACCES, "sandbox denied ancestor", value)
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(cpc_module.os, "open", sandboxed_open)
+    descriptor = cpc_module._open_directory_fd(target)
+    try:
+        assert calls[0][0] == str(target)
+        assert calls[0][1] & os.O_NOFOLLOW_ANY
+        assert calls[0][2] is None
+        assert stat.S_ISDIR(os.fstat(descriptor).st_mode)
+    finally:
+        os.close(descriptor)
+
+
+@pytest.mark.skipif(
+    getattr(os, "O_NOFOLLOW_ANY", 0) == 0,
+    reason="macOS O_NOFOLLOW_ANY is required for direct sandbox-safe path opens",
+)
+def test_directory_open_creates_leaf_without_enumerating_denied_ancestors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "Predictions"
+    original_open = os.open
+    allowed_absolute_paths = {target, target.parent}
+    calls: list[tuple[str, int, int | None]] = []
+
+    def sandboxed_open(
+        path: os.PathLike[str] | str,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        value = os.fspath(path)
+        calls.append((value, flags, dir_fd))
+        if (
+            dir_fd is None
+            and Path(value).is_absolute()
+            and Path(value) not in allowed_absolute_paths
+        ):
+            raise PermissionError(errno.EACCES, "sandbox denied ancestor", value)
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(cpc_module.os, "open", sandboxed_open)
+    descriptor = cpc_module._open_directory_fd(target, create_leaf=True)
+    try:
+        assert calls[0][0] == str(target)
+        assert calls[0][1] & os.O_NOFOLLOW_ANY
+        assert any(call[0] == str(target.parent) for call in calls)
+        assert stat.S_ISDIR(os.fstat(descriptor).st_mode)
+    finally:
+        os.close(descriptor)
+    assert target.is_dir()
 
 
 def test_atomic_writer_rejects_symlinked_ancestor(tmp_path: Path) -> None:
