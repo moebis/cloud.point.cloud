@@ -1,13 +1,36 @@
 # CloudPoint development
 
-CloudPoint is a macOS 15 SwiftUI document app. The first runnable version can
-sample recordings or a live camera into durable JPEG frames and exercise the
-complete schema-v2 reconstruction workflow with the deterministic mock engine.
-The production Apple/MLX reconstruction engine is not wired yet, so a normal
-launch reports **Lingbot engine not installed yet** and never substitutes mock
-output.
+CloudPoint 1.0 is a native macOS 15 SwiftUI app backed by the production
+LingBot-Map MLX worker. A normal Debug or Release launch reconstructs real scene
+geometry; it does not substitute deterministic output when the worker or model
+is unavailable.
 
-## Bootstrap and open in Xcode
+## Architecture
+
+- SwiftUI and `AppCoordinator` own the welcome screen, input routing, model
+  setup, managed projects, recent projects, and workspace lifecycle.
+- AVFoundation validates and samples MOV, MP4, and M4V recordings and captures
+  live camera frames.
+- `SessionController` persists every admitted frame and commits predictions,
+  CPC point chunks, and schema-v2 manifest state at reconstruction-window
+  boundaries.
+- `PythonMLXEngine` launches the worker as a child process over framed standard
+  input/output. The worker does not bind a network port.
+- The worker loads the verified converted LingBot-Map model with Apple MLX and
+  emits depth, confidence, camera, and colored point-cloud artifacts.
+- `PointCloudRenderer` displays committed CPC chunks in a native Metal view.
+
+The native app never imports Python or MLX into its process. Model download is
+performed by the native setup layer; worker inference is network-free.
+
+## Prerequisites
+
+- Apple Silicon Mac
+- macOS 15.0 or newer
+- Xcode with the macOS 15 SDK and Swift 6
+- [`uv`](https://docs.astral.sh/uv/)
+
+## Bootstrap and run
 
 From the repository root:
 
@@ -16,87 +39,232 @@ scripts/bootstrap
 open CloudPoint.xcodeproj
 ```
 
-`scripts/bootstrap` verifies Xcode, installs the pinned XcodeGen 2.46.0 when
-needed, installs Apple's Metal toolchain when needed, and generates the ignored
-Xcode project. Run `scripts/generate-project` again whenever Swift source
-membership or `project.yml` changes.
+`scripts/bootstrap`:
 
-In Xcode, select the **CloudPoint** scheme and **My Mac**, then Run. A new
-untitled document must be saved as a `.cloudpoint` package before recording or
-camera input is enabled.
+1. verifies Xcode;
+2. installs the pinned XcodeGen 2.46.0 if it is not already available;
+3. installs Apple's Metal toolchain if Xcode reports it missing;
+4. creates `Config/Local.xcconfig` from the checked-in example;
+5. resolves the locked worker, model-preparation, reference, and test
+   dependencies into `worker/.venv`; and
+6. regenerates `CloudPoint.xcodeproj` from `project.yml`.
 
-## Run the deterministic app
-
-Mock reconstruction is intentionally available only in Debug and only with the
-exact `--mock-engine` argument. In Xcode, add it under Scheme > Run > Arguments,
-or use the one-command first-version launcher from Terminal:
+In Xcode, select the **CloudPoint** scheme and **My Mac**, then Run. The fastest
+terminal path performs the same bootstrap, builds an arm64 Debug app in a
+temporary DerivedData directory, prints its exact path, and opens it:
 
 ```sh
 scripts/run-first-version
 ```
 
-The launcher verifies the pinned tools, builds the arm64 Debug app in a temporary
-DerivedData directory, prints the exact `.app` path, and launches it with the
-mock flag. To compile without opening the app, use
-`scripts/run-first-version --build-only`.
+Use `scripts/run-first-version --build-only` to compile without launching.
 
-The equivalent manual build and launch is:
+Open a recording from the welcome screen. CloudPoint probes it first, routes
+through model setup if needed, then automatically creates an autosaved project
+and begins import. There is no untitled document and no save-before-input step.
 
-```sh
-xcodebuild build \
-  -project CloudPoint.xcodeproj \
-  -scheme CloudPoint \
-  -configuration Debug \
-  -destination 'platform=macOS,arch=arm64'
+## Development and release runtimes
 
-open "$HOME/Library/Developer/Xcode/DerivedData/CloudPoint-"*/Build/Products/Debug/CloudPoint.app \
-  --args --mock-engine
+Debug builds use the absolute worker path generated in the ignored
+`Config/Local.xcconfig`:
+
+```xcconfig
+CLOUDPOINT_WORKER_RUNTIME = $(SRCROOT)/worker/.venv
 ```
 
-Save the project, choose **Open Recording**, and select a movie. CloudPoint
-persists each selected frame before admitting it to reconstruction. A window is
-shown only after its predictions, CPC point chunk, manifest transaction, and
-document adoption all succeed. **Use Camera** follows the same transaction path;
-**Stop Capture** drains every durable camera event before closing engine input.
+Release builds ignore that machine-local value and run
+`scripts/package-worker-runtime` during the build. It creates a relocatable,
+arm64 CPython 3.12.11 environment under
+`CloudPoint.app/Contents/Resources/WorkerRuntime`, installs the exact locked
+packages, adds native launchers, removes build paths and bytecode, and verifies
+the result before publication. Model weights are never placed in the app.
 
-## Tests
+The app launches only its bundled runtime or the exact build-configured Debug
+runtime. It deliberately ignores inherited `PATH` lookups.
 
-Run the complete native gate:
+## Model setup and trust anchors
+
+CloudPoint supports the official `robbyant/lingbot-map` long-sequence checkpoint
+at Hugging Face revision
+`204754b72bb24f561f8d7e7e1e4e4cd9e809adf9`.
+
+### Source checkpoint trust anchor
+
+- File: `lingbot-map-long.pt`
+- Exact size: 4,632,303,465 bytes
+- SHA-256:
+
+  ```text
+  832bc82cbae0bc9bbe946ef5ee1f7226abd8c0e183ccf8beddbb3d133576f409
+  ```
+
+### Converted model trust anchor
+
+- File: `lingbot-map-long-f16.safetensors`
+- Exact size: 2,316,040,080 bytes
+- SHA-256:
+
+  ```text
+  eb966484923b5a205677b3ce7316d079c46fc6503bc9b6ac256b6e11560ea2e5
+  ```
+
+Native `URLSession` downloads and resumes only that checkpoint. The installer
+verifies its size and SHA-256 before invoking the isolated converter. The
+converter accepts only the exact verified artifact, produces 1,342 tensors,
+and publishes converted weights only after the output digest and manifests
+validate. Allow approximately 8 GiB of free space for setup.
+
+The normal inference process reads SafeTensors and does not accept `.pt` input.
+The source checkpoint, converted weights, and model manifests live under the
+sandboxed app's Application Support directory, not in a project package.
+
+## Input and project lifecycle
+
+`AppCoordinator.defaultSamplingRate` is 2 fps for recording import. Camera
+sampling is adjustable from 1 through 10 fps before capture. Selected frames
+are written to the package before they are admitted to reconstruction.
+
+Managed projects are created under the sandboxed Application Support
+`CloudPoint/Projects` directory with a source-derived name and UUID. A package
+contains `Manifest.json`, `Frames/`, `Predictions/`, `Points/`, and `Logs/`.
+The original recording is referenced with a security-scoped bookmark rather
+than copied into the package.
+
+Stopping camera capture closes input but drains all durable queued frames.
+Closing during active capture requires confirmation. Completed geometry is
+restored when a project reopens; interrupted or failed work resumes from the
+last committed reconstruction window.
+
+## Native tests
+
+Regenerate the project whenever `project.yml`, target resources, or Swift source
+membership changes, then run the complete native gate:
 
 ```sh
-scripts/generate-project
+scripts/bootstrap
 scripts/test-native
 ```
 
-Run the portable real-recording smoke against any local movie without embedding
-its path in the test suite:
+The script builds the app, test bundle, mock worker, and worker launcher before
+running the full `CloudPoint` scheme test suite on arm64 macOS.
+
+### Recording-ingest regression
+
+Run the portable recording smoke against a local movie:
 
 ```sh
 scripts/test-recording-smoke '/absolute/path/to/video.mov'
 ```
 
-The helper fingerprints the caller-provided movie, stages a read-only copy
-inside the test host's sandbox container, and removes that copy afterward. The
-original is never passed to the test process and its fingerprint must remain
-unchanged. The smoke drives the same production `AssetRecordingImporter` used
-by the app through `SessionController` and the deterministic
-`MockReconstructionEngine` until terminal completion. It then reloads and
-validates the schema-v2 manifest; checks captured, queued, and processed parity;
-checks the exact JPEG, three-per-frame prediction, and CPC file sets; opens
-every JPEG and CPC; and rejects any remaining `.partial` transaction file. All
-generated artifacts live in a temporary `.cloudpoint` package. If the variable
-is absent, the test is skipped.
+This test fingerprints the source, stages a read-only copy inside the test
+host's sandbox, drives the production recording importer and project
+transaction path, validates all generated schema-v2 artifacts, and proves the
+source remained unchanged. It intentionally uses the deterministic test engine
+to isolate ingest and durability behavior; it is not evidence of MLX scene
+reconstruction.
 
-Build the shipping configuration explicitly:
+### Real native-to-worker MLX bridge
+
+After preparing the pinned model through CloudPoint, package the locked worker
+runtime inside CloudPoint's test-support container. The sandbox intentionally
+cannot execute the repository runtime from `Documents`, so the CLI build
+setting below points the Debug test host at that sandbox-readable copy.
 
 ```sh
-xcodebuild build \
+model_root="$HOME/Library/Containers/cloud.point.cloud.CloudPoint/Data/Library/Application Support/cloud.point.cloud.CloudPoint/Models"
+test_support="$HOME/Library/Containers/cloud.point.cloud.CloudPoint/Data/Library/Application Support/CloudPoint/TestSupport"
+runtime="$test_support/WorkerRuntime"
+
+scripts/package-worker-runtime "$runtime"
+
+CLOUDPOINT_REAL_MODEL_DIR="$model_root/robbyant-lingbot-map/204754b72bb24f561f8d7e7e1e4e4cd9e809adf9/converted" \
+xcodebuild test -quiet \
+  -project CloudPoint.xcodeproj \
+  -scheme CloudPoint \
+  -configuration Debug \
+  -destination 'platform=macOS,arch=arm64' \
+  -derivedDataPath /tmp/cloudpoint-real-bridge \
+  "CLOUDPOINT_WORKER_RUNTIME=$runtime" \
+  -only-testing:CloudPointTests/RealWorkerBridgeTests
+```
+
+This opt-in test sends the nine pinned courthouse frames through the real Swift
+bridge and MLX worker, waits for terminal completion, opens the resulting CPC,
+and requires more than 1,000 points. The packaged runtime is the same locked,
+relocatable runtime produced for Release builds; Debug is used only so the
+`@testable` test target and its test doubles remain available.
+
+## Worker tests
+
+Run the locked Python checks from the repository root:
+
+```sh
+(
+  cd worker
+  uv run --frozen --extra model-prep ruff check src tests
+  uv run --frozen --extra model-prep pytest -q -m 'not real_model'
+)
+```
+
+The real-model Python health test is opt-in:
+
+```sh
+(
+  cd worker
+  CLOUDPOINT_MODEL_DIR='/absolute/path/to/converted' \
+    uv run --frozen --extra model-prep \
+    pytest -q -m real_model
+)
+```
+
+Protocol fixtures have a dedicated regeneration and verification command:
+
+```sh
+worker/scripts/verify-protocol
+```
+
+The release-runtime static contract is checked with:
+
+```sh
+scripts/tests/test-worker-runtime-packaging
+```
+
+## Deterministic test engine
+
+`MockReconstructionEngine` is a developer fixture for fast native input,
+persistence, and failure-path tests. It is compiled for Debug only and can be
+selected only with the exact `--mock-engine` process argument. Ordinary Debug
+launches and all Release launches use the production MLX route. A missing or
+invalid runtime/model produces a visible setup or repair state instead of mock
+geometry.
+
+## Build a release
+
+Release builds package and verify the relocatable runtime, so they take longer
+and produce a much larger app than Debug builds:
+
+```sh
+scripts/bootstrap
+
+xcodebuild build -quiet \
   -project CloudPoint.xcodeproj \
   -scheme CloudPoint \
   -configuration Release \
-  -destination 'platform=macOS,arch=arm64'
+  -destination 'platform=macOS,arch=arm64' \
+  -derivedDataPath /tmp/cloudpoint-release
+
+codesign --verify --deep --strict --verbose=2 \
+  /tmp/cloudpoint-release/Build/Products/Release/CloudPoint.app
 ```
 
-Release and ordinary Debug builds do not enable mock reconstruction. The next
-engine milestone is an Apple Silicon implementation using Metal/MLX rather than
-CUDA, connected through the existing `ReconstructionEngine` boundary.
+To create the distributable archive:
+
+```sh
+ditto -c -k --sequesterRsrc --keepParent \
+  /tmp/cloudpoint-release/Build/Products/Release/CloudPoint.app \
+  CloudPoint-v1.0.0-macOS-arm64.zip
+```
+
+The public v1.0.0 artifact is ad-hoc signed and not notarized. Do not describe it
+as Developer ID signed or notarized unless a later release pipeline actually
+performs and verifies those steps.
