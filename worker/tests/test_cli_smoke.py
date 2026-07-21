@@ -40,18 +40,25 @@ def _make_project(root: Path) -> Path:
     manifest = {
         "completedWindows": [],
         "createdAt": "2026-07-21T00:00:00.0Z",
-        "engineConfiguration": {
-            "cameraRefinementIterations": 4,
-            "confidenceThreshold": 1.5,
-            "keyframeInterval": 1,
-            "scaleFrames": 8,
-            "voxelSize": 0.01,
-            "windowOverlap": 8,
-            "windowSize": 32,
-        },
-        "formatVersion": 2,
+        "formatVersion": 3,
         "frames": [],
+        "outputState": {"type": "pointCloud"},
         "projectID": "33333333-3333-3333-3333-333333333333",
+        "reconstructionPlan": {
+            "configuration": {
+                "settings": {
+                    "cameraRefinementIterations": 4,
+                    "confidenceThreshold": 1.5,
+                    "keyframeInterval": 1,
+                    "scaleFrames": 8,
+                    "voxelSize": 0.01,
+                    "windowOverlap": 8,
+                    "windowSize": 32,
+                },
+                "type": "lingbotPointCloud",
+            },
+            "modeID": "cloudpoint.lingbot.point-cloud.v1",
+        },
         "sessionState": {
             "capturedCount": 0,
             "currentWindow": None,

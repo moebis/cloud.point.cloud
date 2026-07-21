@@ -30,7 +30,12 @@ from cloudpoint_worker.protocol.schema import (
     decode_event,
 )
 from cloudpoint_worker.server import WorkerServer
-from cloudpoint_worker.session import PersistedFrame, SessionRunner, SessionState
+from cloudpoint_worker.session import (
+    PersistedFrame,
+    SessionRunner,
+    SessionState,
+    validate_project_root,
+)
 
 PROJECT_ID = uuid.UUID("11111111-1111-1111-1111-111111111111")
 CONFIG = ConfigurePayload(8, 32, 8, 1, 4, 1.5, 0.01)
@@ -103,6 +108,21 @@ def _manifest(project_id: uuid.UUID = PROJECT_ID) -> dict[str, object]:
     }
 
 
+def _manifest_v3(project_id: uuid.UUID = PROJECT_ID) -> dict[str, object]:
+    manifest = _manifest(project_id)
+    settings = manifest.pop("engineConfiguration")
+    manifest["formatVersion"] = 3
+    manifest["reconstructionPlan"] = {
+        "modeID": "cloudpoint.lingbot.point-cloud.v1",
+        "configuration": {
+            "type": "lingbotPointCloud",
+            "settings": settings,
+        },
+    }
+    manifest["outputState"] = {"type": "pointCloud"}
+    return manifest
+
+
 @pytest.fixture
 def project(tmp_path: Path) -> Path:
     root = tmp_path / "Smoke.cloudpoint"
@@ -119,6 +139,48 @@ def project(tmp_path: Path) -> Path:
 
 def _frame(index: int) -> PersistedFrame:
     return PersistedFrame(index, index / 2, f"Frames/{index:08d}.jpg")
+
+
+def test_v2_and_v3_lingbot_manifests_produce_equivalent_snapshots(
+    project: Path,
+) -> None:
+    v2 = validate_project_root(project)
+    (project / "Manifest.json").write_text(
+        json.dumps(_manifest_v3(), sort_keys=True), encoding="utf-8"
+    )
+
+    v3 = validate_project_root(project)
+
+    assert v3.project_id == v2.project_id
+    assert v3.frames == v2.frames
+    assert v3.completed_windows == v2.completed_windows
+    assert v3.referenced_artifacts == v2.referenced_artifacts
+
+
+@pytest.mark.parametrize(
+    ("mode_id", "configuration_type"),
+    [
+        ("cloudpoint.apple.sharp.gaussian.v1", "sharpGaussian"),
+        ("example.future.reconstruction.v9", "future"),
+    ],
+)
+def test_v3_non_lingbot_modes_fail_closed(
+    project: Path,
+    mode_id: str,
+    configuration_type: str,
+) -> None:
+    manifest = _manifest_v3()
+    manifest["reconstructionPlan"] = {
+        "modeID": mode_id,
+        "configuration": {"type": configuration_type, "settings": {}},
+    }
+    manifest["outputState"] = {"type": "gaussian", "result": None}
+    (project / "Manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(WorkerFault) as raised:
+        validate_project_root(project)
+
+    assert raised.value.code == "PROJECT_UNSUPPORTED_MODE"
 
 
 def _install_completed_window(

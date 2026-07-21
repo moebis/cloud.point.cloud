@@ -77,6 +77,7 @@ _PARTIAL = re.compile(
     r"|window-[0-9]{8,10}\.cpc)\.[0-9a-f]{8}-[0-9a-f]{4}-"
     r"[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.partial$"
 )
+_LINGBOT_MODE_ID = "cloudpoint.lingbot.point-cloud.v1"
 
 
 class ReconstructionModel(Protocol):
@@ -181,6 +182,57 @@ def _manifest_relative(value: object) -> str:
         ) from error
 
 
+def _validated_lingbot_manifest(decoded: object) -> dict[str, object]:
+    if not isinstance(decoded, dict):
+        raise _fault(
+            "PROJECT_UNSUPPORTED_FORMAT",
+            "CloudPoint project format version 2 or 3 is required",
+        )
+    manifest = cast(dict[str, object], decoded)
+    version = manifest.get("formatVersion")
+    if version == 2:
+        return manifest
+    if version != 3:
+        raise _fault(
+            "PROJECT_UNSUPPORTED_FORMAT",
+            "CloudPoint project format version 2 or 3 is required",
+        )
+
+    plan = manifest.get("reconstructionPlan")
+    if not isinstance(plan, dict):
+        raise _fault(
+            "PROJECT_INVALID_MANIFEST",
+            "manifest reconstructionPlan is invalid",
+        )
+    mode_id = plan.get("modeID")
+    if not isinstance(mode_id, str):
+        raise _fault(
+            "PROJECT_INVALID_MANIFEST",
+            "manifest reconstruction mode ID is invalid",
+        )
+    if mode_id != _LINGBOT_MODE_ID:
+        raise _fault(
+            "PROJECT_UNSUPPORTED_MODE",
+            "the LingBot worker cannot run this reconstruction mode",
+            modeID=mode_id,
+        )
+
+    configuration = plan.get("configuration")
+    output = manifest.get("outputState")
+    if (
+        not isinstance(configuration, dict)
+        or configuration.get("type") != "lingbotPointCloud"
+        or not isinstance(configuration.get("settings"), dict)
+        or not isinstance(output, dict)
+        or output.get("type") != "pointCloud"
+    ):
+        raise _fault(
+            "PROJECT_INVALID_MANIFEST",
+            "manifest LingBot plan or output state is invalid",
+        )
+    return manifest
+
+
 def _directory_flags() -> int:
     no_follow = getattr(os, "O_NOFOLLOW", 0)
     directory = getattr(os, "O_DIRECTORY", 0)
@@ -253,12 +305,7 @@ def _read_manifest(root_fd: int, root_identity: tuple[int, int]) -> _ProjectSnap
     finally:
         if descriptor >= 0:
             os.close(descriptor)
-    if not isinstance(decoded, dict) or decoded.get("formatVersion") != 2:
-        raise _fault(
-            "PROJECT_UNSUPPORTED_FORMAT",
-            "CloudPoint project format version 2 is required",
-        )
-    manifest = cast(dict[str, object], decoded)
+    manifest = _validated_lingbot_manifest(decoded)
     project_id = _canonical_uuid(manifest.get("projectID"))
 
     frames_value = manifest.get("frames")

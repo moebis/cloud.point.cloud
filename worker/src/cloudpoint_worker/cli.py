@@ -263,6 +263,7 @@ def _exit_code(fault: WorkerFault) -> int:
         "PROJECT_INVALID_PATH",
         "PROJECT_INVALID_MANIFEST",
         "PROJECT_UNSUPPORTED_FORMAT",
+        "PROJECT_UNSUPPORTED_MODE",
         "FRAME_INVALID_PATH",
         "MODEL_UNAVAILABLE",
         "MODEL_INVALID_PATH",
