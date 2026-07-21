@@ -44,6 +44,11 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - Made worker startup, shutdown, cancellation, and failed-session reopening
   interruptible and checkpoint-safe.
 
+### Fixed
+
+- Made Release-sandbox project access compatible with macOS security-scoped
+  paths while retaining no-symlink validation for every path component.
+
 ### Release notes
 
 - Requires Apple Silicon and macOS 15.0 or newer.
