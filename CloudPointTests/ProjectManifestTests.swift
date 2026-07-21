@@ -2,6 +2,113 @@ import XCTest
 @testable import CloudPoint
 
 final class ProjectManifestTests: XCTestCase {
+    func testReconstructionModeIdentifiersAreStable() {
+        XCTAssertEqual(
+            ReconstructionModeID.lingbotPointCloud.rawValue,
+            "cloudpoint.lingbot.point-cloud.v1"
+        )
+        XCTAssertEqual(
+            ReconstructionModeID.sharpGaussian.rawValue,
+            "cloudpoint.apple.sharp.gaussian.v1"
+        )
+    }
+
+    func testLegacyV2ManifestMigratesInMemoryWithoutLosingLingBotState() throws {
+        var original = ProjectManifest.fixture()
+        original.frames = [.fixture(index: 0)]
+        original.completedWindows = [.fixture(index: 0)]
+        original.sessionState = SessionState(
+            phase: .completed,
+            capturedCount: 1,
+            queuedCount: 1,
+            processedCount: 1
+        )
+
+        let migrated = try ProjectManifest.decode(legacyV2Data(from: original))
+
+        XCTAssertEqual(migrated.formatVersion, 3)
+        XCTAssertEqual(migrated.reconstructionPlan.modeID, .lingbotPointCloud)
+        XCTAssertEqual(migrated.engineConfiguration, original.engineConfiguration)
+        XCTAssertEqual(migrated.completedWindows, original.completedWindows)
+        XCTAssertEqual(migrated.outputState, .pointCloud)
+
+        let rewritten = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: ProjectManifest.encode(migrated)) as? [String: Any]
+        )
+        XCTAssertEqual(rewritten["formatVersion"] as? Int, 3)
+        XCTAssertNotNil(rewritten["reconstructionPlan"])
+        XCTAssertNil(rewritten["engineConfiguration"])
+    }
+
+    func testManifestUsesTaggedModeConfigurationAndOutputState() throws {
+        let manifest = ProjectManifest.fixture()
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: ProjectManifest.encode(manifest)) as? [String: Any]
+        )
+        let plan = try XCTUnwrap(object["reconstructionPlan"] as? [String: Any])
+        let configuration = try XCTUnwrap(plan["configuration"] as? [String: Any])
+        let output = try XCTUnwrap(object["outputState"] as? [String: Any])
+
+        XCTAssertEqual(plan["modeID"] as? String, ReconstructionModeID.lingbotPointCloud.rawValue)
+        XCTAssertEqual(configuration["type"] as? String, "lingbotPointCloud")
+        XCTAssertNotNil(configuration["settings"])
+        XCTAssertEqual(output["type"] as? String, "pointCloud")
+    }
+
+    func testUnknownV3ModeDecodesUnavailableAndNeverFallsBackToLingBot() throws {
+        let encoded = try ProjectManifest.encode(.fixture())
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        var plan = try XCTUnwrap(object["reconstructionPlan"] as? [String: Any])
+        plan["modeID"] = "example.future.reconstruction.v9"
+        plan["configuration"] = ["type": "future", "settings": ["quality": 9]]
+        object["reconstructionPlan"] = plan
+
+        let decoded = try ProjectManifest.decode(JSONSerialization.data(withJSONObject: object))
+
+        XCTAssertEqual(decoded.reconstructionPlan.modeID.rawValue, "example.future.reconstruction.v9")
+        XCTAssertFalse(decoded.reconstructionPlan.isRunnable)
+        XCTAssertNil(decoded.reconstructionPlan.lingbotConfiguration)
+    }
+
+    func testArtifactEnumerationIncludesLegacyAndGaussianOutputs() throws {
+        var pointCloud = ProjectManifest.fixture()
+        pointCloud.frames = [.fixture(index: 0)]
+        pointCloud.completedWindows = [.fixture(index: 0)]
+        pointCloud.sessionState = SessionState(
+            phase: .completed,
+            capturedCount: 1,
+            queuedCount: 1,
+            processedCount: 1
+        )
+        XCTAssertEqual(pointCloud.artifactRelativePaths(), Set([
+            "Frames/00000000.jpg",
+            "Points/window-00000000.cpc",
+            "Predictions/00000000.depth-f16",
+            "Predictions/00000000.confidence-f16",
+            "Predictions/00000000.geometry.json",
+        ]))
+
+        let gaussian = ProjectManifest(
+            reconstructionPlan: .sharp(SharpReconstructionConfiguration(inputFrameIndex: 4)),
+            outputState: .gaussian(GaussianSceneOutput(
+                sourceFrameIndex: 4,
+                plyRelativePath: "Outputs/Gaussians/frame-00000004.ply",
+                gaussianCount: 1_179_648
+            )),
+            frames: [.fixture(index: 4)],
+            sessionState: SessionState(
+                phase: .completed,
+                capturedCount: 1,
+                queuedCount: 1,
+                processedCount: 1
+            )
+        )
+        XCTAssertEqual(try ProjectManifest.validate(gaussian).artifactRelativePaths(), Set([
+            "Frames/00000004.jpg",
+            "Outputs/Gaussians/frame-00000004.ply",
+        ]))
+    }
+
     func testManifestEncodesProjectIDAsLowercaseCanonicalUUIDForWorker() throws {
         var manifest = ProjectManifest.fixture()
         manifest.projectID = UUID(uuidString: "ABCDEF01-2345-4678-9ABC-DEF012345678")!
@@ -260,8 +367,9 @@ final class ProjectManifestTests: XCTestCase {
 
         XCTAssertEqual(
             Set(wrapper.fileWrappers?.keys.map { $0 } ?? []),
-            ["Manifest.json", "Frames", "Predictions", "Points", "Logs"]
+            ["Manifest.json", "Frames", "Predictions", "Points", "Outputs", "Logs"]
         )
+        XCTAssertNotNil(wrapper.fileWrappers?["Outputs"]?.fileWrappers?["Gaussians"])
     }
 
     @MainActor
@@ -396,6 +504,18 @@ final class ProjectManifestTests: XCTestCase {
         let valid = try ProjectManifest.encode(.fixture())
         var object = try XCTUnwrap(JSONSerialization.jsonObject(with: valid) as? [String: Any])
         object["formatVersion"] = formatVersion
+        return try JSONSerialization.data(withJSONObject: object)
+    }
+
+    private func legacyV2Data(from manifest: ProjectManifest) throws -> Data {
+        var object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: ProjectManifest.encode(manifest)) as? [String: Any]
+        )
+        let plan = try XCTUnwrap(object.removeValue(forKey: "reconstructionPlan") as? [String: Any])
+        let configuration = try XCTUnwrap(plan["configuration"] as? [String: Any])
+        object["engineConfiguration"] = configuration["settings"]
+        object.removeValue(forKey: "outputState")
+        object["formatVersion"] = 2
         return try JSONSerialization.data(withJSONObject: object)
     }
 }

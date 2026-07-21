@@ -173,10 +173,10 @@ actor ManagedProjectStore: ManagedProjectStoring {
         }
 
         try fileManager.createDirectory(at: stagingURL, withIntermediateDirectories: false)
-        for directory in ["Frames", "Predictions", "Points", "Logs"] {
+        for directory in ["Frames", "Predictions", "Points", "Outputs/Gaussians", "Logs"] {
             try fileManager.createDirectory(
                 at: stagingURL.appending(path: directory, directoryHint: .isDirectory),
-                withIntermediateDirectories: false
+                withIntermediateDirectories: true
             )
         }
         let manifest = ProjectManifest(

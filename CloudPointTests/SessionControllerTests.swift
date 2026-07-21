@@ -507,6 +507,93 @@ final class SessionControllerTests: XCTestCase {
         XCTAssertEqual(appendedRanges, [0...0])
     }
 
+    func testUnknownReconstructionModeOpensReadOnlyWithoutConstructingLingBotEngine() async throws {
+        let package = try TemporaryProjectPackage.make()
+        let encoded = try ProjectManifest.encode(.fixture())
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        var plan = try XCTUnwrap(object["reconstructionPlan"] as? [String: Any])
+        plan["modeID"] = "example.future.reconstruction.v9"
+        plan["configuration"] = ["type": "future", "settings": ["quality": 9]]
+        object["reconstructionPlan"] = plan
+        let manifest = try ProjectManifest.decode(JSONSerialization.data(withJSONObject: object))
+        try manifest.writeAtomically(to: package.url)
+
+        let factory = HarnessEngineFactory(engine: HarnessEngine(packageURL: package.url))
+        let effects = HarnessEffects()
+        let controller = SessionController(
+            manifest: manifest,
+            packageURL: package.url,
+            dependencies: .harness(
+                engineFactory: factory,
+                store: HarnessManifestStore(),
+                importer: HarnessRecordingImporter(frames: []),
+                effects: effects
+            )
+        )
+        defer { Task { await controller.close() } }
+
+        try await controller.open()
+        let snapshot = try await effects.next { $0.setupText != nil }
+
+        XCTAssertEqual(factory.calls, 0)
+        XCTAssertEqual(snapshot.phase, .empty)
+        XCTAssertEqual(
+            snapshot.setupText,
+            SessionControllerError.reconstructionModeUnavailable(
+                "example.future.reconstruction.v9"
+            ).localizedDescription
+        )
+    }
+
+    func testRelocationCopiesGaussianArtifactsFromManifestEnumeration() async throws {
+        let original = try TemporaryProjectPackage.make()
+        let destination = try TemporaryProjectPackage.make()
+        let frame = try WorkspaceTestFiles.writeJPEG(frameIndex: 4, in: original.url)
+        let plyPath = "Outputs/Gaussians/frame-00000004.ply"
+        let plyData = Data("synthetic-sharp-ply".utf8)
+        try plyData.write(to: original.url.appending(path: plyPath))
+        let manifest = ProjectManifest(
+            reconstructionPlan: .sharp(SharpReconstructionConfiguration(inputFrameIndex: 4)),
+            outputState: .gaussian(GaussianSceneOutput(
+                sourceFrameIndex: 4,
+                plyRelativePath: plyPath,
+                gaussianCount: 1
+            )),
+            frames: [frame],
+            sessionState: SessionState(
+                phase: .completed,
+                capturedCount: 1,
+                queuedCount: 1,
+                processedCount: 1
+            )
+        )
+        try manifest.writeAtomically(to: original.url)
+
+        let factory = HarnessEngineFactory(engine: HarnessEngine(packageURL: original.url))
+        let controller = SessionController(
+            manifest: manifest,
+            packageURL: original.url,
+            dependencies: .harness(
+                engineFactory: factory,
+                store: HarnessManifestStore(),
+                importer: HarnessRecordingImporter(frames: []),
+                effects: HarnessEffects()
+            )
+        )
+        defer { Task { await controller.close() } }
+
+        try await controller.open()
+        await controller.updatePackageURL(destination.url)
+        await controller.flush()
+
+        XCTAssertEqual(try Data(contentsOf: destination.url.appending(path: plyPath)), plyData)
+        XCTAssertEqual(
+            try ProjectManifest.load(from: destination.url).reconstructionPlan.modeID,
+            .sharpGaussian
+        )
+        XCTAssertEqual(factory.calls, 0)
+    }
+
     func testManifestWriteFailurePreventsEngineAdmission() async throws {
         let package = try TemporaryProjectPackage.make()
         let frame = try WorkspaceTestFiles.writeJPEG(frameIndex: 0, in: package.url)

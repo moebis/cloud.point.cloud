@@ -18,7 +18,7 @@ final class TemporaryProjectPackage {
         let fileManager = FileManager.default
 
         try fileManager.createDirectory(at: url, withIntermediateDirectories: true)
-        for directory in ["Frames", "Predictions", "Points", "Logs"] {
+        for directory in ["Frames", "Predictions", "Points", "Outputs/Gaussians", "Logs"] {
             try fileManager.createDirectory(
                 at: url.appending(path: directory),
                 withIntermediateDirectories: true

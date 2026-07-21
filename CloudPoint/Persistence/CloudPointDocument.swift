@@ -70,6 +70,15 @@ final class CloudPointDocument: ReferenceFileDocument, @unchecked Sendable {
         for name in ["Frames", "Predictions", "Points", "Logs"] where packageContents[name] == nil {
             packageContents[name] = FileWrapper(directoryWithFileWrappers: [:])
         }
+        if packageContents["Outputs"] == nil {
+            packageContents["Outputs"] = FileWrapper(directoryWithFileWrappers: [
+                "Gaussians": FileWrapper(directoryWithFileWrappers: [:]),
+            ])
+        } else if packageContents["Outputs"]?.fileWrappers?["Gaussians"] == nil {
+            var outputs = packageContents["Outputs"]?.fileWrappers ?? [:]
+            outputs["Gaussians"] = FileWrapper(directoryWithFileWrappers: [:])
+            packageContents["Outputs"] = FileWrapper(directoryWithFileWrappers: outputs)
+        }
 
         packageContents["Manifest.json"] = FileWrapper(
             regularFileWithContents: try ProjectManifest.encode(manifest)

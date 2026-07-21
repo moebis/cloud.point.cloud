@@ -56,8 +56,17 @@ struct CameraSourceReference: Codable, Sendable, Equatable {
     }
 }
 
-struct ProjectManifest: Codable, Sendable, Equatable {
-    static let currentFormatVersion = 2
+private struct LegacyProjectManifestV2: Decodable {
+    var formatVersion: Int
+    var projectID: UUID
+    var createdAt: Date
+    var updatedAt: Date
+    var engineConfiguration: EngineConfiguration
+    var recordingSource: RecordingSourceReference?
+    var cameraSource: CameraSourceReference?
+    var frames: [PersistedFrame]
+    var completedWindows: [CompletedWindow]
+    var sessionState: SessionState
 
     private enum CodingKeys: String, CodingKey {
         case formatVersion
@@ -70,41 +79,6 @@ struct ProjectManifest: Codable, Sendable, Equatable {
         case frames
         case completedWindows
         case sessionState
-    }
-
-    var formatVersion: Int
-    var projectID: UUID
-    var createdAt: Date
-    var updatedAt: Date
-    var engineConfiguration: EngineConfiguration
-    var recordingSource: RecordingSourceReference?
-    var cameraSource: CameraSourceReference?
-    var frames: [PersistedFrame]
-    var completedWindows: [CompletedWindow]
-    var sessionState: SessionState
-
-    init(
-        formatVersion: Int = ProjectManifest.currentFormatVersion,
-        projectID: UUID = UUID(),
-        createdAt: Date = Date(),
-        updatedAt: Date = Date(),
-        engineConfiguration: EngineConfiguration = EngineConfiguration(),
-        recordingSource: RecordingSourceReference? = nil,
-        cameraSource: CameraSourceReference? = nil,
-        frames: [PersistedFrame] = [],
-        completedWindows: [CompletedWindow] = [],
-        sessionState: SessionState = .empty
-    ) {
-        self.formatVersion = formatVersion
-        self.projectID = projectID
-        self.createdAt = createdAt
-        self.updatedAt = updatedAt
-        self.engineConfiguration = engineConfiguration
-        self.recordingSource = recordingSource
-        self.cameraSource = cameraSource
-        self.frames = frames
-        self.completedWindows = completedWindows
-        self.sessionState = sessionState
     }
 
     init(from decoder: Decoder) throws {
@@ -134,6 +108,120 @@ struct ProjectManifest: Codable, Sendable, Equatable {
             forKey: .cameraSource
         )
         frames = try container.decode([PersistedFrame].self, forKey: .frames)
+        completedWindows = try container.decode([CompletedWindow].self, forKey: .completedWindows)
+        sessionState = try container.decode(SessionState.self, forKey: .sessionState)
+    }
+
+    func migrated() -> ProjectManifest {
+        ProjectManifest(
+            projectID: projectID,
+            createdAt: createdAt,
+            updatedAt: updatedAt,
+            engineConfiguration: engineConfiguration,
+            reconstructionPlan: .lingbot(engineConfiguration),
+            outputState: .pointCloud,
+            recordingSource: recordingSource,
+            cameraSource: cameraSource,
+            frames: frames,
+            completedWindows: completedWindows,
+            sessionState: sessionState
+        )
+    }
+}
+
+struct ProjectManifest: Codable, Sendable, Equatable {
+    static let currentFormatVersion = 3
+
+    private enum CodingKeys: String, CodingKey {
+        case formatVersion
+        case projectID
+        case createdAt
+        case updatedAt
+        case reconstructionPlan
+        case outputState
+        case recordingSource
+        case cameraSource
+        case frames
+        case completedWindows
+        case sessionState
+    }
+
+    var formatVersion: Int
+    var projectID: UUID
+    var createdAt: Date
+    var updatedAt: Date
+    var reconstructionPlan: ReconstructionPlan
+    var outputState: ReconstructionOutputState
+    var recordingSource: RecordingSourceReference?
+    var cameraSource: CameraSourceReference?
+    var frames: [PersistedFrame]
+    var completedWindows: [CompletedWindow]
+    var sessionState: SessionState
+
+    var engineConfiguration: EngineConfiguration {
+        get { reconstructionPlan.lingbotConfiguration ?? EngineConfiguration() }
+        set { reconstructionPlan = .lingbot(newValue) }
+    }
+
+    init(
+        formatVersion: Int = ProjectManifest.currentFormatVersion,
+        projectID: UUID = UUID(),
+        createdAt: Date = Date(),
+        updatedAt: Date = Date(),
+        engineConfiguration: EngineConfiguration = EngineConfiguration(),
+        reconstructionPlan: ReconstructionPlan? = nil,
+        outputState: ReconstructionOutputState? = nil,
+        recordingSource: RecordingSourceReference? = nil,
+        cameraSource: CameraSourceReference? = nil,
+        frames: [PersistedFrame] = [],
+        completedWindows: [CompletedWindow] = [],
+        sessionState: SessionState = .empty
+    ) {
+        self.formatVersion = formatVersion
+        self.projectID = projectID
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+        let resolvedPlan = reconstructionPlan ?? .lingbot(engineConfiguration)
+        self.reconstructionPlan = resolvedPlan
+        self.outputState = outputState ?? Self.defaultOutputState(for: resolvedPlan)
+        self.recordingSource = recordingSource
+        self.cameraSource = cameraSource
+        self.frames = frames
+        self.completedWindows = completedWindows
+        self.sessionState = sessionState
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        formatVersion = try container.decode(Int.self, forKey: .formatVersion)
+        let projectIDText = try container.decode(String.self, forKey: .projectID)
+        guard let decodedProjectID = UUID(uuidString: projectIDText) else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .projectID,
+                in: container,
+                debugDescription: "projectID must be a canonical UUID"
+            )
+        }
+        projectID = decodedProjectID
+        createdAt = try container.decode(Date.self, forKey: .createdAt)
+        updatedAt = try container.decode(Date.self, forKey: .updatedAt)
+        reconstructionPlan = try container.decode(
+            ReconstructionPlan.self,
+            forKey: .reconstructionPlan
+        )
+        outputState = try container.decode(
+            ReconstructionOutputState.self,
+            forKey: .outputState
+        )
+        recordingSource = try container.decodeIfPresent(
+            RecordingSourceReference.self,
+            forKey: .recordingSource
+        )
+        cameraSource = try container.decodeIfPresent(
+            CameraSourceReference.self,
+            forKey: .cameraSource
+        )
+        frames = try container.decode([PersistedFrame].self, forKey: .frames)
         completedWindows = try container.decode(
             [CompletedWindow].self,
             forKey: .completedWindows
@@ -147,7 +235,8 @@ struct ProjectManifest: Codable, Sendable, Equatable {
         try container.encode(projectID.uuidString.lowercased(), forKey: .projectID)
         try container.encode(createdAt, forKey: .createdAt)
         try container.encode(updatedAt, forKey: .updatedAt)
-        try container.encode(engineConfiguration, forKey: .engineConfiguration)
+        try container.encode(reconstructionPlan, forKey: .reconstructionPlan)
+        try container.encode(outputState, forKey: .outputState)
         try container.encodeIfPresent(recordingSource, forKey: .recordingSource)
         try container.encodeIfPresent(cameraSource, forKey: .cameraSource)
         try container.encode(frames, forKey: .frames)
@@ -203,7 +292,7 @@ struct ProjectManifest: Codable, Sendable, Equatable {
     static func decode(_ data: Data) throws -> ProjectManifest {
         struct VersionProbe: Decodable { let formatVersion: Int }
         let probe = try JSONDecoder().decode(VersionProbe.self, from: data)
-        guard probe.formatVersion == currentFormatVersion else {
+        guard [2, currentFormatVersion].contains(probe.formatVersion) else {
             throw ProjectManifestError.unsupportedFormatVersion(probe.formatVersion)
         }
 
@@ -213,6 +302,9 @@ struct ProjectManifest: Codable, Sendable, Equatable {
             let value = try container.decode(String.self)
             return try date(fromRFC3339: value, codingPath: decoder.codingPath)
         }
+        if probe.formatVersion == 2 {
+            return try validate(decoder.decode(LegacyProjectManifestV2.self, from: data).migrated())
+        }
         return try validate(decoder.decode(ProjectManifest.self, from: data))
     }
 
@@ -220,8 +312,20 @@ struct ProjectManifest: Codable, Sendable, Equatable {
         guard manifest.formatVersion == currentFormatVersion else {
             throw ProjectManifestError.unsupportedFormatVersion(manifest.formatVersion)
         }
-        do { try manifest.engineConfiguration.validate() }
-        catch { throw ProjectManifestError.invalidConfiguration }
+        switch manifest.reconstructionPlan {
+        case let .lingbot(configuration):
+            do { try configuration.validate() }
+            catch { throw ProjectManifestError.invalidConfiguration }
+            guard manifest.outputState == .pointCloud else {
+                throw ProjectManifestError.invalidConfiguration
+            }
+        case .sharp:
+            guard case .gaussian = manifest.outputState else {
+                throw ProjectManifestError.invalidConfiguration
+            }
+        case .unavailable:
+            break
+        }
         guard manifest.recordingSource == nil || manifest.cameraSource == nil else {
             throw ProjectManifestError.invalidRecordingSource
         }
@@ -265,6 +369,13 @@ struct ProjectManifest: Codable, Sendable, Equatable {
             }
             previousFrameIndex = frame.index
             persistedFrameIndices.insert(frame.index)
+        }
+
+        if case .sharp = manifest.reconstructionPlan {
+            return try validateSharp(manifest, persistedFrameIndices: persistedFrameIndices)
+        }
+        if case .unavailable = manifest.reconstructionPlan {
+            return manifest
         }
 
         var previousWindowIndex: UInt32?
@@ -331,6 +442,22 @@ struct ProjectManifest: Codable, Sendable, Equatable {
         return manifest
     }
 
+    func artifactRelativePaths() -> Set<String> {
+        var paths = Set(frames.map(\.relativePath))
+        for window in completedWindows {
+            paths.insert(window.pointChunkRelativePath)
+            for artifact in window.frameArtifacts {
+                paths.insert(artifact.depthRelativePath)
+                paths.insert(artifact.confidenceRelativePath)
+                paths.insert(artifact.geometryRelativePath)
+            }
+        }
+        if case let .gaussian(output?) = outputState {
+            paths.insert(output.plyRelativePath)
+        }
+        return paths
+    }
+
     func resumeCheckpoint() throws -> ResumeCheckpoint? {
         _ = try Self.validate(self)
         guard let finalWindow = completedWindows.last else { return nil }
@@ -351,6 +478,51 @@ struct ProjectManifest: Codable, Sendable, Equatable {
 
     private static func validDuration(_ value: Double) -> Bool {
         value.isFinite && value >= 0
+    }
+
+    private static func defaultOutputState(
+        for plan: ReconstructionPlan
+    ) -> ReconstructionOutputState {
+        switch plan {
+        case .lingbot: .pointCloud
+        case .sharp: .gaussian(nil)
+        case .unavailable: .unavailable(
+            type: "unavailable",
+            payload: .object(["type": .string("unavailable")])
+        )
+        }
+    }
+
+    private static func validateSharp(
+        _ manifest: ProjectManifest,
+        persistedFrameIndices: Set<UInt32>
+    ) throws -> ProjectManifest {
+        guard manifest.completedWindows.isEmpty,
+              manifest.frames.count <= 1 else {
+            throw ProjectManifestError.invalidConfiguration
+        }
+        if case let .sharp(configuration) = manifest.reconstructionPlan,
+           let inputFrameIndex = configuration.inputFrameIndex,
+           !manifest.frames.isEmpty,
+           !persistedFrameIndices.contains(inputFrameIndex) {
+            throw ProjectManifestError.invalidConfiguration
+        }
+        guard case let .gaussian(output) = manifest.outputState else {
+            throw ProjectManifestError.invalidConfiguration
+        }
+        if let output {
+            guard persistedFrameIndices.contains(output.sourceFrameIndex),
+                  output.gaussianCount > 0,
+                  output.plyRelativePath.hasPrefix("Outputs/Gaussians/"),
+                  output.plyRelativePath.hasSuffix(".ply"),
+                  ProjectRelativePath.isSafe(output.plyRelativePath),
+                  manifest.sessionState.processedCount == 1 else {
+                throw ProjectManifestError.invalidArtifact
+            }
+        } else if manifest.sessionState.processedCount != 0 {
+            throw ProjectManifestError.invalidSessionState
+        }
+        return manifest
     }
 
     private static func rfc3339String(for date: Date, codingPath: [CodingKey]) throws -> String {

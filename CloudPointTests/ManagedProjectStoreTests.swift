@@ -91,7 +91,12 @@ final class ManagedProjectStoreTests: XCTestCase {
         XCTAssertEqual(manifest.sessionState, .empty)
         XCTAssertEqual(
             Set(try FileManager.default.contentsOfDirectory(atPath: project.packageURL.path)),
-            ["Manifest.json", "Frames", "Predictions", "Points", "Logs"]
+            ["Manifest.json", "Frames", "Predictions", "Points", "Outputs", "Logs"]
+        )
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: project.packageURL.appending(path: "Outputs/Gaussians").path
+            )
         )
         XCTAssertEqual(try partialFiles(beneath: support.url), [])
     }

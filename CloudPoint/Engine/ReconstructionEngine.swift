@@ -85,15 +85,18 @@ struct EngineConfiguration: Codable, Sendable, Equatable {
 struct ProjectDescriptor: Sendable, Equatable {
     var projectID: UUID
     var packageURL: URL
+    var modeID: ReconstructionModeID
     var resumeCheckpoint: ResumeCheckpoint?
 
     init(
         projectID: UUID,
         packageURL: URL,
+        modeID: ReconstructionModeID = .lingbotPointCloud,
         resumeCheckpoint: ResumeCheckpoint? = nil
     ) {
         self.projectID = projectID
         self.packageURL = packageURL
+        self.modeID = modeID
         self.resumeCheckpoint = resumeCheckpoint
     }
 }

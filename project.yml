@@ -86,6 +86,7 @@ targets:
     sources:
       - path: CloudPointMockWorker
       - path: CloudPoint/Domain/ProjectModels.swift
+      - path: CloudPoint/Domain/ReconstructionMode.swift
       - path: CloudPoint/Engine/ReconstructionEngine.swift
       - path: CloudPoint/Engine/WorkerProtocol.swift
     configFiles:

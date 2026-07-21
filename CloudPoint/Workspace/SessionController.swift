@@ -160,6 +160,7 @@ enum SessionControllerError: Error, Equatable, Sendable, LocalizedError {
     case packageNotSaved
     case packageRelocationWhileActive
     case engineUnavailable
+    case reconstructionModeUnavailable(String)
     case controllerClosed
     case invalidSourceFrame
     case invalidJPEG
@@ -175,6 +176,8 @@ enum SessionControllerError: Error, Equatable, Sendable, LocalizedError {
         case .packageRelocationWhileActive:
             "Finish or cancel reconstruction before moving this project"
         case .engineUnavailable: "Lingbot engine not installed yet"
+        case let .reconstructionModeUnavailable(modeID):
+            "This CloudPoint version cannot run reconstruction mode \(modeID). The project is open read-only."
         case .controllerClosed: "This project is closed"
         case .invalidSourceFrame: "The recording produced an invalid frame sequence"
         case .invalidJPEG: "A persisted frame is not a decodable JPEG"
@@ -584,22 +587,14 @@ final class SessionController: @unchecked Sendable {
         to destinationPackageURL: URL
     ) throws {
         let fileManager = FileManager.default
-        for directory in ["Frames", "Predictions", "Points", "Logs"] {
+        for directory in ["Frames", "Predictions", "Points", "Outputs/Gaussians", "Logs"] {
             try fileManager.createDirectory(
                 at: destinationPackageURL.appending(path: directory),
                 withIntermediateDirectories: true
             )
         }
 
-        var relativePaths = Set(manifest.frames.map(\.relativePath))
-        for window in manifest.completedWindows {
-            relativePaths.insert(window.pointChunkRelativePath)
-            for artifact in window.frameArtifacts {
-                relativePaths.insert(artifact.depthRelativePath)
-                relativePaths.insert(artifact.confidenceRelativePath)
-                relativePaths.insert(artifact.geometryRelativePath)
-            }
-        }
+        let relativePaths = manifest.artifactRelativePaths()
 
         for relativePath in relativePaths.sorted() {
             guard ProjectRelativePath.isSafe(relativePath) else {
@@ -799,6 +794,16 @@ final class SessionController: @unchecked Sendable {
         }
         _ = try ProjectManifest.validate(manifest)
 
+        guard case .lingbot = manifest.reconstructionPlan else {
+            openedPackageURL = packageURL.standardizedFileURL
+            engineReady = false
+            setupText = SessionControllerError.reconstructionModeUnavailable(
+                manifest.reconstructionPlan.modeID.rawValue
+            ).localizedDescription
+            await publishSnapshot()
+            return
+        }
+
         for window in manifest.completedWindows where restoreCommittedChunks {
             let chunk = try dependencies.pointChunkOpener.open(
                 packageURL.appending(path: window.pointChunkRelativePath)
@@ -875,6 +880,7 @@ final class SessionController: @unchecked Sendable {
             try await createdEngine.begin(project: ProjectDescriptor(
                 projectID: manifest.projectID,
                 packageURL: packageURL,
+                modeID: manifest.reconstructionPlan.modeID,
                 resumeCheckpoint: checkpoint
             ))
             try await checkForStartupInterruption(
