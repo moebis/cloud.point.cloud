@@ -51,6 +51,24 @@ text and provenance are included beside the source.
 CloudPoint contains adaptations and integration code around that snapshot; the
 vendored files themselves remain separately identified.
 
+## Apple SHARP source and research model
+
+CloudPoint includes a minimal inference-only snapshot of
+[`apple/ml-sharp`][apple-sharp] at commit
+`1eaa046834b81852261262b41b0919f5c1efdd2e`. Apple retains copyright in that
+source and distributes it under the license preserved at
+`worker/src/cloudpoint_worker/model/_vendor/ml_sharp/LICENSE`.
+
+The snapshot contains model construction and Gaussian PLY utilities. CloudPoint
+excludes the upstream CLI, image/video utilities, CUDA renderer, and `gsplat`,
+and modifies only absolute imports to use a private vendored namespace. Full
+provenance and acknowledgements are stored beside the source.
+
+The separately downloaded SHARP checkpoint is governed by Apple's Machine
+Learning Research Model License Agreement, preserved as `LICENSE_MODEL`. It is
+restricted to research purposes and is never committed to this repository or
+redistributed inside the application.
+
 ## Courthouse test images
 
 The nine courthouse images in `worker/tests/fixtures/courthouse/` come from the
@@ -82,8 +100,12 @@ preserved inside the bundled runtime.
 | msgspec | 0.19.0 | BSD-3-Clause |
 | NumPy | 2.3.1 | BSD-3-Clause and bundled component licenses |
 | Pillow | 11.3.0 | MIT-CMU |
+| plyfile | 1.1.2 | GPL-3.0-only |
 | safetensors | 0.5.3 | Apache-2.0 |
+| SciPy | 1.16.2 | BSD-3-Clause and bundled component licenses |
+| timm | 1.0.20 | Apache-2.0 |
 | PyTorch | 2.8.0 | BSD-3-Clause and bundled component licenses |
+| torchvision | 0.23.0 | BSD-3-Clause |
 | tqdm | 4.67.1 | MPL-2.0 and MIT |
 | filelock | 3.31.1 | MIT |
 | fsspec | 2026.6.0 | BSD-3-Clause |
@@ -108,3 +130,4 @@ provided by macOS and are not redistributed by this repository.
 [lingbot-mlx-port]: https://github.com/anmolduainter/lingbot-map-mlx/tree/c2e0cf04072afa1c817755f1d665e71349d0a32d
 [lingbot-model]: https://huggingface.co/robbyant/lingbot-map/tree/204754b72bb24f561f8d7e7e1e4e4cd9e809adf9
 [lingbot-source]: https://github.com/Robbyant/lingbot-map/tree/7ff6f3ed0913d4d326f8f13bbb429c4ffc0195c2
+[apple-sharp]: https://github.com/apple/ml-sharp/tree/1eaa046834b81852261262b41b0919f5c1efdd2e

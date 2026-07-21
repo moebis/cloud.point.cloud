@@ -30,6 +30,48 @@ if ! grep -F 'scripts/package-worker-runtime' "${repo_root}/project.yml" >/dev/n
   exit 1
 fi
 
+sharp_vendor="${repo_root}/worker/src/cloudpoint_worker/model/_vendor/ml_sharp"
+for required in \
+  "${sharp_vendor}/PROVENANCE.md" \
+  "${sharp_vendor}/LICENSE" \
+  "${sharp_vendor}/LICENSE_MODEL" \
+  "${sharp_vendor}/ACKNOWLEDGEMENTS" \
+  "${sharp_vendor}/models/predictor.py" \
+  "${sharp_vendor}/utils/gaussians.py"
+do
+  if [[ ! -f "$required" ]]; then
+    echo "pinned Apple SHARP inference source is missing: $required" >&2
+    exit 1
+  fi
+done
+if ! grep -F '1eaa046834b81852261262b41b0919f5c1efdd2e' \
+  "${sharp_vendor}/PROVENANCE.md" >/dev/null; then
+  echo "Apple SHARP provenance must pin the reviewed source commit" >&2
+  exit 1
+fi
+if find "$sharp_vendor" -type f \( -name '*.pt' -o -name '*.pth' -o -name '*.ckpt' \) \
+  | grep -q .; then
+  echo "Apple SHARP model weights must never be bundled with source" >&2
+  exit 1
+fi
+if find "$sharp_vendor" -type f -name '*gsplat*' | grep -q . || \
+   grep -R -E '(^|[[:space:]])(from|import)[[:space:]]+gsplat' "$sharp_vendor" >/dev/null; then
+  echo "CUDA-only gsplat code must not be bundled" >&2
+  exit 1
+fi
+for dependency in 'timm==1.0.20' 'plyfile==1.1.2'; do
+  if ! grep -F "$dependency" "${repo_root}/worker/pyproject.toml" >/dev/null; then
+    echo "SHARP runtime dependency is not pinned: $dependency" >&2
+    exit 1
+  fi
+done
+for package in '"timm"' '"plyfile"'; do
+  if ! grep -F "$package" "${scripts_dir}/package-worker-runtime" >/dev/null; then
+    echo "SHARP package is missing from the runtime manifest: $package" >&2
+    exit 1
+  fi
+done
+
 if grep -E '/Users/|worker/\.venv' "$launcher_source" >/dev/null; then
   echo "runtime launcher contains a build-machine path: $launcher_source" >&2
   exit 1
