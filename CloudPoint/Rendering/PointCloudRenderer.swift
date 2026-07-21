@@ -36,6 +36,9 @@ struct PointCloudCameraState: Sendable, Equatable {
 final class PointCloudRenderer: NSObject, MTKViewDelegate {
     static let maximumDisplayPointCount = 5_000_000
     static let uniformBufferStride = MemoryLayout<PointCloudUniforms>.stride
+    static let openCVToMetal = simd_float4x4(
+        diagonal: SIMD4<Float>(1, -1, -1, 1)
+    )
 
     let device: any MTLDevice
     let displayLimit: Int
@@ -211,7 +214,7 @@ final class PointCloudRenderer: NSObject, MTKViewDelegate {
             near: 0.01,
             far: 100_000
         )
-        return projection * view
+        return projection * view * Self.openCVToMetal
     }
 
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}

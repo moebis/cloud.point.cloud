@@ -90,6 +90,31 @@ final class RendererBufferTests: XCTestCase {
         XCTAssertEqual(renderer.cameraState, .default)
     }
 
+    func testDefaultViewProjectsOpenCVCoordinatesRightSideUpAndForward() throws {
+        let renderer = try makeRenderer(displayLimit: 10)
+        let matrix = renderer.viewProjectionMatrix(aspectRatio: 1)
+
+        let center = try projectedNDC(SIMD3<Float>(0, 0, 1), matrix: matrix)
+        let imageRight = try projectedNDC(SIMD3<Float>(1, 0, 1), matrix: matrix)
+        let imageDown = try projectedNDC(SIMD3<Float>(0, 1, 1), matrix: matrix)
+        let fartherForward = try projectedNDC(SIMD3<Float>(0, 0, 2), matrix: matrix)
+
+        XCTAssertGreaterThan(imageRight.x, center.x)
+        XCTAssertLessThan(imageDown.y, center.y)
+        XCTAssertGreaterThan(fartherForward.z, center.z)
+        XCTAssertTrue((0...1).contains(center.z))
+
+        renderer.orbit(deltaX: 100, deltaY: -50)
+        renderer.resetCamera()
+        let resetCenter = try projectedNDC(
+            SIMD3<Float>(0, 0, 1),
+            matrix: renderer.viewProjectionMatrix(aspectRatio: 1)
+        )
+        XCTAssertEqual(resetCenter.x, center.x, accuracy: 0.000_001)
+        XCTAssertEqual(resetCenter.y, center.y, accuracy: 0.000_001)
+        XCTAssertEqual(resetCenter.z, center.z, accuracy: 0.000_001)
+    }
+
     func testLargeTargetCloseZoomObliqueOrbitAndSubnormalAspectRemainFinite() throws {
         let renderer = try makeRenderer(displayLimit: 10)
 
@@ -152,6 +177,19 @@ final class RendererBufferTests: XCTestCase {
             device: device,
             displayLimit: displayLimit,
             libraryBundle: Bundle(for: PointCloudRenderer.self)
+        )
+    }
+
+    private func projectedNDC(
+        _ point: SIMD3<Float>,
+        matrix: simd_float4x4
+    ) throws -> SIMD3<Float> {
+        let clip = matrix * SIMD4<Float>(point, 1)
+        XCTAssertGreaterThan(clip.w, 0)
+        return try XCTUnwrap(
+            clip.w.isFinite && clip.w > 0
+                ? SIMD3<Float>(clip.x, clip.y, clip.z) / clip.w
+                : nil
         )
     }
 
