@@ -137,13 +137,15 @@ final class WorkspaceViewModel: ObservableObject {
     private let panelPresenter: any InputPanelPresenting
     private let onChooseAnotherVideo: () -> Void
     private let onRepairModel: () -> Void
+    private let onRetryProject: () -> Void
     private let packageScope: any SecurityScopedResourceAccessing
     private let packageScopeURL: URL
-    private let didStartPackageScope: Bool
+    private var packageScopeIsActive: Bool
     private var controller: SessionController?
     private var initialSource: WorkspaceInitialSource?
     private var didResolvePersistedRecording = false
     private var didStart = false
+    private var didClose = false
 
     var requiresCloseConfirmation: Bool { snapshot.isCapturing }
     var projectURL: URL { packageScopeURL }
@@ -173,6 +175,7 @@ final class WorkspaceViewModel: ObservableObject {
         engineFactory injectedEngineFactory: (@Sendable () throws -> any ReconstructionEngine)? = nil,
         onChooseAnotherVideo: @escaping () -> Void = {},
         onRepairModel: @escaping () -> Void = {},
+        onRetryProject: @escaping () -> Void = {},
         arguments: [String] = ProcessInfo.processInfo.arguments
     ) {
         self.document = document
@@ -180,6 +183,7 @@ final class WorkspaceViewModel: ObservableObject {
         self.panelPresenter = panelPresenter
         self.onChooseAnotherVideo = onChooseAnotherVideo
         self.onRepairModel = onRepairModel
+        self.onRetryProject = onRetryProject
         self.packageScope = packageScope
         let resolvedPackageURL: URL
         if let packageBookmarkData,
@@ -189,7 +193,7 @@ final class WorkspaceViewModel: ObservableObject {
             resolvedPackageURL = packageURL
         }
         packageScopeURL = resolvedPackageURL
-        didStartPackageScope = packageScope.startAccessing(resolvedPackageURL)
+        packageScopeIsActive = packageScope.startAccessing(resolvedPackageURL)
         self.initialSource = initialSource
         recoveryAction = nil
         sourceErrorText = nil
@@ -256,13 +260,15 @@ final class WorkspaceViewModel: ObservableObject {
                     self.snapshot = snapshot
                     self.renderer?.setPointSize(snapshot.pointSize)
                     self.renderer?.setConfidenceThreshold(snapshot.confidenceThreshold)
-                    if snapshot.setupText != nil,
-                       self.sourceErrorText == nil,
-                       self.recoveryAction == nil {
-                        self.recoveryAction = .repairModel
-                    } else if snapshot.setupText == nil,
-                              self.recoveryAction == .repairModel {
-                        self.recoveryAction = nil
+                    if self.sourceErrorText == nil {
+                        if snapshot.setupText != nil {
+                            self.recoveryAction = .repairModel
+                        } else if snapshot.phase == .failed {
+                            self.recoveryAction = .resumeFromCheckpoint
+                        } else if self.recoveryAction == .repairModel
+                                    || self.recoveryAction == .resumeFromCheckpoint {
+                            self.recoveryAction = nil
+                        }
                     }
                     self.beginInitialRecordingIfReady()
                 }
@@ -303,7 +309,7 @@ final class WorkspaceViewModel: ObservableObject {
         let previewToClose = preflightPreview
         let scope = packageScope
         let scopeURL = packageScopeURL
-        let shouldStopScope = didStartPackageScope
+        let shouldStopScope = packageScopeIsActive
         Task {
             await controllerToClose?.close()
             await previewToClose.stop()
@@ -340,6 +346,17 @@ final class WorkspaceViewModel: ObservableObject {
             if let selectedCameraID {
                 await showCameraPreflight(deviceID: selectedCameraID)
             }
+        }
+    }
+
+    func close() async {
+        guard !didClose else { return }
+        didClose = true
+        await controller?.close()
+        await preflightPreview.stop()
+        if packageScopeIsActive {
+            packageScope.stopAccessing(packageScopeURL)
+            packageScopeIsActive = false
         }
     }
 
@@ -400,7 +417,7 @@ final class WorkspaceViewModel: ObservableObject {
         case .repairModel:
             onRepairModel()
         case .resumeFromCheckpoint:
-            resume()
+            onRetryProject()
         case nil:
             break
         }

@@ -5,17 +5,16 @@ import XCTest
 final class RealWorkerBridgeTests: XCTestCase {
     func testPreparedLingbotWorkerCompletesNineFrameFixture() async throws {
         let environment = ProcessInfo.processInfo.environment
-        guard let runtimePath = environment["CLOUDPOINT_WORKER_RUNTIME"],
-              let modelPath = environment["CLOUDPOINT_REAL_MODEL_DIR"],
-              runtimePath.hasPrefix("/"),
+        guard let modelPath = environment["CLOUDPOINT_REAL_MODEL_DIR"],
               modelPath.hasPrefix("/"),
               FileManager.default.fileExists(atPath: modelPath) else {
             throw XCTSkip(
-                "Set CLOUDPOINT_WORKER_RUNTIME and CLOUDPOINT_REAL_MODEL_DIR for the real MLX bridge test"
+                "Set CLOUDPOINT_REAL_MODEL_DIR for the real MLX bridge test"
             )
         }
         let runtime = try WorkerRuntime.resolve(
-            bundleValue: runtimePath,
+            bundleValue: environment["CLOUDPOINT_WORKER_RUNTIME"]
+                ?? Bundle.main.object(forInfoDictionaryKey: "CloudPointWorkerRuntime") as? String,
             environment: environment
         )
         let fixture = try RealWorkerBridgeFixture.make()
@@ -63,6 +62,7 @@ final class RealWorkerBridgeTests: XCTestCase {
 }
 
 private enum RealWorkerBridgeTestError: Error {
+    case missingBundledFixture
     case streamEndedBeforeCompletion
 }
 
@@ -86,8 +86,8 @@ private final class RealWorkerBridgeFixture {
 
     static func make() throws -> RealWorkerBridgeFixture {
         let fileManager = FileManager.default
-        let packageURL = URL(
-            filePath: "/private/tmp/cloudpoint-real-bridge-(UUID().uuidString.lowercased()).cloudpoint",
+        let packageURL = fileManager.temporaryDirectory.appending(
+            path: "cloudpoint-real-bridge-\(UUID().uuidString.lowercased()).cloudpoint",
             directoryHint: .isDirectory
         )
         try fileManager.createDirectory(at: packageURL, withIntermediateDirectories: false)
@@ -97,11 +97,12 @@ private final class RealWorkerBridgeFixture {
                 withIntermediateDirectories: false
             )
         }
-        let repositoryRoot = URL(filePath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-        let sourceDirectory = repositoryRoot
-            .appending(path: "worker/tests/fixtures/courthouse", directoryHint: .isDirectory)
+        guard let sourceDirectory = Bundle(for: RealWorkerBridgeTests.self).url(
+            forResource: "courthouse",
+            withExtension: nil
+        ) else {
+            throw RealWorkerBridgeTestError.missingBundledFixture
+        }
         var frames: [PersistedFrame] = []
         for index in 0..<9 {
             let source = sourceDirectory.appending(path: String(format: "%06d.png", index))

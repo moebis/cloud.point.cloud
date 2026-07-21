@@ -124,8 +124,9 @@ struct SystemCameraPreflight: CameraPreflighting {
 }
 
 struct WorkspaceLaunch: Identifiable, Sendable, Equatable {
-    var id: UUID { projectID }
+    var id: UUID { sessionID }
 
+    let sessionID: UUID
     let projectID: UUID
     let sourceTitle: String
     let packageURL: URL
@@ -184,6 +185,22 @@ final class AppCoordinator: ObservableObject {
         case recording(URL, VideoProbeResult)
         case camera(CameraPreflightResult)
         case project(URL)
+        case recent(RecentProject)
+    }
+
+    private struct WorkspaceIdentity: Equatable {
+        let projectID: UUID
+        let packageURL: URL
+
+        init(projectID: UUID, packageURL: URL) {
+            self.projectID = projectID
+            self.packageURL = packageURL.standardizedFileURL
+        }
+    }
+
+    private struct OwnedWorkspace {
+        let identity: WorkspaceIdentity
+        let viewModel: WorkspaceViewModel
     }
 
     @Published private(set) var destination: Destination = .welcome
@@ -204,6 +221,7 @@ final class AppCoordinator: ObservableObject {
     private let engineContext: ProductionReconstructionContext?
     private var didStart = false
     private var pendingModelRoute: PendingModelRoute?
+    private var ownedWorkspace: OwnedWorkspace?
 
     init(
         projectStore: any ManagedProjectStoring,
@@ -316,17 +334,40 @@ final class AppCoordinator: ObservableObject {
     }
 
     func openRecent(_ recent: RecentProject) {
-        Task { await openProject(recent.packageURL) }
+        Task { await openRecentProject(recent) }
     }
 
-    func showWelcome() {
+    func showWelcome() async {
+        await closeOwnedWorkspace()
         destination = .welcome
-        Task { await refreshRecentProjects() }
+        await refreshRecentProjects()
     }
 
     func repairModel() {
-        pendingModelRoute = nil
+        if case let .workspace(launch) = destination {
+            pendingModelRoute = .project(launch.packageURL)
+        } else {
+            pendingModelRoute = nil
+        }
         isModelSetupPresented = true
+    }
+
+    func retryCurrentProject() {
+        guard case let .workspace(launch) = destination else { return }
+        pendingModelRoute = .project(launch.packageURL)
+        Task {
+            await refreshEngineHealth()
+            guard engineState == .ready, engineContext != nil else {
+                isModelSetupPresented = true
+                return
+            }
+            let route = pendingModelRoute
+            pendingModelRoute = nil
+            guard case let .project(url) = route else { return }
+            await performRoute {
+                try await finishOpenProject(url, replacingExistingWorkspace: true)
+            }
+        }
     }
 
     func continueAfterModelSetup() async {
@@ -343,9 +384,36 @@ final class AppCoordinator: ObservableObject {
             case let .camera(preflight):
                 try await finishCameraProject(preflight)
             case let .project(url):
-                try await finishOpenProject(url)
+                try await finishOpenProject(url, replacingExistingWorkspace: true)
+            case let .recent(recent):
+                try await finishOpenRecentProject(recent)
             }
         }
+    }
+
+    func workspaceViewModel(for launch: WorkspaceLaunch) -> WorkspaceViewModel {
+        let identity = WorkspaceIdentity(
+            projectID: launch.projectID,
+            packageURL: launch.packageURL
+        )
+        if let existing = ownedWorkspace, existing.identity == identity {
+            return existing.viewModel
+        }
+        let viewModel = WorkspaceViewModel(
+            document: CloudPointDocument(manifest: launch.manifest),
+            packageURL: launch.packageURL,
+            packageBookmarkData: launch.packageBookmarkData,
+            initialSource: launch.initialSource,
+            engineFactory: reconstructionEngineFactory,
+            onChooseAnotherVideo: { [weak self] in self?.chooseVideo() },
+            onRepairModel: { [weak self] in self?.repairModel() },
+            onRetryProject: { [weak self] in self?.retryCurrentProject() }
+        )
+        if let existing = ownedWorkspace {
+            Task { await existing.viewModel.close() }
+        }
+        ownedWorkspace = OwnedWorkspace(identity: identity, viewModel: viewModel)
+        return viewModel
     }
 
     var reconstructionEngineFactory: @Sendable () throws -> any ReconstructionEngine {
@@ -376,7 +444,7 @@ final class AppCoordinator: ObservableObject {
             sourceName: url.lastPathComponent,
             source: reference
         )
-        destination = .workspace(Self.launch(
+        await presentWorkspace(Self.launch(
             project,
             initialSource: .recording(
                 url,
@@ -390,16 +458,41 @@ final class AppCoordinator: ObservableObject {
         await performRoute {
             let project = try await projectStore.openProject(at: url)
             let phase = project.manifest.sessionState.phase
-            if ![SessionPhase.completed, .cancelled, .failed].contains(phase) {
+            if ![SessionPhase.completed, .cancelled].contains(phase) {
                 guard await requireReadyModel(for: .project(url)) else { return }
             }
-            destination = .workspace(Self.launch(project, initialSource: nil))
+            await presentWorkspace(Self.launch(project, initialSource: nil))
         }
     }
 
-    private func finishOpenProject(_ url: URL) async throws {
+    private func openRecentProject(_ recent: RecentProject) async {
+        await performRoute {
+            let project = try await projectStore.openRecentProject(recent)
+            let phase = project.manifest.sessionState.phase
+            if ![SessionPhase.completed, .cancelled].contains(phase) {
+                guard await requireReadyModel(for: .recent(recent)) else { return }
+            }
+            await presentWorkspace(Self.launch(project, initialSource: nil))
+        }
+    }
+
+    private func finishOpenProject(
+        _ url: URL,
+        replacingExistingWorkspace: Bool = false
+    ) async throws {
         let project = try await projectStore.openProject(at: url)
-        destination = .workspace(Self.launch(project, initialSource: nil))
+        await presentWorkspace(
+            Self.launch(project, initialSource: nil),
+            replacingExistingWorkspace: replacingExistingWorkspace
+        )
+    }
+
+    private func finishOpenRecentProject(_ recent: RecentProject) async throws {
+        let project = try await projectStore.openRecentProject(recent)
+        await presentWorkspace(
+            Self.launch(project, initialSource: nil),
+            replacingExistingWorkspace: true
+        )
     }
 
     private func createCameraProject() async {
@@ -419,7 +512,7 @@ final class AppCoordinator: ObservableObject {
             sourceName: "\(preflight.deviceName) Capture",
             source: source
         )
-        destination = .workspace(Self.launch(
+        await presentWorkspace(Self.launch(
             project,
             initialSource: .camera(
                 deviceID: preflight.deviceID,
@@ -478,11 +571,32 @@ final class AppCoordinator: ObservableObject {
         catch { errorMessage = error.localizedDescription }
     }
 
+    private func presentWorkspace(
+        _ launch: WorkspaceLaunch,
+        replacingExistingWorkspace: Bool = false
+    ) async {
+        let identity = WorkspaceIdentity(
+            projectID: launch.projectID,
+            packageURL: launch.packageURL
+        )
+        if replacingExistingWorkspace || ownedWorkspace?.identity != identity {
+            await closeOwnedWorkspace()
+        }
+        destination = .workspace(launch)
+    }
+
+    private func closeOwnedWorkspace() async {
+        guard let existing = ownedWorkspace else { return }
+        ownedWorkspace = nil
+        await existing.viewModel.close()
+    }
+
     private static func launch(
         _ project: ManagedProject,
         initialSource: WorkspaceInitialSource?
     ) -> WorkspaceLaunch {
         WorkspaceLaunch(
+            sessionID: UUID(),
             projectID: project.id,
             sourceTitle: project.displayName,
             packageURL: project.packageURL,

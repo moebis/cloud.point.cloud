@@ -62,7 +62,14 @@ protocol ManagedProjectStoring: Sendable {
         source: CameraSourceReference
     ) async throws -> ManagedProject
     func openProject(at url: URL) async throws -> ManagedProject
+    func openRecentProject(_ recent: RecentProject) async throws -> ManagedProject
     func recentProjects() async throws -> [RecentProject]
+}
+
+extension ManagedProjectStoring {
+    func openRecentProject(_ recent: RecentProject) async throws -> ManagedProject {
+        try await openProject(at: recent.packageURL)
+    }
 }
 
 enum ManagedProjectStoreError: Error, LocalizedError, Equatable {
@@ -208,13 +215,44 @@ actor ManagedProjectStore: ManagedProjectStoring {
 
     func openProject(at url: URL) throws -> ManagedProject {
         let packageURL = url.standardizedFileURL
+        return try openProjectWithSecurityScope(at: packageURL)
+    }
+
+    func openRecentProject(_ recent: RecentProject) throws -> ManagedProject {
+        guard let bookmarkData = recent.packageBookmarkData else {
+            return try openProject(at: recent.packageURL)
+        }
+        let resolution = try bookmarks.resolve(bookmarkData)
+        return try openProjectWithSecurityScope(
+            at: resolution.url.standardizedFileURL,
+            expectedProjectID: recent.id
+        )
+    }
+
+    private func openProjectWithSecurityScope(
+        at packageURL: URL,
+        expectedProjectID: UUID? = nil
+    ) throws -> ManagedProject {
         let didStartScope = scope.startAccessing(packageURL)
         defer { if didStartScope { scope.stopAccessing(packageURL) } }
+        return try openProjectWithinScope(
+            at: packageURL,
+            expectedProjectID: expectedProjectID
+        )
+    }
+
+    private func openProjectWithinScope(
+        at packageURL: URL,
+        expectedProjectID: UUID?
+    ) throws -> ManagedProject {
         guard packageURL.pathExtension.lowercased() == "cloudpoint",
               (try packageURL.resourceValues(forKeys: [.isDirectoryKey])).isDirectory == true else {
             throw ManagedProjectStoreError.invalidProjectPackage
         }
         let manifest = try ProjectManifest.load(from: packageURL)
+        guard expectedProjectID == nil || manifest.projectID == expectedProjectID else {
+            throw ManagedProjectStoreError.invalidProjectPackage
+        }
         let openedAt = now()
         let records = try loadRecentRecords()
         let prior = records.first { $0.id == manifest.projectID }

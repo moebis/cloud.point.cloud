@@ -22,6 +22,50 @@ final class ManagedProjectStoreTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(bookmarks.resolveCount, 1)
     }
 
+    @MainActor
+    func testAppCoordinatorReopensExternalRecentUsingRetainedBookmarkCapability() async throws {
+        let support = try TemporaryDirectory.make()
+        let external = try TemporaryProjectPackage.make()
+        var manifest = ProjectManifest.fixture()
+        manifest.sessionState = SessionState(phase: .completed)
+        try manifest.writeAtomically(to: external.url)
+        let bookmarks = ProjectBookmarkHarness()
+        let store = ManagedProjectStore(
+            applicationSupportDirectory: support.url,
+            bookmarks: bookmarks
+        )
+        _ = try await store.openProject(at: external.url)
+        guard let recent = try await store.recentProjects().first else {
+            return XCTFail("Expected external recent project")
+        }
+        let movedURL = external.url.deletingLastPathComponent().appending(
+            path: "Moved-\(UUID().uuidString).cloudpoint",
+            directoryHint: .isDirectory
+        )
+        try FileManager.default.moveItem(at: external.url, to: movedURL)
+        defer { try? FileManager.default.removeItem(at: movedURL) }
+        bookmarks.resolveTo(movedURL)
+        let resolveCountBeforeReopen = bookmarks.resolveCount
+        let coordinator = AppCoordinator(
+            projectStore: store,
+            videoProbe: UnusedProjectVideoProbe()
+        )
+
+        coordinator.openRecent(recent)
+
+        let didFinish = await waitForRecentOpen {
+            if case .workspace = coordinator.destination { return true }
+            return coordinator.errorMessage != nil
+        }
+        guard case let .workspace(launch) = coordinator.destination else {
+            return XCTFail("Recent project did not reopen: \(coordinator.errorMessage ?? "unknown error")")
+        }
+        XCTAssertTrue(didFinish)
+        XCTAssertGreaterThan(bookmarks.resolveCount, resolveCountBeforeReopen)
+        XCTAssertEqual(launch.packageURL.standardizedFileURL, movedURL.standardizedFileURL)
+        XCTAssertEqual(launch.packageBookmarkData, Data(movedURL.path.utf8))
+    }
+
     func testCreateProjectAtomicallyBuildsAutosavedPackageUnderApplicationSupport() async throws {
         let support = try TemporaryDirectory.make()
         let projectID = UUID(uuidString: "00000000-0000-0000-0000-000000000101")!
@@ -162,17 +206,48 @@ final class ManagedProjectStoreTests: XCTestCase {
 private final class ProjectBookmarkHarness: SecurityScopedBookmarking, @unchecked Sendable {
     private let lock = NSLock()
     private var storedResolveCount = 0
+    private var resolvedURL: URL?
 
     var resolveCount: Int { lock.withLock { storedResolveCount } }
+
+    func resolveTo(_ url: URL) {
+        lock.withLock { resolvedURL = url }
+    }
 
     func makeBookmark(for url: URL) throws -> Data { Data(url.path.utf8) }
 
     func resolve(_ bookmark: Data) throws -> SecurityScopedBookmarkResolution {
-        lock.withLock { storedResolveCount += 1 }
+        let url = lock.withLock {
+            storedResolveCount += 1
+            return resolvedURL ?? URL(
+                filePath: String(decoding: bookmark, as: UTF8.self),
+                directoryHint: .isDirectory
+            )
+        }
         return SecurityScopedBookmarkResolution(
-            url: URL(filePath: String(decoding: bookmark, as: UTF8.self), directoryHint: .isDirectory),
+            url: url,
             isStale: false
         )
+    }
+}
+
+@MainActor
+private func waitForRecentOpen(
+    timeout: Duration = .seconds(2),
+    condition: @escaping @MainActor () -> Bool
+) async -> Bool {
+    let clock = ContinuousClock()
+    let deadline = clock.now.advanced(by: timeout)
+    while clock.now < deadline {
+        if condition() { return true }
+        try? await Task.sleep(for: .milliseconds(10))
+    }
+    return condition()
+}
+
+private struct UnusedProjectVideoProbe: VideoMetadataProbing {
+    func probe(_ url: URL, framesPerSecond: Int) async throws -> VideoProbeResult {
+        throw VideoProbeError.noVideoTrack
     }
 }
 

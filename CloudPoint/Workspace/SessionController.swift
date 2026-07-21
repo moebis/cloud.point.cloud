@@ -800,7 +800,7 @@ final class SessionController: @unchecked Sendable {
             try await dependencies.effects.appendPointChunk(chunk)
         }
 
-        if [.completed, .cancelled, .failed].contains(manifest.sessionState.phase) {
+        if [.completed, .cancelled].contains(manifest.sessionState.phase) {
             openedPackageURL = packageURL.standardizedFileURL
             engineReady = false
             await publishSnapshot()

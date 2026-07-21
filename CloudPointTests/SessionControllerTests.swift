@@ -109,6 +109,44 @@ final class SessionControllerTests: XCTestCase {
         XCTAssertEqual(appendedRanges, [0...0])
     }
 
+    func testFailedProjectRetriesDurableTailToTerminalCompletion() async throws {
+        let package = try TemporaryProjectPackage.make()
+        let frame = try WorkspaceTestFiles.writeJPEG(frameIndex: 0, in: package.url)
+        var manifest = ProjectManifest.fixture()
+        manifest.frames = [frame]
+        manifest.sessionState = SessionState(
+            phase: .failed,
+            capturedCount: 1,
+            queuedCount: 1,
+            failedCount: 1
+        )
+        try manifest.writeAtomically(to: package.url)
+
+        let effects = HarnessEffects()
+        let controller = SessionController(
+            manifest: manifest,
+            packageURL: package.url,
+            dependencies: SessionControllerDependencies(
+                engineFactory: { MockReconstructionEngine() },
+                effects: SessionControllerEffects(
+                    adoptManifest: { await effects.adopt($0) },
+                    appendPointChunk: { await effects.append($0) },
+                    publishSnapshot: { await effects.publish($0) }
+                )
+            )
+        )
+        defer { Task { await controller.close() } }
+
+        try await controller.open()
+        let completed = try await effects.next { $0.phase == .completed }
+
+        XCTAssertEqual(completed.processedCount, 1)
+        XCTAssertEqual(completed.failedCount, 1)
+        let disk = try ProjectManifest.load(from: package.url)
+        XCTAssertEqual(disk.sessionState.phase, .completed)
+        XCTAssertEqual(disk.completedWindows.count, 1)
+    }
+
     func testImmediateMockEventsCommitWindowBeforeRendererAndReachCompletion() async throws {
         let package = try TemporaryProjectPackage.make()
         let frame = try WorkspaceTestFiles.writeJPEG(frameIndex: 0, in: package.url)

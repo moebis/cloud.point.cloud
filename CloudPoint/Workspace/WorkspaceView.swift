@@ -2,7 +2,7 @@ import AppKit
 import SwiftUI
 
 struct WorkspaceView: View {
-    @StateObject private var viewModel: WorkspaceViewModel
+    @ObservedObject private var viewModel: WorkspaceViewModel
     @State private var inspectorPresented = true
     @State private var closeConfirmationPresented = false
     @State private var confirmedClose: (() -> Void)?
@@ -12,30 +12,15 @@ struct WorkspaceView: View {
     let onShowWelcome: () -> Void
 
     init(
-        document: CloudPointDocument,
-        packageURL: URL,
-        packageBookmarkData: Data? = nil,
-        initialSource: WorkspaceInitialSource? = nil,
+        viewModel: WorkspaceViewModel,
         sourceTitle: String = "CloudPoint Project",
-        engineFactory: (@Sendable () throws -> any ReconstructionEngine)? = nil,
         onOpenVideo: @escaping () -> Void = {},
-        onRepairModel: @escaping () -> Void = {},
         onShowWelcome: @escaping () -> Void = {}
     ) {
+        self.viewModel = viewModel
         self.sourceTitle = sourceTitle
         self.onOpenVideo = onOpenVideo
         self.onShowWelcome = onShowWelcome
-        _viewModel = StateObject(
-            wrappedValue: WorkspaceViewModel(
-                document: document,
-                packageURL: packageURL,
-                packageBookmarkData: packageBookmarkData,
-                initialSource: initialSource,
-                engineFactory: engineFactory,
-                onChooseAnotherVideo: onOpenVideo,
-                onRepairModel: onRepairModel
-            )
-        )
     }
 
     var body: some View {
@@ -570,7 +555,7 @@ private struct ProgressMetric: View {
 }
 
 @MainActor
-private struct WorkspaceWindowCloseGuard: NSViewRepresentable {
+struct WorkspaceWindowCloseGuard: NSViewRepresentable {
     let isEnabled: Bool
     let onCloseRequested: (@escaping () -> Void) -> Void
 
@@ -578,14 +563,16 @@ private struct WorkspaceWindowCloseGuard: NSViewRepresentable {
 
     func makeNSView(context: Context) -> NSView {
         let view = NSView()
-        Task { @MainActor in context.coordinator.attach(to: view.window) }
+        context.coordinator.isEnabled = isEnabled
+        context.coordinator.onCloseRequested = onCloseRequested
+        Task { @MainActor in context.coordinator.synchronize(with: view.window) }
         return view
     }
 
     func updateNSView(_ view: NSView, context: Context) {
         context.coordinator.isEnabled = isEnabled
         context.coordinator.onCloseRequested = onCloseRequested
-        Task { @MainActor in context.coordinator.attach(to: view.window) }
+        Task { @MainActor in context.coordinator.synchronize(with: view.window) }
     }
 
     static func dismantleNSView(_ view: NSView, coordinator: Coordinator) {
@@ -600,8 +587,23 @@ private struct WorkspaceWindowCloseGuard: NSViewRepresentable {
         var onCloseRequested: ((@escaping () -> Void) -> Void)?
         private var allowsNextClose = false
 
+        func synchronize(with window: NSWindow?) {
+            guard isEnabled else {
+                detach()
+                return
+            }
+            attach(to: window)
+        }
+
         func attach(to window: NSWindow?) {
-            guard let window, self.window !== window else { return }
+            guard let window else { return }
+            if self.window === window {
+                if window.delegate !== self {
+                    previousDelegate = window.delegate
+                    window.delegate = self
+                }
+                return
+            }
             detach()
             self.window = window
             previousDelegate = window.delegate
@@ -612,6 +614,7 @@ private struct WorkspaceWindowCloseGuard: NSViewRepresentable {
             if window?.delegate === self { window?.delegate = previousDelegate }
             window = nil
             previousDelegate = nil
+            allowsNextClose = false
         }
 
         func windowShouldClose(_ sender: NSWindow) -> Bool {
@@ -622,22 +625,15 @@ private struct WorkspaceWindowCloseGuard: NSViewRepresentable {
             guard isEnabled else {
                 return previousDelegate?.windowShouldClose?(sender) ?? true
             }
-            onCloseRequested? { [weak self] in
-                guard let self, let window = self.window else { return }
-                allowsNextClose = true
-                window.performClose(nil)
+            let requestedWindow = sender
+            onCloseRequested? { [weak self, weak requestedWindow] in
+                guard let requestedWindow else { return }
+                if let self, requestedWindow.delegate === self {
+                    self.allowsNextClose = true
+                }
+                requestedWindow.performClose(nil)
             }
             return false
-        }
-
-        override func responds(to selector: Selector!) -> Bool {
-            super.responds(to: selector) || previousDelegate?.responds(to: selector) == true
-        }
-
-        override func forwardingTarget(for selector: Selector!) -> Any? {
-            previousDelegate?.responds(to: selector) == true
-                ? previousDelegate
-                : super.forwardingTarget(for: selector)
         }
     }
 }

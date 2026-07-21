@@ -1,3 +1,5 @@
+import AppKit
+import SwiftUI
 import XCTest
 @testable import CloudPoint
 import UniformTypeIdentifiers
@@ -157,6 +159,137 @@ final class WorkspaceViewModelTests: XCTestCase {
         XCTAssertFalse(WorkspaceViewModel.shouldUseMockEngine(arguments: ["CloudPoint", "--mock-engine-extra"]))
     }
 
+    func testWindowCloseGuardDoesNotAdvertisePreviousDelegateOptionalSelectors() async throws {
+        let package = try TemporaryProjectPackage.make()
+        var manifest = ProjectManifest()
+        manifest.sessionState = SessionState(phase: .capturing, isCapturing: true)
+        try manifest.writeAtomically(to: package.url)
+        let viewModel = WorkspaceViewModel(
+            document: CloudPointDocument(manifest: manifest),
+            packageURL: package.url,
+            arguments: []
+        )
+        let previousDelegate = OptionalWindowDelegate()
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 900, height: 650),
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: false
+        )
+        window.delegate = previousDelegate
+        window.contentView = NSHostingView(rootView: WorkspaceView(viewModel: viewModel))
+        window.orderFront(nil)
+        defer {
+            window.delegate = previousDelegate
+            window.orderOut(nil)
+            window.contentView = nil
+        }
+
+        let didAttachGuard = await waitUntil { window.delegate !== previousDelegate }
+        let optionalSelector = #selector(NSWindowDelegate.windowDidResize(_:))
+
+        XCTAssertTrue(didAttachGuard)
+        XCTAssertTrue(previousDelegate.responds(to: optionalSelector))
+        XCTAssertFalse(window.delegate?.responds(to: optionalSelector) == true)
+        await viewModel.close()
+    }
+
+    func testWindowCloseGuardRestoresPreviousDelegateWhenDisabled() async throws {
+        let activePackage = try TemporaryProjectPackage.make()
+        var activeManifest = ProjectManifest()
+        activeManifest.sessionState = SessionState(phase: .capturing, isCapturing: true)
+        try activeManifest.writeAtomically(to: activePackage.url)
+        let activeViewModel = WorkspaceViewModel(
+            document: CloudPointDocument(manifest: activeManifest),
+            packageURL: activePackage.url,
+            arguments: []
+        )
+        let completedPackage = try TemporaryProjectPackage.make()
+        var completedManifest = ProjectManifest()
+        completedManifest.sessionState = SessionState(phase: .completed)
+        try completedManifest.writeAtomically(to: completedPackage.url)
+        let completedViewModel = WorkspaceViewModel(
+            document: CloudPointDocument(manifest: completedManifest),
+            packageURL: completedPackage.url,
+            arguments: []
+        )
+        let previousDelegate = OptionalWindowDelegate()
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 900, height: 650),
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: false
+        )
+        let host = NSHostingView(rootView: WorkspaceView(viewModel: activeViewModel))
+        window.delegate = previousDelegate
+        window.contentView = host
+        window.orderFront(nil)
+        defer {
+            window.delegate = previousDelegate
+            window.orderOut(nil)
+            window.contentView = nil
+        }
+
+        let didAttachGuard = await waitUntil { window.delegate !== previousDelegate }
+        XCTAssertTrue(didAttachGuard)
+
+        host.rootView = WorkspaceView(viewModel: completedViewModel)
+
+        let didRestorePreviousDelegate = await waitUntil {
+            window.delegate === previousDelegate
+        }
+        XCTAssertTrue(didRestorePreviousDelegate)
+        await activeViewModel.close()
+        await completedViewModel.close()
+    }
+
+    func testConfirmedWindowCloseStillClosesAfterGuardDisables() async {
+        let previousDelegate = OptionalWindowDelegate()
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 900, height: 650),
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: false
+        )
+        window.isReleasedWhenClosed = false
+        var confirmedClose: (() -> Void)?
+        let host = NSHostingView(rootView: WorkspaceWindowCloseGuard(isEnabled: true) {
+            confirmedClose = $0
+        })
+        window.delegate = previousDelegate
+        window.contentView = host
+        window.orderFront(nil)
+        host.rootView = WorkspaceWindowCloseGuard(isEnabled: true) {
+            confirmedClose = $0
+        }
+        defer {
+            window.delegate = previousDelegate
+            window.orderOut(nil)
+            window.contentView = nil
+        }
+
+        let didAttachGuard = await waitUntil { window.delegate !== previousDelegate }
+        guard didAttachGuard else {
+            return XCTFail("Expected the active close guard to attach")
+        }
+
+        window.performClose(nil)
+
+        XCTAssertTrue(window.isVisible)
+        XCTAssertNotNil(confirmedClose)
+
+        host.rootView = WorkspaceWindowCloseGuard(isEnabled: false) { _ in }
+        let didRestorePreviousDelegate = await waitUntil {
+            window.delegate === previousDelegate
+        }
+        XCTAssertTrue(didRestorePreviousDelegate)
+
+        confirmedClose?()
+
+        let didClose = await waitUntil { !window.isVisible }
+        XCTAssertTrue(didClose)
+    }
+
 }
 
 @MainActor
@@ -197,4 +330,9 @@ private struct FailingRecordingSourceManager: RecordingSourceManaging {
 @MainActor
 private final class RepairActionTracker {
     var callCount = 0
+}
+
+@MainActor
+private final class OptionalWindowDelegate: NSObject, NSWindowDelegate {
+    func windowDidResize(_ notification: Notification) {}
 }

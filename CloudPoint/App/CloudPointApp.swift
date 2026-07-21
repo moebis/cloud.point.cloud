@@ -9,6 +9,7 @@ struct CloudPointApp: App {
             CloudPointRootView(coordinator: coordinator)
         }
         .defaultSize(width: 1_080, height: 760)
+        .restorationBehavior(.disabled)
         .commands {
             CommandGroup(replacing: .newItem) {
                 Button("Open Video…") { coordinator.chooseVideo() }
@@ -32,16 +33,12 @@ private struct CloudPointRootView: View {
                 WelcomeView(coordinator: coordinator)
 
             case let .workspace(launch):
+                let viewModel = coordinator.workspaceViewModel(for: launch)
                 WorkspaceView(
-                    document: CloudPointDocument(manifest: launch.manifest),
-                    packageURL: launch.packageURL,
-                    packageBookmarkData: launch.packageBookmarkData,
-                    initialSource: launch.initialSource,
+                    viewModel: viewModel,
                     sourceTitle: launch.sourceTitle,
-                    engineFactory: coordinator.reconstructionEngineFactory,
                     onOpenVideo: coordinator.chooseVideo,
-                    onRepairModel: coordinator.repairModel,
-                    onShowWelcome: coordinator.showWelcome
+                    onShowWelcome: { Task { await coordinator.showWelcome() } }
                 )
                 .id(launch.id)
             }
@@ -50,6 +47,7 @@ private struct CloudPointRootView: View {
         .onOpenURL { url in
             Task { await coordinator.openExternalURL(url) }
         }
+        .handlesExternalEvents(preferring: ["*"], allowing: ["*"])
         .sheet(isPresented: $coordinator.isModelSetupPresented) {
             if let model = coordinator.modelSetupViewModel {
                 ModelSetupView(model: model) {

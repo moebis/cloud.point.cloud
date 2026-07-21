@@ -217,6 +217,152 @@ final class AppCoordinatorTests: XCTestCase {
         XCTAssertFalse(coordinator.isModelSetupPresented)
     }
 
+    func testFailedProjectRequiresReadyModelBeforeRetrying() async {
+        let package = URL(filePath: "/tmp/Failed.cloudpoint", directoryHint: .isDirectory)
+        var manifest = ProjectManifest()
+        manifest.sessionState = SessionState(phase: .failed, failedCount: 1)
+        let store = CoordinatorStore(
+            project: .fixture(packageURL: package, manifest: manifest)
+        )
+        let coordinator = AppCoordinator(
+            projectStore: store,
+            videoProbe: CoordinatorVideoProbe(
+                result: VideoProbeResult(durationSeconds: 2, sampledFrameCount: 4)
+            ),
+            modelInstaller: CoordinatorModelInstaller(health: .absent),
+            engineContext: .fixture()
+        )
+        await coordinator.start()
+
+        await coordinator.openInput(package)
+
+        XCTAssertEqual(coordinator.destination, .welcome)
+        XCTAssertTrue(coordinator.isModelSetupPresented)
+    }
+
+    func testRepairModelReopensCurrentProjectAfterSetupCompletes() async {
+        let package = URL(filePath: "/tmp/Repair.cloudpoint", directoryHint: .isDirectory)
+        let store = CoordinatorStore(project: .fixture(packageURL: package))
+        let coordinator = AppCoordinator(
+            projectStore: store,
+            videoProbe: CoordinatorVideoProbe(
+                result: VideoProbeResult(durationSeconds: 2, sampledFrameCount: 4)
+            ),
+            modelInstaller: CoordinatorModelInstaller(health: .ready(.fixture())),
+            engineContext: .fixture()
+        )
+        await coordinator.start()
+        await coordinator.openInput(package)
+
+        coordinator.repairModel()
+        XCTAssertTrue(coordinator.isModelSetupPresented)
+        await coordinator.continueAfterModelSetup()
+
+        let openedURLs = await store.requestedProjectURLs()
+        XCTAssertEqual(openedURLs, [package, package])
+        XCTAssertFalse(coordinator.isModelSetupPresented)
+    }
+
+    func testWorkspaceViewModelIsOwnedOncePerProjectAcrossSceneRecreation() async {
+        let package = URL(filePath: "/tmp/Owned.cloudpoint", directoryHint: .isDirectory)
+        let coordinator = AppCoordinator(
+            projectStore: CoordinatorStore(project: .fixture(packageURL: package)),
+            videoProbe: CoordinatorVideoProbe(
+                result: VideoProbeResult(durationSeconds: 2, sampledFrameCount: 4)
+            ),
+            modelInstaller: CoordinatorModelInstaller(health: .ready(.fixture())),
+            engineContext: .fixture()
+        )
+        await coordinator.openInput(package)
+        guard case let .workspace(launch) = coordinator.destination else {
+            return XCTFail("Expected workspace destination")
+        }
+
+        let first = coordinator.workspaceViewModel(for: launch)
+        let second = coordinator.workspaceViewModel(for: launch)
+
+        XCTAssertTrue(first === second)
+        await first.close()
+    }
+
+    func testShowingWelcomeClosesAndEvictsTheCurrentWorkspace() async {
+        let package = URL(filePath: "/tmp/Welcome-Eviction.cloudpoint", directoryHint: .isDirectory)
+        let coordinator = AppCoordinator(
+            projectStore: CoordinatorStore(project: .fixture(packageURL: package)),
+            videoProbe: CoordinatorVideoProbe(
+                result: VideoProbeResult(durationSeconds: 2, sampledFrameCount: 4)
+            ),
+            modelInstaller: CoordinatorModelInstaller(health: .ready(.fixture())),
+            engineContext: .fixture()
+        )
+        await coordinator.openInput(package)
+        guard case let .workspace(launch) = coordinator.destination else {
+            return XCTFail("Expected workspace destination")
+        }
+        weak var releasedViewModel: WorkspaceViewModel?
+        do {
+            let viewModel = coordinator.workspaceViewModel(for: launch)
+            releasedViewModel = viewModel
+        }
+
+        await coordinator.showWelcome()
+
+        XCTAssertEqual(coordinator.destination, .welcome)
+        XCTAssertNil(releasedViewModel)
+    }
+
+    func testCopiedPackagesWithTheSameManifestUUIDNeverShareAWorkspaceViewModel() async {
+        let firstPackage = URL(
+            filePath: "/tmp/Original.cloudpoint",
+            directoryHint: .isDirectory
+        )
+        let copiedPackage = URL(
+            filePath: "/tmp/Copy.cloudpoint",
+            directoryHint: .isDirectory
+        )
+        let projectID = UUID(uuidString: "00000000-0000-0000-0000-000000000199")!
+        let manifest = ProjectManifest(projectID: projectID)
+        let firstProject = ManagedProject.fixture(
+            packageURL: firstPackage,
+            manifest: manifest
+        )
+        let copiedProject = ManagedProject.fixture(
+            packageURL: copiedPackage,
+            manifest: manifest
+        )
+        let coordinator = AppCoordinator(
+            projectStore: CoordinatorStore(projectsByURL: [
+                firstPackage: firstProject,
+                copiedPackage: copiedProject,
+            ]),
+            videoProbe: CoordinatorVideoProbe(
+                result: VideoProbeResult(durationSeconds: 2, sampledFrameCount: 4)
+            ),
+            modelInstaller: CoordinatorModelInstaller(health: .ready(.fixture())),
+            engineContext: .fixture()
+        )
+        await coordinator.openInput(firstPackage)
+        guard case let .workspace(firstLaunch) = coordinator.destination else {
+            return XCTFail("Expected first workspace destination")
+        }
+        weak var releasedFirstViewModel: WorkspaceViewModel?
+        do {
+            let firstViewModel = coordinator.workspaceViewModel(for: firstLaunch)
+            releasedFirstViewModel = firstViewModel
+            XCTAssertEqual(firstViewModel.projectURL, firstPackage)
+        }
+
+        await coordinator.openInput(copiedPackage)
+        guard case let .workspace(copiedLaunch) = coordinator.destination else {
+            return XCTFail("Expected copied workspace destination")
+        }
+        let copiedViewModel = coordinator.workspaceViewModel(for: copiedLaunch)
+
+        XCTAssertEqual(copiedViewModel.projectURL, copiedPackage)
+        XCTAssertNil(releasedFirstViewModel)
+        await copiedViewModel.close()
+    }
+
     func testReadyModelPublishesEngineStateAndAllowsVideoRoute() async {
         let video = URL(filePath: "/tmp/ready.mov")
         let store = CoordinatorStore(project: .fixture())
@@ -243,12 +389,22 @@ final class AppCoordinatorTests: XCTestCase {
 
 private actor CoordinatorStore: ManagedProjectStoring {
     let project: ManagedProject
+    let projectsByURL: [URL: ManagedProject]
     private(set) var createdSourceNames: [String] = []
     private(set) var openedURLs: [URL] = []
     private(set) var recordingSources: [RecordingSourceReference] = []
     private(set) var cameraSources: [CameraSourceReference] = []
 
-    init(project: ManagedProject) { self.project = project }
+    init(project: ManagedProject) {
+        self.project = project
+        projectsByURL = [:]
+    }
+
+    init(projectsByURL: [URL: ManagedProject]) {
+        precondition(!projectsByURL.isEmpty)
+        project = projectsByURL.values.first!
+        self.projectsByURL = projectsByURL
+    }
 
     func createProject(sourceName: String) -> ManagedProject {
         createdSourceNames.append(sourceName)
@@ -275,7 +431,7 @@ private actor CoordinatorStore: ManagedProjectStoring {
 
     func openProject(at url: URL) -> ManagedProject {
         openedURLs.append(url)
-        return project
+        return projectsByURL[url] ?? project
     }
 
     func recentProjects() -> [RecentProject] { [] }

@@ -61,6 +61,9 @@ targets:
       - path: CloudPointTests
         excludes:
           - Info.plist
+      - path: worker/tests/fixtures/courthouse
+        type: folder
+        buildPhase: resources
     dependencies:
       - target: CloudPoint
       - target: CloudPointMockWorker
