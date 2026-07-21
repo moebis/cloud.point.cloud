@@ -133,6 +133,18 @@ def _fault(
     return WorkerFault(code, message, recoverable, dict(details))
 
 
+def _finite_float(value: object, *, nonnegative: bool = False) -> float | None:
+    if type(value) not in {int, float}:
+        return None
+    try:
+        result = float(value)
+    except (OverflowError, ValueError):
+        return None
+    if not math.isfinite(result) or (nonnegative and result < 0):
+        return None
+    return result
+
+
 def _safe_relative(value: object) -> str:
     if not isinstance(value, str) or (
         not value
@@ -263,17 +275,16 @@ def _read_manifest(root_fd: int, root_identity: tuple[int, int]) -> _ProjectSnap
             raise _fault("PROJECT_INVALID_MANIFEST", "manifest frame is not an object")
         index = raw.get("index")
         timestamp = raw.get("sourceTimestamp")
+        timestamp_value = _finite_float(timestamp, nonnegative=True)
         if (
             type(index) is not int
             or not 0 <= index <= _UINT32_MAX
             or index <= previous_index
-            or type(timestamp) not in {int, float}
-            or not math.isfinite(float(timestamp))
-            or float(timestamp) < 0
+            or timestamp_value is None
         ):
             raise _fault("PROJECT_INVALID_MANIFEST", "manifest frame is invalid")
         relative = _manifest_relative(raw.get("relativePath"))
-        frames[index] = PersistedFrame(index, float(timestamp), relative)
+        frames[index] = PersistedFrame(index, timestamp_value, relative)
         previous_index = index
 
     completed: list[dict[str, object]] = []
@@ -294,6 +305,12 @@ def _read_manifest(root_fd: int, root_identity: tuple[int, int]) -> _ProjectSnap
         alignment = window.get("alignmentRowMajor")
         inlier_count = window.get("inlierCount")
         duration = window.get("durationSeconds")
+        alignment_is_valid = (
+            isinstance(alignment, list)
+            and len(alignment) == 16
+            and all(_finite_float(value) is not None for value in alignment)
+        )
+        duration_value = _finite_float(duration, nonnegative=True)
         if (
             type(index) is not int
             or not 0 <= index <= _UINT32_MAX
@@ -309,17 +326,10 @@ def _read_manifest(root_fd: int, root_identity: tuple[int, int]) -> _ProjectSnap
             <= last_processed
             <= _UINT32_MAX
             or frame_start <= previous_output_end
-            or not isinstance(alignment, list)
-            or len(alignment) != 16
-            or any(
-                type(value) not in {int, float} or not math.isfinite(float(value))
-                for value in alignment
-            )
+            or not alignment_is_valid
             or type(inlier_count) is not int
             or not 0 <= inlier_count <= _UINT64_MAX
-            or type(duration) not in {int, float}
-            or not math.isfinite(float(duration))
-            or float(duration) < 0
+            or duration_value is None
         ):
             raise _fault(
                 "PROJECT_INVALID_MANIFEST", "completed window bounds are invalid"
@@ -343,6 +353,7 @@ def _read_manifest(root_fd: int, root_identity: tuple[int, int]) -> _ProjectSnap
             frame_index = artifact.get("frameIndex")
             artifact_window = artifact.get("windowIndex")
             artifact_duration = artifact.get("durationSeconds")
+            artifact_duration_value = _finite_float(artifact_duration, nonnegative=True)
             if (
                 type(frame_index) is not int
                 or frame_index not in frames
@@ -350,9 +361,7 @@ def _read_manifest(root_fd: int, root_identity: tuple[int, int]) -> _ProjectSnap
                 or frame_index <= previous_artifact
                 or type(artifact_window) is not int
                 or artifact_window != index
-                or type(artifact_duration) not in {int, float}
-                or not math.isfinite(float(artifact_duration))
-                or float(artifact_duration) < 0
+                or artifact_duration_value is None
             ):
                 raise _fault(
                     "PROJECT_INVALID_MANIFEST", "frame artifact index is invalid"
@@ -777,23 +786,30 @@ class SessionRunner:
 
     def enqueue(self, frame: PersistedFrame) -> None:
         with self._condition:
-            if not self._begun or self._input_finished or self._cancel_requested:
+            if (
+                not self._begun
+                or self._input_finished
+                or self._cancel_requested
+                or self.state == SessionState.FAILED
+            ):
                 raise _fault("INVALID_STATE", "session is not accepting frames", True)
             configuration = cast(ConfigurePayload, self._configuration)
             maximum = min(_DIRECT_FRAME_LIMIT, configuration.window_size)
             if len(self._frames) >= maximum:
-                raise _fault(
+                fault = _fault(
                     "WINDOWING_UNAVAILABLE",
                     "direct reconstruction admission limit has been reached",
                     True,
                     frameCount=len(self._frames),
                     maximum=maximum,
                 )
+                self.state = SessionState.FAILED
+                raise fault
+            timestamp_value = _finite_float(frame.source_timestamp, nonnegative=True)
             if (
                 type(frame.index) is not int
                 or not 0 <= frame.index <= _UINT32_MAX
-                or not math.isfinite(float(frame.source_timestamp))
-                or frame.source_timestamp < 0
+                or timestamp_value is None
             ):
                 raise _fault("INVALID_FRAME", "frame descriptor is invalid", True)
             snapshot = cast(_ProjectSnapshot, self._snapshot)
@@ -812,11 +828,13 @@ class SessionRunner:
             if checkpoint is not None:
                 replay_ordinal = len(self._frames)
                 if frame.index > checkpoint.last_committed_frame_index:
-                    raise _fault(
+                    fault = _fault(
                         "WINDOWING_UNAVAILABLE",
                         "resumed output requires real Sim3 window alignment",
                         True,
                     )
+                    self.state = SessionState.FAILED
+                    raise fault
                 if replay_ordinal >= len(self._expected_replay):
                     raise _fault(
                         "REPLAY_ORDER_VIOLATION",
@@ -836,7 +854,7 @@ class SessionRunner:
                     )
                 replay = True
             admitted = PersistedFrame(
-                frame.index, frame.source_timestamp, frame.relative_path, replay
+                frame.index, timestamp_value, frame.relative_path, replay
             )
             self._frames.append(admitted)
             if not replay:
@@ -846,6 +864,8 @@ class SessionRunner:
         with self._condition:
             if not self._begun or self._input_finished or self._cancel_requested:
                 raise _fault("INVALID_STATE", "input cannot be finished now", True)
+            if self.state == SessionState.FAILED:
+                raise _fault("INVALID_STATE", "failed session cannot be finished", True)
             if self._checkpoint is not None:
                 replay_descriptors = tuple(
                     frame for frame in self._frames if frame.replay
@@ -997,7 +1017,11 @@ class SessionRunner:
                 raise _fault(
                     "INVALID_STATE", "finishInput must precede processing", True
                 )
-            if self.state in {SessionState.CANCELLED, SessionState.COMPLETED}:
+            if self.state in {
+                SessionState.CANCELLED,
+                SessionState.COMPLETED,
+                SessionState.FAILED,
+            }:
                 raise _fault("INVALID_STATE", "session is already terminal", True)
             configuration = cast(ConfigurePayload, self._configuration)
             maximum = min(_DIRECT_FRAME_LIMIT, configuration.window_size)

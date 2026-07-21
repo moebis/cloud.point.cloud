@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -11,6 +12,24 @@ from pathlib import Path
 import pytest
 
 from cloudpoint_worker.cpc import read_cpc
+
+
+def test_base_dependency_cli_help_does_not_import_optional_torch() -> None:
+    uv = shutil.which("uv")
+    assert uv is not None
+
+    result = subprocess.run(
+        [uv, "run", "--isolated", "--frozen", "cloudpoint-worker", "--help"],
+        cwd=Path(__file__).parents[1],
+        check=False,
+        text=True,
+        capture_output=True,
+        timeout=60,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "usage: cloudpoint-worker" in result.stdout
+    assert "torch" not in result.stderr
 
 
 def _make_project(root: Path) -> Path:

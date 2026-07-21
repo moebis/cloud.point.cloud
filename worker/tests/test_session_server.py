@@ -251,7 +251,8 @@ def test_more_than_thirty_two_frames_fails_recoverably_without_outputs(
         Image.new("RGB", (42, 28), (index, index, index)).save(
             project / "Frames" / f"{index:08d}.jpg"
         )
-    runner = SessionRunner(project, FakeModel(), lambda _: None, project_id=PROJECT_ID)
+    events: list[object] = []
+    runner = SessionRunner(project, FakeModel(), events.append, project_id=PROJECT_ID)
     runner.configure(CONFIG)
     runner.begin(BeginSessionPayload(None))
     for index in range(32):
@@ -261,7 +262,13 @@ def test_more_than_thirty_two_frames_fails_recoverably_without_outputs(
         runner.enqueue(_frame(32))
 
     assert raised.value.recoverable is True
+    assert runner.state == SessionState.FAILED
     assert runner.queued_frames == 32
+    with pytest.raises(WorkerFault, match="INVALID_STATE"):
+        runner.finish_input()
+    with pytest.raises(WorkerFault, match="INVALID_STATE"):
+        runner.process()
+    assert events == []
     assert not list((project / "Predictions").iterdir())
     assert not list((project / "Points").iterdir())
 
@@ -396,11 +403,14 @@ def test_replay_is_context_only_and_never_overwrites_committed_outputs(
     with pytest.raises(WorkerFault, match="WINDOWING_UNAVAILABLE") as raised:
         runner.enqueue(_frame(2))
     assert raised.value.recoverable is True
-    runner.finish_input()
-    runner.process()
+    assert runner.state == SessionState.FAILED
+    with pytest.raises(WorkerFault, match="INVALID_STATE"):
+        runner.finish_input()
+    with pytest.raises(WorkerFault, match="INVALID_STATE"):
+        runner.process()
 
     assert runner.processed_frames == 0
-    assert [event.type for event in events] == ["sessionCompleted"]
+    assert events == []
     assert not (project / "Points/window-00000001.cpc").exists()
     for relative, contents in original.items():
         assert (project / relative).read_bytes() == contents
@@ -985,12 +995,15 @@ def test_orphan_cleanup_holds_directory_descriptor_across_path_swap(
     [
         ({"alignmentRowMajor": [1.0] * 15}, None),
         ({"alignmentRowMajor": [1.0] * 15 + [float("inf")]}, None),
+        ({"alignmentRowMajor": [1.0] * 15 + [10**400]}, None),
         ({"inferenceFrameStart": 1}, None),
         ({"lastProcessedFrameIndex": 0}, None),
         ({"inlierCount": -1}, None),
         ({"durationSeconds": -0.1}, None),
+        ({"durationSeconds": 10**400}, None),
         (None, {0: {"windowIndex": 1}}),
         (None, {0: {"durationSeconds": float("nan")}}),
+        (None, {0: {"durationSeconds": 10**400}}),
     ],
 )
 def test_recovery_rejects_malformed_window_metadata(
@@ -1004,6 +1017,20 @@ def test_recovery_rejects_malformed_window_metadata(
         window_overrides=window_overrides,
         artifact_overrides=artifact_overrides,
     )
+    runner = SessionRunner(project, FakeModel(), lambda _: None, project_id=PROJECT_ID)
+    runner.configure(CONFIG)
+
+    with pytest.raises(WorkerFault, match="PROJECT_INVALID_MANIFEST"):
+        runner.begin(BeginSessionPayload(ResumeCheckpoint(1, 0, 1)))
+
+
+def test_recovery_rejects_huge_frame_timestamp_as_structured_manifest_fault(
+    project: Path,
+) -> None:
+    _install_completed_window(project, (0, 1))
+    manifest = json.loads((project / "Manifest.json").read_text(encoding="utf-8"))
+    manifest["frames"][0]["sourceTimestamp"] = 10**400
+    (project / "Manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     runner = SessionRunner(project, FakeModel(), lambda _: None, project_id=PROJECT_ID)
     runner.configure(CONFIG)
 

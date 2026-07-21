@@ -57,6 +57,14 @@ class CPCContents:
         return self.descriptor.point_count
 
 
+@dataclass(frozen=True, slots=True)
+class AtomicWriteReceipt:
+    """Filesystem identity of one exclusively promoted canonical output."""
+
+    device: int
+    inode: int
+
+
 def _fault(message: str, *, code: str = "INVALID_POINT_CHUNK") -> WorkerFault:
     return WorkerFault(code, message, False)
 
@@ -124,12 +132,48 @@ def _open_parent_directory(path: Path) -> tuple[int, str]:
     return _open_directory_fd(path.parent), components[-1]
 
 
-def atomic_write_bytes(path: Path, payload: bytes) -> None:
+def _unlink_if_owned_at(
+    parent_fd: int, final_name: str, receipt: AtomicWriteReceipt
+) -> bool:
+    try:
+        info = os.stat(final_name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_dev != receipt.device
+        or info.st_ino != receipt.inode
+    ):
+        return False
+    os.unlink(final_name, dir_fd=parent_fd)
+    return True
+
+
+def rollback_atomic_write(path: Path, receipt: AtomicWriteReceipt) -> None:
+    """Remove a promotion only while its exact inode still owns the path."""
+
+    parent_fd = -1
+    try:
+        parent_fd, final_name = _open_parent_directory(path)
+        if _unlink_if_owned_at(parent_fd, final_name, receipt):
+            os.fsync(parent_fd)
+    except (OSError, ValueError):
+        return
+    finally:
+        if parent_fd >= 0:
+            os.close(parent_fd)
+
+
+def atomic_write_bytes(path: Path, payload: bytes) -> AtomicWriteReceipt:
     """Write one exclusive sibling partial and promote without clobbering."""
 
     parent_fd = -1
     fd = -1
     partial_name: str | None = None
+    final_name = ""
+    receipt: AtomicWriteReceipt | None = None
+    promoted = False
+    completed = False
     try:
         parent_fd, final_name = _open_parent_directory(path)
         try:
@@ -158,6 +202,10 @@ def atomic_write_bytes(path: Path, payload: bytes) -> None:
             stream.write(payload)
             stream.flush()
             os.fsync(stream.fileno())
+            partial_info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(partial_info.st_mode):
+                raise OSError("partial output is not a regular file")
+            receipt = AtomicWriteReceipt(partial_info.st_dev, partial_info.st_ino)
         try:
             os.link(
                 partial_name,
@@ -166,13 +214,23 @@ def atomic_write_bytes(path: Path, payload: bytes) -> None:
                 dst_dir_fd=parent_fd,
                 follow_symlinks=False,
             )
+            promoted = True
         except FileExistsError as error:
             raise _fault(
                 "output already exists", code="OUTPUT_ALREADY_EXISTS"
             ) from error
+        final_info = os.stat(final_name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(final_info.st_mode)
+            or final_info.st_dev != receipt.device
+            or final_info.st_ino != receipt.inode
+        ):
+            raise OSError("promoted output identity changed")
         os.unlink(partial_name, dir_fd=parent_fd)
         partial_name = None
         os.fsync(parent_fd)
+        completed = True
+        return receipt
     except WorkerFault:
         raise
     except (OSError, ValueError) as error:
@@ -185,6 +243,10 @@ def atomic_write_bytes(path: Path, payload: bytes) -> None:
         if fd >= 0:
             os.close(fd)
         if parent_fd >= 0:
+            if promoted and not completed and receipt is not None:
+                with suppress(OSError):
+                    if _unlink_if_owned_at(parent_fd, final_name, receipt):
+                        os.fsync(parent_fd)
             if partial_name is not None:
                 with suppress(FileNotFoundError):
                     os.unlink(partial_name, dir_fd=parent_fd)
@@ -418,11 +480,13 @@ def read_cpc(path: Path) -> CPCContents:
 
 
 __all__ = [
+    "AtomicWriteReceipt",
     "CPCContents",
     "CPCDescriptor",
     "CPCVertex",
     "atomic_write_bytes",
     "read_cpc",
     "reduce_vertices",
+    "rollback_atomic_write",
     "write_cpc",
 ]

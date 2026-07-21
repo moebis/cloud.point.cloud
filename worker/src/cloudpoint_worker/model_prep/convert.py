@@ -21,6 +21,11 @@ from safetensors.torch import load_file, save_file
 from cloudpoint_worker import ENGINE_VERSION
 from cloudpoint_worker.errors import WorkerFault
 from cloudpoint_worker.model.weight_specs import WeightSpec
+from cloudpoint_worker.model_prep.artifacts import (
+    CONVERTED_FILENAME,
+    MODEL_MANIFEST_FILENAME,
+    WEIGHTS_MANIFEST_FILENAME,
+)
 from cloudpoint_worker.model_prep.provenance import (
     MODEL_FILENAME,
     MODEL_REPO,
@@ -31,10 +36,6 @@ from cloudpoint_worker.model_prep.provenance import (
     verify_checkpoint,
     verify_open_file,
 )
-
-CONVERTED_FILENAME = "lingbot-map-long-f16.safetensors"
-WEIGHTS_MANIFEST_FILENAME = "weights-manifest.json"
-MODEL_MANIFEST_FILENAME = "model-manifest.json"
 
 
 @dataclass(frozen=True)
@@ -233,15 +234,16 @@ def _atomic_write_bytes(path: Path, content: bytes) -> None:
 
 
 def _atomic_write_json(path: Path, value: object) -> None:
-    content = json.dumps(
-        value, ensure_ascii=False, separators=(",", ":"), sort_keys=True
-    ).encode("utf-8") + b"\n"
+    content = (
+        json.dumps(
+            value, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        ).encode("utf-8")
+        + b"\n"
+    )
     _atomic_write_bytes(path, content)
 
 
-def _atomic_write_safetensors(
-    path: Path, tensors: Mapping[str, torch.Tensor]
-) -> None:
+def _atomic_write_safetensors(path: Path, tensors: Mapping[str, torch.Tensor]) -> None:
     partial = path.with_name(f"{path.name}.partial")
     try:
         save_file(dict(tensors), partial)

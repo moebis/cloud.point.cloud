@@ -12,7 +12,12 @@ from typing import Protocol
 import numpy as np
 
 from cloudpoint_worker import PROTOCOL_VERSION
-from cloudpoint_worker.cpc import _open_directory_fd, atomic_write_bytes
+from cloudpoint_worker.cpc import (
+    AtomicWriteReceipt,
+    _open_directory_fd,
+    atomic_write_bytes,
+    rollback_atomic_write,
+)
 from cloudpoint_worker.errors import WorkerFault
 from cloudpoint_worker.preprocess import PreprocessedFrame
 
@@ -78,7 +83,11 @@ def write_frame_outputs(
     _real_directory(project_root, create=False)
     if type(frame.index) is not int or not 0 <= frame.index <= 2**32 - 1:
         raise _fault("frame index exceeds UInt32")
-    if not math.isfinite(float(frame.source_timestamp)) or frame.source_timestamp < 0:
+    try:
+        source_timestamp = float(frame.source_timestamp)
+    except (OverflowError, ValueError) as error:
+        raise _fault("source timestamp must be finite and nonnegative") from error
+    if not math.isfinite(source_timestamp) or source_timestamp < 0:
         raise _fault("source timestamp must be finite and nonnegative")
     if not math.isfinite(confidence_floor) or confidence_floor <= 0:
         raise _fault("confidence floor must be finite and positive")
@@ -140,18 +149,37 @@ def write_frame_outputs(
         "reconstructionUnit": "model-depth-unit",
         "sourcePath": frame.relative_path,
         "sourceSize": list(preprocessed.source_size),
-        "sourceTimestamp": float(frame.source_timestamp),
+        "sourceTimestamp": source_timestamp,
     }
     json_payload = (
         json.dumps(metadata, sort_keys=True, separators=(",", ":"), allow_nan=False)
         + "\n"
     ).encode("utf-8")
 
-    atomic_write_bytes(finals[0], depth.astype("<f2", copy=False).tobytes(order="C"))
-    atomic_write_bytes(
-        finals[1], confidence.astype("<f2", copy=False).tobytes(order="C")
-    )
-    atomic_write_bytes(finals[2], json_payload)
+    promotions: list[tuple[Path, AtomicWriteReceipt]] = []
+    try:
+        promotions.append(
+            (
+                finals[0],
+                atomic_write_bytes(
+                    finals[0], depth.astype("<f2", copy=False).tobytes(order="C")
+                ),
+            )
+        )
+        promotions.append(
+            (
+                finals[1],
+                atomic_write_bytes(
+                    finals[1],
+                    confidence.astype("<f2", copy=False).tobytes(order="C"),
+                ),
+            )
+        )
+        promotions.append((finals[2], atomic_write_bytes(finals[2], json_payload)))
+    except BaseException:
+        for path, receipt in reversed(promotions):
+            rollback_atomic_write(path, receipt)
+        raise
     return relative
 
 

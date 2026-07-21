@@ -12,6 +12,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+import cloudpoint_worker.outputs as outputs_module
 from cloudpoint_worker.cpc import CPCVertex, read_cpc, reduce_vertices, write_cpc
 from cloudpoint_worker.errors import WorkerFault
 from cloudpoint_worker.geometry import (
@@ -277,6 +278,34 @@ def test_atomic_writer_cleans_partial_when_promotion_fails(
     assert not [path for path in tmp_path.iterdir() if path.name.endswith(".partial")]
 
 
+def test_atomic_writer_rolls_back_owned_final_when_directory_sync_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    destination = tmp_path / "failed-after-promotion.cpc"
+    real_fsync = os.fsync
+    calls = 0
+
+    def fail_first_directory_sync(descriptor: int) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError(errno.EIO, "injected directory sync failure")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", fail_first_directory_sync)
+
+    with pytest.raises(WorkerFault, match="INVALID_POINT_CHUNK"):
+        write_cpc(
+            destination,
+            0,
+            0,
+            (CPCVertex((0, 0, 1), (0, 0, 0, 255), 2, 0, 0),),
+        )
+
+    assert not destination.exists()
+    assert not [path for path in tmp_path.iterdir() if path.name.endswith(".partial")]
+
+
 @dataclass(frozen=True)
 class _Frame:
     index: int
@@ -390,3 +419,125 @@ def test_frame_outputs_are_exact_atomic_and_descriptive(tmp_path: Path) -> None:
             model_identifier="robbyant/lingbot-map",
             model_revision="204754b",
         )
+
+
+@pytest.mark.parametrize("failure_ordinal", [2, 3])
+def test_frame_output_transaction_rolls_back_earlier_promotions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_ordinal: int,
+) -> None:
+    project = tmp_path / "Test.cloudpoint"
+    project.mkdir()
+    real_write = outputs_module.atomic_write_bytes
+    calls: list[Path] = []
+
+    def fail_later_promotion(path: Path, payload: bytes) -> object:
+        calls.append(path)
+        if len(calls) == failure_ordinal:
+            raise WorkerFault("SYNTHETIC_PROMOTION_FAILURE", "synthetic", False)
+        return real_write(path, payload)
+
+    monkeypatch.setattr(outputs_module, "atomic_write_bytes", fail_later_promotion)
+
+    with pytest.raises(WorkerFault, match="SYNTHETIC_PROMOTION_FAILURE"):
+        write_frame_outputs(
+            project,
+            _Frame(0, 0, "Frames/00000000.jpg"),
+            _one_pixel_prediction(),
+            _one_pixel_preprocessed(),
+            confidence_floor=1.5,
+            engine_version="1.0.0",
+            model_identifier="robbyant/lingbot-map",
+            model_revision="204754b",
+        )
+
+    canonical = (
+        project / "Predictions/00000000.depth-f16",
+        project / "Predictions/00000000.confidence-f16",
+        project / "Predictions/00000000.geometry.json",
+    )
+    assert not any(path.exists() for path in canonical)
+    assert not list(project.rglob("*.partial"))
+
+
+def test_frame_output_rollback_preserves_replacement_inode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "Test.cloudpoint"
+    project.mkdir()
+    real_write = outputs_module.atomic_write_bytes
+    calls: list[Path] = []
+    replacement = b"replacement-owned-by-another-writer"
+
+    def replace_then_fail_third(path: Path, payload: bytes) -> object:
+        calls.append(path)
+        if len(calls) == 3:
+            calls[0].unlink()
+            calls[0].write_bytes(replacement)
+            raise WorkerFault("SYNTHETIC_PROMOTION_FAILURE", "synthetic", False)
+        return real_write(path, payload)
+
+    monkeypatch.setattr(outputs_module, "atomic_write_bytes", replace_then_fail_third)
+
+    with pytest.raises(WorkerFault, match="SYNTHETIC_PROMOTION_FAILURE"):
+        write_frame_outputs(
+            project,
+            _Frame(0, 0, "Frames/00000000.jpg"),
+            _one_pixel_prediction(),
+            _one_pixel_preprocessed(),
+            confidence_floor=1.5,
+            engine_version="1.0.0",
+            model_identifier="robbyant/lingbot-map",
+            model_revision="204754b",
+        )
+
+    depth = project / "Predictions/00000000.depth-f16"
+    assert depth.read_bytes() == replacement
+    assert not (project / "Predictions/00000000.confidence-f16").exists()
+    assert not (project / "Predictions/00000000.geometry.json").exists()
+
+
+@pytest.mark.parametrize("collision_ordinal", [2, 3])
+def test_frame_output_rollback_preserves_racing_preexisting_canonical(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    collision_ordinal: int,
+) -> None:
+    project = tmp_path / "Test.cloudpoint"
+    project.mkdir()
+    real_write = outputs_module.atomic_write_bytes
+    calls: list[Path] = []
+    preexisting = b"preexisting-from-another-writer"
+
+    def collide_with_later_promotion(path: Path, payload: bytes) -> object:
+        calls.append(path)
+        if len(calls) == collision_ordinal:
+            path.write_bytes(preexisting)
+        return real_write(path, payload)
+
+    monkeypatch.setattr(
+        outputs_module, "atomic_write_bytes", collide_with_later_promotion
+    )
+
+    with pytest.raises(WorkerFault, match="OUTPUT_ALREADY_EXISTS"):
+        write_frame_outputs(
+            project,
+            _Frame(0, 0, "Frames/00000000.jpg"),
+            _one_pixel_prediction(),
+            _one_pixel_preprocessed(),
+            confidence_floor=1.5,
+            engine_version="1.0.0",
+            model_identifier="robbyant/lingbot-map",
+            model_revision="204754b",
+        )
+
+    canonical = (
+        project / "Predictions/00000000.depth-f16",
+        project / "Predictions/00000000.confidence-f16",
+        project / "Predictions/00000000.geometry.json",
+    )
+    assert canonical[collision_ordinal - 1].read_bytes() == preexisting
+    for ordinal, path in enumerate(canonical, start=1):
+        if ordinal != collision_ordinal:
+            assert not path.exists()

@@ -19,7 +19,7 @@ from cloudpoint_worker import ENGINE_VERSION
 from cloudpoint_worker.errors import WorkerFault
 from cloudpoint_worker.model.config import ModelConfig
 from cloudpoint_worker.model.weight_specs import WeightSpec, build_weight_specs
-from cloudpoint_worker.model_prep.convert import (
+from cloudpoint_worker.model_prep.artifacts import (
     CONVERTED_FILENAME,
     MODEL_MANIFEST_FILENAME,
     WEIGHTS_MANIFEST_FILENAME,
