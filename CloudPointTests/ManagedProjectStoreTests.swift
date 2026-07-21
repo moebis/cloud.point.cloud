@@ -176,6 +176,44 @@ final class ManagedProjectStoreTests: XCTestCase {
         XCTAssertEqual(try partialFiles(beneath: support.url), [])
     }
 
+    func testSharpCameraProjectPersistsSnapshotAndCameraIdentity() async throws {
+        let support = try TemporaryDirectory.make()
+        let store = ManagedProjectStore(applicationSupportDirectory: support.url)
+        let source = CameraSourceReference(
+            deviceID: "camera-42",
+            deviceName: "Studio Camera",
+            mirrorDisplay: true
+        )
+        let snapshot = VideoKeyFrameCandidate(
+            index: 0,
+            timestampSeconds: 0,
+            thumbnailJPEG: Data("thumbnail".utf8),
+            fullResolutionJPEG: Data("camera-jpeg".utf8),
+            sharpnessScore: 0.8,
+            exposureScore: 0.9,
+            temporalScore: 1
+        )
+
+        let project = try await store.createSharpCameraProject(
+            sourceName: "Studio Camera Snapshot",
+            source: source,
+            selectedFrame: snapshot
+        )
+        let manifest = try ProjectManifest.load(from: project.packageURL)
+
+        XCTAssertEqual(manifest.reconstructionPlan.modeID, .sharpGaussian)
+        XCTAssertEqual(manifest.cameraSource, source)
+        XCTAssertNil(manifest.recordingSource)
+        XCTAssertEqual(manifest.sessionState.phase, .ready)
+        XCTAssertEqual(manifest.sessionState.capturedCount, 1)
+        XCTAssertEqual(manifest.frames.count, 1)
+        XCTAssertEqual(
+            try Data(contentsOf: project.packageURL.appending(path: "Frames/00000000.jpg")),
+            snapshot.fullResolutionJPEG
+        )
+        XCTAssertEqual(try partialFiles(beneath: support.url), [])
+    }
+
     func testCameraProjectPersistsPreflightSelection() async throws {
         let support = try TemporaryDirectory.make()
         let store = ManagedProjectStore(applicationSupportDirectory: support.url)

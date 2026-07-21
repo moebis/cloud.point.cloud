@@ -75,6 +75,26 @@ final class VideoKeyFrameSelectorTests: XCTestCase {
             XCTAssertTrue(candidate.qualityScore.isFinite)
         }
     }
+
+    func testCameraCandidateCopiesPixelBufferIntoDurableJPEGData() throws {
+        let pixelBuffer = try VideoFixtureFactory.makePixelBuffer(
+            color: VideoFixtureColor(red: 40, green: 120, blue: 220)
+        )
+        let frame = CapturedFrame(
+            index: 0,
+            presentationTimestamp: CMTime(seconds: 1.5, preferredTimescale: 600),
+            pixelBuffer: pixelBuffer,
+            orientation: .identity,
+            sourceSampleSequence: 0
+        )
+
+        let candidate = try VideoKeyFrameSelector.candidate(from: frame)
+
+        XCTAssertEqual(candidate.timestampSeconds, 1.5, accuracy: 0.001)
+        XCTAssertFalse(candidate.fullResolutionJPEG.isEmpty)
+        XCTAssertFalse(candidate.thumbnailJPEG.isEmpty)
+        XCTAssertNotNil(CGImageSourceCreateWithData(candidate.fullResolutionJPEG as CFData, nil))
+    }
 }
 
 private extension VideoKeyFrameCandidate {

@@ -5,10 +5,26 @@ struct NewReconstructionView: View {
     @ObservedObject var coordinator: AppCoordinator
     let request: PendingReconstructionRequest
 
+    @StateObject private var cameraCapture: SharpCameraSnapshotViewModel
+
     @State private var candidates: [VideoKeyFrameCandidate] = []
     @State private var selectedFrameIndex: Int?
     @State private var isLoadingFrames = false
     @State private var frameError: String?
+
+    init(coordinator: AppCoordinator, request: PendingReconstructionRequest) {
+        self.coordinator = coordinator
+        self.request = request
+        let deviceID: String?
+        if case let .camera(preflight) = request.source {
+            deviceID = preflight.deviceID
+        } else {
+            deviceID = nil
+        }
+        _cameraCapture = StateObject(
+            wrappedValue: SharpCameraSnapshotViewModel(deviceID: deviceID)
+        )
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -20,8 +36,10 @@ struct NewReconstructionView: View {
                     modeCards
                     if case .video = request.source {
                         framePicker
+                    } else {
+                        cameraPreview
                     }
-                    if let error = frameError ?? coordinator.errorMessage {
+                    if let error = frameError ?? cameraCapture.errorMessage ?? coordinator.errorMessage {
                         Label(error, systemImage: "exclamationmark.triangle.fill")
                             .font(.callout)
                             .foregroundStyle(.orange)
@@ -33,7 +51,8 @@ struct NewReconstructionView: View {
         }
         .frame(width: 820, height: 680)
         .background(.ultraThickMaterial)
-        .task(id: request.id) { await loadFramesIfNeeded() }
+        .task(id: request.id) { await prepareSource() }
+        .onDisappear { Task { await cameraCapture.stop() } }
     }
 
     private var header: some View {
@@ -111,17 +130,51 @@ struct NewReconstructionView: View {
                     description: sharpDescription,
                     details: sharpDetail,
                     actionTitle: sharpActionTitle,
-                    isEnabled: selectedFrame != nil && !coordinator.isBusy
+                    isEnabled: sharpActionIsEnabled && !coordinator.isBusy
                 ) {
-                    guard let selectedFrame else { return }
                     Task {
-                        await coordinator.createPendingSharpReconstruction(
-                            selectedFrame: selectedFrame
-                        )
+                        await createSharpReconstruction()
                     }
                 }
             }
         }
+    }
+
+    private var cameraPreview: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Frame your SHARP snapshot")
+                        .font(.headline)
+                    Text("Keep the camera steady and include the complete area you want to explore in 3D.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                if cameraCapture.isStarting {
+                    ProgressView().controlSize(.small)
+                } else if cameraCapture.isReady {
+                    Label("Ready", systemImage: "checkmark.circle.fill")
+                        .font(.callout.weight(.medium))
+                        .foregroundStyle(.green)
+                }
+            }
+
+            CameraPreviewView(
+                session: cameraCapture.previewSession,
+                mirrorDisplay: true
+            )
+            .background(.black)
+            .clipShape(RoundedRectangle(cornerRadius: 14))
+            .overlay {
+                RoundedRectangle(cornerRadius: 14)
+                    .strokeBorder(.white.opacity(0.14))
+            }
+            .aspectRatio(16 / 9, contentMode: .fit)
+            .frame(maxHeight: 245)
+        }
+        .padding(16)
+        .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 16))
     }
 
     @ViewBuilder
@@ -188,8 +241,11 @@ struct NewReconstructionView: View {
         VideoKeyFrameSelector.recommended(in: candidates)
     }
 
-    private func loadFramesIfNeeded() async {
-        guard case .video = request.source else { return }
+    private func prepareSource() async {
+        guard case .video = request.source else {
+            await cameraCapture.start()
+            return
+        }
         isLoadingFrames = true
         frameError = nil
         do {
@@ -202,6 +258,23 @@ struct NewReconstructionView: View {
             frameError = error.localizedDescription
         }
         isLoadingFrames = false
+    }
+
+    @MainActor
+    private func createSharpReconstruction() async {
+        do {
+            let frame: VideoKeyFrameCandidate
+            switch request.source {
+            case .video:
+                guard let selectedFrame else { return }
+                frame = selectedFrame
+            case .camera:
+                frame = try await cameraCapture.capture()
+            }
+            await coordinator.createPendingSharpReconstruction(selectedFrame: frame)
+        } catch {
+            frameError = error.localizedDescription
+        }
     }
 
     private var sourceIcon: String {
@@ -232,21 +305,28 @@ struct NewReconstructionView: View {
         case .video:
             "Builds a dense metric 3D Gaussian representation from one selected frame using Apple SHARP."
         case .camera:
-            "Single-snapshot SHARP capture is being connected to this camera workflow."
+            "Captures one camera frame and builds a dense metric 3D Gaussian representation using Apple SHARP."
         }
     }
 
     private var sharpDetail: String {
         switch request.source {
         case .video: "Best for nearby novel views from one image"
-        case .camera: "Choose a video source in this build"
+        case .camera: "Best for a quick spatial snapshot"
         }
     }
 
     private var sharpActionTitle: String {
         switch request.source {
         case .video: "Create Gaussian Scene"
-        case .camera: "Coming next"
+        case .camera: "Capture & Reconstruct"
+        }
+    }
+
+    private var sharpActionIsEnabled: Bool {
+        switch request.source {
+        case .video: selectedFrame != nil
+        case .camera: cameraCapture.isReady
         }
     }
 }

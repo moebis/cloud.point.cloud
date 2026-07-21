@@ -149,6 +149,43 @@ final class AppCoordinatorTests: XCTestCase {
         }
     }
 
+    func testSharpCameraConfirmationCreatesSnapshotProject() async {
+        let store = CoordinatorStore(project: .fixture())
+        let preflight = CameraPreflightResult(
+            deviceID: "studio-camera",
+            deviceName: "Studio Display Camera"
+        )
+        let snapshot = VideoKeyFrameCandidate(
+            index: 0,
+            timestampSeconds: 0,
+            thumbnailJPEG: Data("thumbnail".utf8),
+            fullResolutionJPEG: Data("camera-jpeg".utf8),
+            sharpnessScore: 0.9,
+            exposureScore: 0.8,
+            temporalScore: 1
+        )
+        let coordinator = AppCoordinator(
+            projectStore: store,
+            videoProbe: CoordinatorVideoProbe(
+                result: VideoProbeResult(durationSeconds: 1, sampledFrameCount: 2)
+            ),
+            cameraPreflight: CoordinatorCameraPreflight(result: preflight),
+            sharpModelInstaller: CoordinatorSharpModelInstaller(health: .ready(.fixture()))
+        )
+
+        await coordinator.useCamera()
+        await coordinator.createPendingSharpReconstruction(selectedFrame: snapshot)
+
+        let requestedFrames = await store.requestedSharpFrames()
+        let requestedCameras = await store.requestedCameraSources()
+        XCTAssertEqual(requestedFrames, [snapshot])
+        XCTAssertEqual(requestedCameras.first?.deviceID, preflight.deviceID)
+        XCTAssertNil(coordinator.pendingReconstruction)
+        guard case .workspace = coordinator.destination else {
+            return XCTFail("Expected SHARP camera workspace")
+        }
+    }
+
     func testCameraFailureDoesNotCreateOrListAnEmptyProject() async {
         let store = CoordinatorStore(project: .fixture())
         let coordinator = AppCoordinator(
@@ -502,6 +539,17 @@ private actor CoordinatorStore: ManagedProjectStoring {
         return project
     }
 
+    func createSharpCameraProject(
+        sourceName: String,
+        source: CameraSourceReference,
+        selectedFrame: VideoKeyFrameCandidate
+    ) -> ManagedProject {
+        createdSourceNames.append(sourceName)
+        cameraSources.append(source)
+        sharpFrames.append(selectedFrame)
+        return project
+    }
+
     func createCameraProject(
         sourceName: String,
         source: CameraSourceReference
@@ -525,6 +573,8 @@ private actor CoordinatorStore: ManagedProjectStoring {
     func requestedRecordingSources() -> [RecordingSourceReference] { recordingSources }
 
     func requestedSharpFrames() -> [VideoKeyFrameCandidate] { sharpFrames }
+
+    func requestedCameraSources() -> [CameraSourceReference] { cameraSources }
 }
 
 private actor CoordinatorKeyFrameSelector: VideoKeyFrameSelecting {

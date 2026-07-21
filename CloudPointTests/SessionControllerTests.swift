@@ -549,15 +549,25 @@ final class SessionControllerTests: XCTestCase {
         let original = try TemporaryProjectPackage.make()
         let destination = try TemporaryProjectPackage.make()
         let frame = try WorkspaceTestFiles.writeJPEG(frameIndex: 4, in: original.url)
-        let plyPath = "Outputs/Gaussians/frame-00000004.ply"
+        let plyPath = "Outputs/Gaussians/00000004.ply"
+        let provenancePath = "Outputs/Gaussians/00000004.json"
         let plyData = Data("synthetic-sharp-ply".utf8)
         try plyData.write(to: original.url.appending(path: plyPath))
+        let provenanceData = Data("synthetic-sharp-provenance".utf8)
+        try provenanceData.write(to: original.url.appending(path: provenancePath))
         let manifest = ProjectManifest(
             reconstructionPlan: .sharp(SharpReconstructionConfiguration(inputFrameIndex: 4)),
             outputState: .gaussian(GaussianSceneOutput(
                 sourceFrameIndex: 4,
                 plyRelativePath: plyPath,
-                gaussianCount: 1
+                provenanceRelativePath: provenancePath,
+                gaussianCount: 1,
+                modelIdentifier: "apple/ml-sharp",
+                modelRevision: String(repeating: "a", count: 40),
+                checkpointSHA256: String(repeating: "b", count: 64),
+                device: "cpu",
+                usedCPUFallback: true,
+                durationSeconds: 2
             )),
             frames: [frame],
             sessionState: SessionState(
@@ -587,6 +597,10 @@ final class SessionControllerTests: XCTestCase {
         await controller.flush()
 
         XCTAssertEqual(try Data(contentsOf: destination.url.appending(path: plyPath)), plyData)
+        XCTAssertEqual(
+            try Data(contentsOf: destination.url.appending(path: provenancePath)),
+            provenanceData
+        )
         XCTAssertEqual(
             try ProjectManifest.load(from: destination.url).reconstructionPlan.modeID,
             .sharpGaussian

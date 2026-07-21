@@ -10,3 +10,15 @@ struct ProductionReconstructionContext: Sendable, Equatable {
         )
     }
 }
+
+struct SharpProductionReconstructionContext: Sendable, Equatable {
+    let runtime: WorkerRuntime
+    let installation: SharpModelInstallation
+
+    func makeEngine() -> any ReconstructionEngine {
+        SharpReconstructionEngineFactory(
+            runtime: runtime,
+            installation: installation
+        ).makeEngine()
+    }
+}

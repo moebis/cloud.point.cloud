@@ -40,6 +40,11 @@ cloudpoint-model = "cloudpoint_worker.model_prep.cli:main"
 requires = ["hatchling==1.27.0"]
 build-backend = "hatchling.build"
 
+[tool.hatch.build]
+# Release packaging must include the complete source tree even before a local
+# commit exists; Hatch otherwise delegates file selection to the Git index.
+ignore-vcs = true
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/cloudpoint_worker"]
 

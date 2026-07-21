@@ -1,6 +1,7 @@
 @preconcurrency import AVFoundation
 import Metal
 import SwiftUI
+import UniformTypeIdentifiers
 
 enum WorkspaceSourceMode: Sendable, Equatable {
     case recording
@@ -131,6 +132,8 @@ final class WorkspaceViewModel: ObservableObject {
     let previewSession: AVCaptureSession
     let preflightPreviewSession: AVCaptureSession
     let renderer: PointCloudRenderer?
+    let gaussianRenderer: GaussianSplatRenderer?
+    let reconstructionModeID: ReconstructionModeID
 
     private let document: CloudPointDocument
     private let preflightPreview: CameraPreflightPreviewController
@@ -150,6 +153,12 @@ final class WorkspaceViewModel: ObservableObject {
 
     var requiresCloseConfirmation: Bool { snapshot.isCapturing }
     var projectURL: URL { packageScopeURL }
+    var isGaussianProject: Bool { reconstructionModeID == .sharpGaussian }
+
+    var gaussianOutputURL: URL? {
+        guard case let .gaussian(output?) = document.manifest.outputState else { return nil }
+        return packageScopeURL.appending(path: output.plyRelativePath)
+    }
 
     var presentedErrorText: String? { sourceErrorText ?? snapshot.errorText }
 
@@ -186,6 +195,7 @@ final class WorkspaceViewModel: ObservableObject {
         self.onRepairModel = onRepairModel
         self.onRetryProject = onRetryProject
         self.packageScope = packageScope
+        reconstructionModeID = document.manifest.reconstructionPlan.modeID
         let initialMirrorDisplay = document.manifest.cameraSource?.mirrorDisplay ?? false
         mirrorDisplay = initialMirrorDisplay
         let resolvedPackageURL: URL
@@ -219,14 +229,23 @@ final class WorkspaceViewModel: ObservableObject {
         preflightPreviewSession = preflightPreview.session
         let cameraCaptureSession = AVCameraCaptureSession()
         previewSession = cameraCaptureSession.previewSession
+        let device = MTLCreateSystemDefaultDevice()
         let pointCloudRenderer: PointCloudRenderer?
-        if let device = MTLCreateSystemDefaultDevice() {
+        if reconstructionModeID == .lingbotPointCloud, let device {
             pointCloudRenderer = try? PointCloudRenderer(device: device)
         } else {
             pointCloudRenderer = nil
         }
+        let gaussianSplatRenderer: GaussianSplatRenderer?
+        if reconstructionModeID == .sharpGaussian, let device {
+            gaussianSplatRenderer = try? GaussianSplatRenderer(device: device)
+        } else {
+            gaussianSplatRenderer = nil
+        }
         pointCloudRenderer?.setMirrorDisplay(initialMirrorDisplay)
+        gaussianSplatRenderer?.setMirrorDisplay(initialMirrorDisplay)
         renderer = pointCloudRenderer
+        gaussianRenderer = gaussianSplatRenderer
         let state = document.manifest.sessionState
         snapshot = WorkspaceSnapshot(
             revision: 0,
@@ -252,7 +271,11 @@ final class WorkspaceViewModel: ObservableObject {
 #endif
         let effects = SessionControllerEffects(
             adoptManifest: { [weak self] manifest in
-                await MainActor.run { self?.document.adoptCommittedManifest(manifest) }
+                await MainActor.run {
+                    guard let self else { return }
+                    self.document.adoptCommittedManifest(manifest)
+                    self.loadGaussianOutput(from: manifest)
+                }
             },
             appendPointChunk: { [weak self] chunk in
                 try await MainActor.run {
@@ -308,6 +331,7 @@ final class WorkspaceViewModel: ObservableObject {
                 effects: effects
             )
         )
+        loadGaussianOutput(from: document.manifest)
     }
 
     deinit {
@@ -504,13 +528,43 @@ final class WorkspaceViewModel: ObservableObject {
     func setMirrorDisplay(_ value: Bool) {
         mirrorDisplay = value
         renderer?.setMirrorDisplay(value)
+        gaussianRenderer?.setMirrorDisplay(value)
         Task { [controller] in
             do { try await controller?.setCameraMirrorDisplay(value) }
             catch { await MainActor.run { self.report(error) } }
         }
     }
 
-    func resetView() { renderer?.resetCamera() }
+    func resetView() {
+        renderer?.resetCamera()
+        gaussianRenderer?.resetCamera()
+    }
+
+    func exportGaussianOutput() {
+        guard let source = gaussianOutputURL else { return }
+        let panel = NSSavePanel()
+        panel.title = "Export Gaussian Scene"
+        panel.prompt = "Export PLY"
+        panel.nameFieldStringValue = "\(projectURL.deletingPathExtension().lastPathComponent).ply"
+        panel.allowedContentTypes = [.data]
+        guard panel.runModal() == .OK, let destination = panel.url else { return }
+        do {
+            if FileManager.default.fileExists(atPath: destination.path) {
+                try FileManager.default.removeItem(at: destination)
+            }
+            try FileManager.default.copyItem(at: source, to: destination)
+        } catch {
+            report(error)
+        }
+    }
+
+    private func loadGaussianOutput(from manifest: ProjectManifest) {
+        guard case let .gaussian(output?) = manifest.outputState else {
+            gaussianRenderer?.load(nil)
+            return
+        }
+        gaussianRenderer?.load(packageScopeURL.appending(path: output.plyRelativePath))
+    }
 
     private func report(_ error: Error) {
         snapshot.errorText = error.localizedDescription

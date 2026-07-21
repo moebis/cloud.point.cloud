@@ -1,9 +1,9 @@
 # CloudPoint development
 
-CloudPoint 1.0 is a native macOS 15 SwiftUI app backed by the production
-LingBot-Map MLX worker. A normal Debug or Release launch reconstructs real scene
-geometry; it does not substitute deterministic output when the worker or model
-is unavailable.
+CloudPoint 1.1 is a native macOS 15 SwiftUI app backed by production LingBot-Map
+MLX and Apple SHARP workers. A normal Debug or Release launch reconstructs real
+scene geometry; it does not substitute deterministic output when a worker or
+model is unavailable.
 
 ## Architecture
 
@@ -12,13 +12,17 @@ is unavailable.
 - AVFoundation validates and samples MOV, MP4, and M4V recordings and captures
   live camera frames.
 - `SessionController` persists every admitted frame and commits predictions,
-  CPC point chunks, and schema-v2 manifest state at reconstruction-window
-  boundaries.
+  CPC point chunks or a validated Gaussian PLY, and schema-v3 manifest state at
+  transactional boundaries.
 - `PythonMLXEngine` launches the worker as a child process over framed standard
   input/output. The worker does not bind a network port.
-- The worker loads the verified converted LingBot-Map model with Apple MLX and
-  emits depth, confidence, camera, and colored point-cloud artifacts.
-- `PointCloudRenderer` displays committed CPC chunks in a native Metal view.
+- The LingBot worker loads verified converted weights with Apple MLX and emits
+  depth, confidence, camera, and colored point-cloud artifacts.
+- The SHARP worker loads Apple's verified research checkpoint with PyTorch MPS,
+  retries recoverable device failures on CPU, and atomically emits PLY plus
+  provenance.
+- `PointCloudRenderer` displays CPC chunks; `GaussianSplatRenderer` loads SHARP
+  PLY through SplatIO and renders it with MetalSplatter.
 
 The native app never imports Python or MLX into its process. Model download is
 performed by the native setup layer; worker inference is network-free.
@@ -114,9 +118,25 @@ converter accepts only the exact verified artifact, produces 1,342 tensors,
 and publishes converted weights only after the output digest and manifests
 validate. Allow approximately 8 GiB of free space for setup.
 
-The normal inference process reads SafeTensors and does not accept `.pt` input.
+The normal LingBot inference process reads SafeTensors and does not accept `.pt` input.
 The source checkpoint, converted weights, and model manifests live under the
 sandboxed app's Application Support directory, not in a project package.
+
+### Apple SHARP trust anchor
+
+- Source commit: `1eaa046834b81852261262b41b0919f5c1efdd2e`
+- File: `sharp_2572gikvuh.pt`
+- Exact size: 2,809,738,232 bytes
+- SHA-256:
+
+  ```text
+  94211a75198c47f61fca7d739ba08a215418d8d398d48fddf023baccc24f073d
+  ```
+
+SHARP setup requires explicit acceptance of the bundled Apple Machine Learning
+Research Model License Agreement. The checkpoint, acceptance record, and
+provenance live under `Models/Apple-SHARP/apple-sharp-2572gikvuh/verified`.
+The checkpoint is never embedded in a project or application release.
 
 ## Input and project lifecycle
 
@@ -124,9 +144,15 @@ sandboxed app's Application Support directory, not in a project package.
 sampling is adjustable from 1 through 10 fps before capture. Selected frames
 are written to the package before they are admitted to reconstruction.
 
+The source-first chooser creates no project until the user confirms Point Cloud
+or Gaussian Scene. Video SHARP mode ranks seven candidate frames. Camera SHARP
+mode starts a live preview and captures exactly one durable source frame.
+
 Managed projects are created under the sandboxed Application Support
 `CloudPoint/Projects` directory with a source-derived name and UUID. A package
 contains `Manifest.json`, `Frames/`, `Predictions/`, `Points/`, and `Logs/`.
+Gaussian projects also place PLY output and provenance under
+`Outputs/Gaussians/`.
 The original recording is referenced with a security-scoped bookmark rather
 than copied into the package.
 
@@ -158,7 +184,7 @@ scripts/test-recording-smoke '/absolute/path/to/video.mov'
 
 This test fingerprints the source, stages a read-only copy inside the test
 host's sandbox, drives the production recording importer and project
-transaction path, validates all generated schema-v2 artifacts, and proves the
+transaction path, validates all generated schema-v3 artifacts, and proves the
 source remained unchanged. It intentionally uses the deterministic test engine
 to isolate ingest and durability behavior; it is not evidence of MLX scene
 reconstruction.
@@ -229,6 +255,37 @@ The release-runtime static contract is checked with:
 scripts/tests/test-worker-runtime-packaging
 ```
 
+### Real SHARP smoke
+
+After downloading the pinned SHARP checkpoint, run the complete worker smoke
+with a local recording:
+
+```sh
+scripts/test-sharp-smoke \
+  '/absolute/path/to/video.mov' \
+  '/absolute/path/to/sharp_2572gikvuh.pt'
+```
+
+The script extracts an oriented source frame, runs the exact SHARP worker on
+MPS with CPU fallback available, validates the Gaussian PLY and provenance, and
+prints the temporary project path for native viewer testing.
+
+To exercise the packaged runtime through the native Swift bridge, pass the
+runtime and fixtures as Xcode build settings. Passing only shell environment
+variables is insufficient when `Config/Local.xcconfig` defines a Debug runtime:
+
+```sh
+xcodebuild test \
+  -project CloudPoint.xcodeproj \
+  -scheme CloudPoint \
+  -destination 'platform=macOS,arch=arm64' \
+  -derivedDataPath /tmp/cloudpoint-real-sharp-bridge \
+  'CLOUDPOINT_WORKER_RUNTIME=/absolute/path/to/WorkerRuntime' \
+  'CLOUDPOINT_REAL_SHARP_CHECKPOINT=/absolute/path/to/sharp_2572gikvuh.pt' \
+  'CLOUDPOINT_REAL_SHARP_FRAME=/absolute/path/to/frame.jpg' \
+  -only-testing:CloudPointTests/RealSharpBridgeTests/testPackagedRuntimeReconstructsAndValidatesRealSharpSceneWhenRequested
+```
+
 ## Deterministic test engine
 
 `MockReconstructionEngine` is a developer fixture for fast native input,
@@ -262,9 +319,9 @@ To create the distributable archive:
 ```sh
 ditto -c -k --sequesterRsrc --keepParent \
   /tmp/cloudpoint-release/Build/Products/Release/CloudPoint.app \
-  CloudPoint-v1.0.0-macOS-arm64.zip
+  CloudPoint-v1.1.0-macOS-arm64.zip
 ```
 
-The public v1.0.0 artifact is ad-hoc signed and not notarized. Do not describe it
+The public v1.1.0 artifact is ad-hoc signed and not notarized. Do not describe it
 as Developer ID signed or notarized unless a later release pipeline actually
 performs and verifies those steps.

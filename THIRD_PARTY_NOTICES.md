@@ -69,6 +69,18 @@ Learning Research Model License Agreement, preserved as `LICENSE_MODEL`. It is
 restricted to research purposes and is never committed to this repository or
 redistributed inside the application.
 
+## MetalSplatter and SplatIO
+
+CloudPoint uses [`scier/MetalSplatter`][metal-splatter], including SplatIO and
+PLYIO, pinned to commit `71ff248e3016ac43c0a9271e322538421b28c360`
+(release 1.0.1). It is distributed under the MIT License. Copyright © 2026
+Sean Cier.
+
+MetalSplatter pulls [`scier/spz-swift`][spz-swift] 2.1.0 for its scene I/O
+layer. It is distributed under the MIT License. Copyright © 2024 Niantic Labs;
+Swift port by Sean Cier, 2026. SHARP projects currently publish and load PLY,
+but this transitive library remains linked in the application.
+
 ## Courthouse test images
 
 The nine courthouse images in `worker/tests/fixtures/courthouse/` come from the
@@ -131,3 +143,5 @@ provided by macOS and are not redistributed by this repository.
 [lingbot-model]: https://huggingface.co/robbyant/lingbot-map/tree/204754b72bb24f561f8d7e7e1e4e4cd9e809adf9
 [lingbot-source]: https://github.com/Robbyant/lingbot-map/tree/7ff6f3ed0913d4d326f8f13bbb429c4ffc0195c2
 [apple-sharp]: https://github.com/apple/ml-sharp/tree/1eaa046834b81852261262b41b0919f5c1efdd2e
+[metal-splatter]: https://github.com/scier/MetalSplatter/tree/71ff248e3016ac43c0a9271e322538421b28c360
+[spz-swift]: https://github.com/scier/spz-swift/tree/2.1.0

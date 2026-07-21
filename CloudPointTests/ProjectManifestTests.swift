@@ -92,8 +92,15 @@ final class ProjectManifestTests: XCTestCase {
             reconstructionPlan: .sharp(SharpReconstructionConfiguration(inputFrameIndex: 4)),
             outputState: .gaussian(GaussianSceneOutput(
                 sourceFrameIndex: 4,
-                plyRelativePath: "Outputs/Gaussians/frame-00000004.ply",
-                gaussianCount: 1_179_648
+                plyRelativePath: "Outputs/Gaussians/00000004.ply",
+                provenanceRelativePath: "Outputs/Gaussians/00000004.json",
+                gaussianCount: 1_179_648,
+                modelIdentifier: "apple/ml-sharp",
+                modelRevision: String(repeating: "a", count: 40),
+                checkpointSHA256: String(repeating: "b", count: 64),
+                device: "mps",
+                usedCPUFallback: false,
+                durationSeconds: 3.5
             )),
             frames: [.fixture(index: 4)],
             sessionState: SessionState(
@@ -105,7 +112,8 @@ final class ProjectManifestTests: XCTestCase {
         )
         XCTAssertEqual(try ProjectManifest.validate(gaussian).artifactRelativePaths(), Set([
             "Frames/00000004.jpg",
-            "Outputs/Gaussians/frame-00000004.ply",
+            "Outputs/Gaussians/00000004.ply",
+            "Outputs/Gaussians/00000004.json",
         ]))
     }
 

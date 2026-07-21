@@ -175,7 +175,7 @@ enum SessionControllerError: Error, Equatable, Sendable, LocalizedError {
         case .packageNotSaved: "Save this project first"
         case .packageRelocationWhileActive:
             "Finish or cancel reconstruction before moving this project"
-        case .engineUnavailable: "Lingbot engine not installed yet"
+        case .engineUnavailable: "The reconstruction engine is not installed yet"
         case let .reconstructionModeUnavailable(modeID):
             "This CloudPoint version cannot run reconstruction mode \(modeID). The project is open read-only."
         case .controllerClosed: "This project is closed"
@@ -378,6 +378,7 @@ struct SessionControllerDependencies: Sendable {
     var recordingImporter: any RecordingImporting
     var jpegValidator: any JPEGValidating
     var pointChunkOpener: any PointChunkOpening
+    var gaussianArtifactValidator: any GaussianArtifactValidating
     var now: @Sendable () -> Date
     var effects: SessionControllerEffects
 
@@ -393,6 +394,7 @@ struct SessionControllerDependencies: Sendable {
         recordingImporter: any RecordingImporting = AssetRecordingImporter(),
         jpegValidator: any JPEGValidating = ProductionJPEGValidator(),
         pointChunkOpener: any PointChunkOpening = ProductionPointChunkOpener(),
+        gaussianArtifactValidator: any GaussianArtifactValidating = ProductionGaussianArtifactValidator(),
         now: @escaping @Sendable () -> Date = Date.init,
         effects: SessionControllerEffects = .none
     ) {
@@ -402,6 +404,7 @@ struct SessionControllerDependencies: Sendable {
         self.recordingImporter = recordingImporter
         self.jpegValidator = jpegValidator
         self.pointChunkOpener = pointChunkOpener
+        self.gaussianArtifactValidator = gaussianArtifactValidator
         self.now = now
         self.effects = effects
     }
@@ -453,6 +456,9 @@ final class SessionController: @unchecked Sendable {
     private var samplingRate = 2
     private var pointSize: Float = 3
     private var confidenceThreshold: Float = 1.5
+    private var readyModelIdentifier: String?
+    private var readyModelRevision: String?
+    private var readyCheckpointSHA256: String?
 
     init(
         manifest: ProjectManifest,
@@ -794,7 +800,7 @@ final class SessionController: @unchecked Sendable {
         }
         _ = try ProjectManifest.validate(manifest)
 
-        guard case .lingbot = manifest.reconstructionPlan else {
+        guard manifest.reconstructionPlan.isRunnable else {
             openedPackageURL = packageURL.standardizedFileURL
             engineReady = false
             setupText = SessionControllerError.reconstructionModeUnavailable(
@@ -804,7 +810,8 @@ final class SessionController: @unchecked Sendable {
             return
         }
 
-        for window in manifest.completedWindows where restoreCommittedChunks {
+        for window in manifest.completedWindows
+            where restoreCommittedChunks && manifest.reconstructionPlan.modeID == .lingbotPointCloud {
             let chunk = try dependencies.pointChunkOpener.open(
                 packageURL.appending(path: window.pointChunkRelativePath)
             )
@@ -881,7 +888,13 @@ final class SessionController: @unchecked Sendable {
                 projectID: manifest.projectID,
                 packageURL: packageURL,
                 modeID: manifest.reconstructionPlan.modeID,
-                resumeCheckpoint: checkpoint
+                resumeCheckpoint: checkpoint,
+                sharpConfiguration: {
+                    guard case let .sharp(configuration) = manifest.reconstructionPlan else {
+                        return nil
+                    }
+                    return configuration
+                }()
             ))
             try await checkForStartupInterruption(
                 engine: createdEngine,
@@ -1352,10 +1365,13 @@ final class SessionController: @unchecked Sendable {
         guard !engineInterruptions.hasPendingRequest(for: generation) else { return }
         do {
             switch event {
-            case .ready:
+            case let .ready(_, modelIdentifier, modelRevision, checkpointSHA256):
                 guard manifest.sessionState.phase == .preparing else { return }
                 engineReady = true
                 setupText = nil
+                readyModelIdentifier = modelIdentifier
+                readyModelRevision = modelRevision
+                readyCheckpointSHA256 = checkpointSHA256
                 var staged = manifest
                 staged.sessionState = try staged.sessionState.applying(.ready)
                 if finiteResumeGeneration == generation {
@@ -1402,6 +1418,19 @@ final class SessionController: @unchecked Sendable {
                 engineReady = false
                 engineInterruptions.clearActiveEngine(generation: generation)
 
+            case let .gaussianProgress(stage, fraction):
+                let percent = Int((fraction * 100).rounded())
+                switch stage {
+                case .loading: setupText = "Loading Apple SHARP model…"
+                case .inference: setupText = "Reconstructing Gaussian scene… \(percent)%"
+                case .validating: setupText = "Validating Gaussian scene…"
+                case .committing: setupText = "Saving Gaussian scene…"
+                }
+                await publishSnapshot()
+
+            case let .gaussianCompleted(completion):
+                try await completeGaussian(completion)
+
             case .cancelled:
                 guard manifest.sessionState.phase != .cancelled else { return }
                 var staged = manifest
@@ -1417,6 +1446,38 @@ final class SessionController: @unchecked Sendable {
         } catch {
             await failDurably(error, generation: generation)
         }
+    }
+
+    private func completeGaussian(_ completion: SharpWorkerCompletion) async throws {
+        guard let packageURL,
+              manifest.reconstructionPlan.modeID == .sharpGaussian,
+              expectedOutputFrameIDs == [completion.sourceFrameIndex],
+              invocationQueuedCount == 1,
+              invocationProcessedCount == 0 else {
+            throw SessionControllerError.completionCounterMismatch
+        }
+        let output = try dependencies.gaussianArtifactValidator.validate(
+            completion,
+            in: packageURL
+        )
+        guard output.modelIdentifier == readyModelIdentifier,
+              output.modelRevision == readyModelRevision,
+              output.checkpointSHA256 == readyCheckpointSHA256 else {
+            throw SessionControllerError.invalidArtifact(output.provenanceRelativePath)
+        }
+        var staged = manifest
+        staged.outputState = .gaussian(output)
+        staged.sessionState = try staged.sessionState
+            .applying(.gaussianCommitted)
+            .applying(.beginFinalizing)
+            .applying(.complete)
+        staged.updatedAt = dependencies.now()
+        try await commit(staged)
+        invocationProcessedCount = 1
+        expectedOutputFrameIDs.removeAll()
+        setupText = nil
+        engineReady = false
+        engineInterruptions.clearActiveEngine(generation: generation)
     }
 
     private func completeWindow(_ result: WindowResult) async throws {
@@ -1676,14 +1737,15 @@ final class SessionController: @unchecked Sendable {
     private var capabilities: WorkspaceCapabilities {
         guard !closed, packageURL != nil else { return .disabled }
         let phase = manifest.sessionState.phase
+        let isLingBot = manifest.reconstructionPlan.modeID == .lingbotPointCloud
         return WorkspaceCapabilities(
-            canImportRecording: engineReady && phase == .ready,
-            canUseCamera: engineReady && phase == .ready,
-            canStopCapture: manifest.sessionState.isCapturing,
-            canPause: engineReady && [.importing, .capturing, .processing].contains(phase),
-            canResume: engineReady && phase == .paused,
+            canImportRecording: isLingBot && engineReady && phase == .ready,
+            canUseCamera: isLingBot && engineReady && phase == .ready,
+            canStopCapture: isLingBot && manifest.sessionState.isCapturing,
+            canPause: isLingBot && engineReady && [.importing, .capturing, .processing].contains(phase),
+            canResume: isLingBot && engineReady && phase == .paused,
             canCancel: phase == .preparing || engineReady && [.ready, .importing, .capturing, .processing, .paused, .finalizing].contains(phase),
-            canEditSamplingRate: engineReady && phase == .ready
+            canEditSamplingRate: isLingBot && engineReady && phase == .ready
         )
     }
 

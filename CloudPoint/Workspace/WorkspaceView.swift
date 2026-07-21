@@ -101,18 +101,26 @@ struct WorkspaceView: View {
                 .help("Cancel this reconstruction")
 
             Button("Reset View", systemImage: "viewfinder") { viewModel.resetView() }
-                .help("Reset the point-cloud camera")
+                .help("Reset the 3D camera")
 
             Button("Inspector", systemImage: "sidebar.trailing") {
                 inspectorPresented.toggle()
             }
             .help(inspectorPresented ? "Hide inspector" : "Show inspector")
 
+            if viewModel.isGaussianProject {
+                Button("Export PLY", systemImage: "square.and.arrow.down") {
+                    viewModel.exportGaussianOutput()
+                }
+                .disabled(viewModel.gaussianOutputURL == nil)
+                .help("Export the reconstructed Gaussian scene as a PLY file")
+            }
+
             ShareLink(item: viewModel.projectURL) {
-                Label("Export", systemImage: "square.and.arrow.up")
+                Label("Share Project", systemImage: "square.and.arrow.up")
             }
             .disabled(viewModel.snapshot.phase != .completed)
-            .help("Export or share the completed CloudPoint project")
+            .help("Share the complete CloudPoint project")
         }
     }
 
@@ -161,20 +169,30 @@ struct WorkspaceView: View {
 
     private var recordingControls: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Label("Video recording", systemImage: "film.stack")
+            Label(
+                viewModel.isGaussianProject ? "Selected video frame" : "Video recording",
+                systemImage: viewModel.isGaussianProject ? "sparkles.rectangle.stack" : "film.stack"
+            )
                 .font(.headline)
 
-            if let total = viewModel.snapshot.expectedInputCount {
+            if viewModel.isGaussianProject {
+                Text("Apple SHARP reconstructs one selected frame into a metric 3D Gaussian scene.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else if let total = viewModel.snapshot.expectedInputCount {
                 Text("CloudPoint sampled \(total.formatted()) frames from this recording. The source link and resume position are stored with the project.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
 
-            Button("Open Another Video…", systemImage: "plus.rectangle.on.rectangle") {
-                onOpenVideo()
+            if !viewModel.isGaussianProject {
+                Button("Open Another Video…", systemImage: "plus.rectangle.on.rectangle") {
+                    onOpenVideo()
+                }
+                .buttonStyle(.bordered)
             }
-            .buttonStyle(.bordered)
         }
     }
 
@@ -371,7 +389,9 @@ struct WorkspaceView: View {
 
     private var viewport: some View {
         ZStack {
-            if let renderer = viewModel.renderer {
+            if let renderer = viewModel.gaussianRenderer {
+                GaussianSplatView(renderer: renderer)
+            } else if let renderer = viewModel.renderer {
                 PointCloudView(renderer: renderer)
             } else {
                 ContentUnavailableView(
@@ -409,6 +429,33 @@ struct WorkspaceView: View {
                 .allowsHitTesting(false)
             }
 
+            if let gaussianRenderer = viewModel.gaussianRenderer {
+                switch gaussianRenderer.state {
+                case .loading:
+                    ProgressView("Loading Gaussian scene…")
+                        .padding(16)
+                        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
+                case let .failed(message):
+                    ContentUnavailableView(
+                        "Gaussian scene could not be displayed",
+                        systemImage: "exclamationmark.triangle",
+                        description: Text(message)
+                    )
+                case .empty where viewModel.snapshot.phase != .completed:
+                    ProgressView("Building Gaussian scene…")
+                        .padding(16)
+                        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
+                case .empty:
+                    ContentUnavailableView(
+                        "No Gaussian scene",
+                        systemImage: "sparkles.rectangle.stack",
+                        description: Text("This project has no validated Gaussian output.")
+                    )
+                case .ready:
+                    EmptyView()
+                }
+            }
+
             if viewModel.snapshot.processedCount > 0 {
                 Label(
                     "Drag to orbit  •  Shift-drag to pan  •  Scroll to zoom",
@@ -422,7 +469,7 @@ struct WorkspaceView: View {
                 .padding(18)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
                 .allowsHitTesting(false)
-                .accessibilityLabel("Point cloud controls")
+                .accessibilityLabel("3D scene controls")
                 .accessibilityValue("Drag to orbit. Shift-drag to pan. Scroll to zoom.")
             }
         }
@@ -495,16 +542,29 @@ struct WorkspaceView: View {
                 }
             }
 
-            Section("Point-cloud display") {
-                LabeledContent("Point size") {
-                    Slider(
-                        value: Binding(
-                            get: { Double(viewModel.snapshot.pointSize) },
-                            set: { viewModel.setPointSize(Float($0)) }
-                        ),
-                        in: 1...12
-                    )
-                    .frame(minWidth: 120)
+            Section(viewModel.isGaussianProject ? "Gaussian display" : "Point-cloud display") {
+                if !viewModel.isGaussianProject {
+                    LabeledContent("Point size") {
+                        Slider(
+                            value: Binding(
+                                get: { Double(viewModel.snapshot.pointSize) },
+                                set: { viewModel.setPointSize(Float($0)) }
+                            ),
+                            in: 1...12
+                        )
+                        .frame(minWidth: 120)
+                    }
+                } else if let renderer = viewModel.gaussianRenderer {
+                    switch renderer.state {
+                    case let .ready(count):
+                        LabeledContent("Gaussians", value: count.formatted())
+                    case .loading:
+                        LabeledContent("Scene", value: "Loading")
+                    case .empty:
+                        LabeledContent("Scene", value: "Waiting for reconstruction")
+                    case .failed:
+                        LabeledContent("Scene", value: "Display unavailable")
+                    }
                 }
 
                 Button("Reset View", systemImage: "viewfinder") { viewModel.resetView() }

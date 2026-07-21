@@ -23,6 +23,7 @@ enum SessionEvent: Sendable, Equatable {
     case frameAdmitted
     case frameStarted(windowIndex: UInt32)
     case windowCommitted(windowIndex: UInt32, processedFrames: UInt64)
+    case gaussianCommitted
     case stopCapture
     case finishInput
     case pause
@@ -143,6 +144,14 @@ struct SessionState: Codable, Sendable, Equatable {
             guard count > 0 else { throw SessionTransitionError.invalidCounters }
             next.processedCount = try Self.add(next.processedCount, count)
             next.currentWindow = nil
+
+        case (.processing, .gaussianCommitted):
+            guard next.processedCount == 0,
+                  next.queuedCount == 1,
+                  next.capturedCount == 1 else {
+                throw SessionTransitionError.invalidCounters
+            }
+            next.processedCount = 1
 
         case (.capturing, .stopCapture):
             next.phase = .processing

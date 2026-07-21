@@ -174,7 +174,14 @@ enum ReconstructionPlan: Codable, Sendable, Equatable {
 struct GaussianSceneOutput: Codable, Sendable, Equatable {
     var sourceFrameIndex: UInt32
     var plyRelativePath: String
+    var provenanceRelativePath: String
     var gaussianCount: UInt64
+    var modelIdentifier: String
+    var modelRevision: String
+    var checkpointSHA256: String
+    var device: String
+    var usedCPUFallback: Bool
+    var durationSeconds: Double
 }
 
 enum ReconstructionOutputState: Codable, Sendable, Equatable {

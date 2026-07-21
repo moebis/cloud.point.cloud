@@ -87,17 +87,20 @@ struct ProjectDescriptor: Sendable, Equatable {
     var packageURL: URL
     var modeID: ReconstructionModeID
     var resumeCheckpoint: ResumeCheckpoint?
+    var sharpConfiguration: SharpReconstructionConfiguration?
 
     init(
         projectID: UUID,
         packageURL: URL,
         modeID: ReconstructionModeID = .lingbotPointCloud,
-        resumeCheckpoint: ResumeCheckpoint? = nil
+        resumeCheckpoint: ResumeCheckpoint? = nil,
+        sharpConfiguration: SharpReconstructionConfiguration? = nil
     ) {
         self.projectID = projectID
         self.packageURL = packageURL
         self.modeID = modeID
         self.resumeCheckpoint = resumeCheckpoint
+        self.sharpConfiguration = sharpConfiguration
     }
 }
 
@@ -113,6 +116,8 @@ enum EngineEvent: Sendable, Equatable {
     case frameCompleted(FrameArtifacts)
     case windowCompleted(WindowResult)
     case sessionCompleted(processedFrames: UInt64, windowCount: UInt32, durationSeconds: Double)
+    case gaussianProgress(stage: SharpProgressStage, fraction: Double)
+    case gaussianCompleted(SharpWorkerCompletion)
     case paused(queuedFrames: UInt64, processedFrames: UInt64)
     case cancelled(lastCompletedWindowIndex: UInt32?)
     case warning(code: String, message: String, recoverable: Bool, details: [String: JSONValue])
@@ -128,8 +133,9 @@ enum EngineEvent: Sendable, Equatable {
         switch self {
         case let .frameStarted(frameIndex, _): frameIndex
         case let .frameCompleted(artifacts): artifacts.frameIndex
+        case let .gaussianCompleted(result): result.sourceFrameIndex
         case .ready, .modelProgress, .windowCompleted, .sessionCompleted, .paused,
-             .cancelled, .warning, .heartbeat:
+             .cancelled, .warning, .heartbeat, .gaussianProgress:
             nil
         }
     }

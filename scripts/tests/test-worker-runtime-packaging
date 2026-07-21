@@ -71,6 +71,27 @@ for package in '"timm"' '"plyfile"'; do
     exit 1
   fi
 done
+sharp_worker="${repo_root}/worker/src/cloudpoint_worker/sharp"
+for required in \
+  "${sharp_worker}/__init__.py" \
+  "${sharp_worker}/cli.py" \
+  "${sharp_worker}/inference.py" \
+  "${sharp_worker}/session.py"
+do
+  if [[ ! -f "$required" ]]; then
+    echo "SHARP worker source is missing: $required" >&2
+    exit 1
+  fi
+done
+if ! grep -F 'ignore-vcs = true' "${repo_root}/worker/pyproject.toml" >/dev/null; then
+  echo "worker wheel packaging must not depend on the Git index" >&2
+  exit 1
+fi
+if ! grep -F 'cloudpoint_worker.sharp.cli' \
+  "${scripts_dir}/verify-worker-runtime" >/dev/null; then
+  echo "release verification must import the complete SHARP entry point" >&2
+  exit 1
+fi
 
 if grep -E '/Users/|worker/\.venv' "$launcher_source" >/dev/null; then
   echo "runtime launcher contains a build-machine path: $launcher_source" >&2

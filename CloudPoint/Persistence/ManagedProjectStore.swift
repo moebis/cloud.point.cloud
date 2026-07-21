@@ -62,6 +62,11 @@ protocol ManagedProjectStoring: Sendable {
         source: RecordingSourceReference,
         selectedFrame: VideoKeyFrameCandidate
     ) async throws -> ManagedProject
+    func createSharpCameraProject(
+        sourceName: String,
+        source: CameraSourceReference,
+        selectedFrame: VideoKeyFrameCandidate
+    ) async throws -> ManagedProject
     func createCameraProject(
         sourceName: String,
         source: CameraSourceReference
@@ -173,6 +178,22 @@ actor ManagedProjectStore: ManagedProjectStoring {
             sourceName: sourceName,
             recordingSource: singleFrameSource,
             cameraSource: nil,
+            reconstructionPlan: .sharp(
+                SharpReconstructionConfiguration(inputFrameIndex: 0)
+            ),
+            selectedFrame: selectedFrame
+        )
+    }
+
+    func createSharpCameraProject(
+        sourceName: String,
+        source: CameraSourceReference,
+        selectedFrame: VideoKeyFrameCandidate
+    ) async throws -> ManagedProject {
+        try createProject(
+            sourceName: sourceName,
+            recordingSource: nil,
+            cameraSource: source,
             reconstructionPlan: .sharp(
                 SharpReconstructionConfiguration(inputFrameIndex: 0)
             ),

@@ -149,7 +149,7 @@ struct WelcomeView: View {
                 ContentUnavailableView(
                     "No Recent Projects",
                     systemImage: "clock.arrow.circlepath",
-                    description: Text("Projects are created and autosaved when you open a video.")
+                    description: Text("Projects are created after you choose a source and reconstruction mode.")
                 )
                 .foregroundStyle(.white.opacity(0.62))
                 .frame(maxWidth: .infinity, minHeight: 190)
@@ -292,11 +292,11 @@ private struct EngineStateBadge: View {
 private extension WelcomeEngineState {
     var label: String {
         switch self {
-        case .ready: "Reconstruction engine ready"
-        case .setupRequired: "Model setup required"
-        case .downloading: "Downloading model"
-        case .converting: "Converting for Apple Silicon"
-        case .repairRequired: "Model repair required"
+        case .ready: "Point Cloud model ready"
+        case .setupRequired: "Models install when needed"
+        case .downloading: "Downloading Point Cloud model"
+        case .converting: "Preparing Point Cloud model"
+        case .repairRequired: "Point Cloud model needs repair"
         }
     }
 

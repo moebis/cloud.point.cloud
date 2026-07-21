@@ -454,6 +454,7 @@ struct ProjectManifest: Codable, Sendable, Equatable {
         }
         if case let .gaussian(output?) = outputState {
             paths.insert(output.plyRelativePath)
+            paths.insert(output.provenanceRelativePath)
         }
         return paths
     }
@@ -513,9 +514,23 @@ struct ProjectManifest: Codable, Sendable, Equatable {
         if let output {
             guard persistedFrameIndices.contains(output.sourceFrameIndex),
                   output.gaussianCount > 0,
-                  output.plyRelativePath.hasPrefix("Outputs/Gaussians/"),
-                  output.plyRelativePath.hasSuffix(".ply"),
+                  output.plyRelativePath == String(
+                    format: "Outputs/Gaussians/%08u.ply",
+                    output.sourceFrameIndex
+                  ),
+                  output.provenanceRelativePath == String(
+                    format: "Outputs/Gaussians/%08u.json",
+                    output.sourceFrameIndex
+                  ),
                   ProjectRelativePath.isSafe(output.plyRelativePath),
+                  ProjectRelativePath.isSafe(output.provenanceRelativePath),
+                  output.modelIdentifier == "apple/ml-sharp",
+                  output.modelRevision.count == 40,
+                  output.modelRevision.allSatisfy({ $0.isHexDigit && !$0.isUppercase }),
+                  output.checkpointSHA256.count == 64,
+                  output.checkpointSHA256.allSatisfy({ $0.isHexDigit && !$0.isUppercase }),
+                  ["mps", "cpu"].contains(output.device),
+                  validDuration(output.durationSeconds),
                   manifest.sessionState.processedCount == 1 else {
                 throw ProjectManifestError.invalidArtifact
             }

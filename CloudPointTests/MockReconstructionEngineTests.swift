@@ -548,6 +548,8 @@ private extension EngineEvent {
         case .frameCompleted: "frameCompleted"
         case .windowCompleted: "windowCompleted"
         case .sessionCompleted: "sessionCompleted"
+        case .gaussianProgress: "gaussianProgress"
+        case .gaussianCompleted: "gaussianCompleted"
         case .paused: "paused"
         case .cancelled: "cancelled"
         case .warning: "warning"

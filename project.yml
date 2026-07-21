@@ -8,6 +8,11 @@ configs:
   Debug: debug
   Release: release
 
+packages:
+  MetalSplatter:
+    url: https://github.com/scier/MetalSplatter.git
+    revision: 71ff248e3016ac43c0a9271e322538421b28c360
+
 targets:
   CloudPoint:
     type: application
@@ -24,6 +29,10 @@ targets:
     dependencies:
       - target: CloudPointWorkerLauncher
         embed: false
+      - package: MetalSplatter
+        product: MetalSplatter
+      - package: MetalSplatter
+        product: SplatIO
     postBuildScripts:
       - name: Embed Worker Launcher
         script: |
@@ -88,6 +97,7 @@ targets:
       - path: CloudPoint/Domain/ProjectModels.swift
       - path: CloudPoint/Domain/ReconstructionMode.swift
       - path: CloudPoint/Engine/ReconstructionEngine.swift
+      - path: CloudPoint/Engine/SharpWorkerProtocol.swift
       - path: CloudPoint/Engine/WorkerProtocol.swift
     configFiles:
       Debug: Config/Base.xcconfig
@@ -126,6 +136,9 @@ schemes:
         CLOUDPOINT_SMOKE_VIDEO: "$(CLOUDPOINT_SMOKE_VIDEO)"
         CLOUDPOINT_WORKER_RUNTIME: "$(CLOUDPOINT_WORKER_RUNTIME)"
         CLOUDPOINT_REAL_MODEL_DIR: "$(CLOUDPOINT_REAL_MODEL_DIR)"
+        CLOUDPOINT_REAL_SHARP_PLY: "$(CLOUDPOINT_REAL_SHARP_PLY)"
+        CLOUDPOINT_REAL_SHARP_CHECKPOINT: "$(CLOUDPOINT_REAL_SHARP_CHECKPOINT)"
+        CLOUDPOINT_REAL_SHARP_FRAME: "$(CLOUDPOINT_REAL_SHARP_FRAME)"
   CloudPointTests:
     build:
       targets:

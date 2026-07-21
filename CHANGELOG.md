@@ -5,6 +5,53 @@ All notable changes to CloudPoint are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-07-21
+
+### Added
+
+- Experimental Apple SHARP reconstruction from a selected video frame or a
+  one-click live camera snapshot, using MPS with a recoverable CPU fallback.
+- Guided SHARP setup with explicit Apple research-license acceptance, resumable
+  download, exact size/SHA-256 verification, provenance, and no bundled model
+  weights.
+- Native Metal Gaussian-splat viewer with orbit, pan, zoom, reset, validated PLY
+  loading, standalone PLY export, and durable project reopen.
+- Source-first mode chooser with seven ranked video key frames and a live SHARP
+  camera preview before any project is created.
+- Manifest schema v3 with stable reconstruction-mode identifiers, Gaussian
+  output provenance, and read-only compatibility for unknown future modes.
+- Separate strict JSON-lines SHARP worker protocol with progress, heartbeat,
+  cancellation, atomic artifact publication, and finite-output validation.
+- Pinned MetalSplatter/SplatIO dependency and Apple SHARP source snapshot with
+  preserved upstream notices.
+
+### Changed
+
+- Reworked opening a recording or camera into an explicit Point Cloud versus
+  Gaussian Scene decision instead of silently creating a project.
+- Separated Point Cloud and Gaussian workspace controls, status text, export
+  actions, and empty/loading states.
+- Kept completed SHARP projects viewable without requiring the model to remain
+  installed; only unfinished reconstruction requires model health.
+
+### Fixed
+
+- Corrected the OpenCV-to-Metal basis so reconstructed geometry is upright and
+  forward-facing.
+- Synchronized camera-preview and reconstructed-scene mirroring and fixed
+  off-axis Gaussian centering when display mirroring is enabled.
+- Hardened Gaussian PLY/provenance validation against symlinks, non-finite
+  values, invalid depth, malformed schemas, truncation, and size overflow.
+
+### Release notes
+
+- Requires Apple Silicon and macOS 15.0 or newer.
+- SHARP is single-image nearby-view synthesis, not multi-view SLAM,
+  photogrammetry, or a watertight mesh generator.
+- SHARP setup downloads a 2,809,738,232-byte research checkpoint after the user
+  accepts Apple's terms; approximately 6 GiB free is required.
+- The v1.1.0 app is ad-hoc signed and not Apple-notarized.
+
 ## [1.0.0] - 2026-07-21
 
 ### Added
@@ -56,4 +103,5 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   weights; approximately 8 GiB of free space is recommended.
 - The v1.0.0 app is ad-hoc signed and not Apple-notarized.
 
+[1.1.0]: https://github.com/moebis/cloud.point.cloud/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/moebis/cloud.point.cloud/releases/tag/v1.0.0

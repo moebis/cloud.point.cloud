@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "$#" -ne 2 ]]; then
+  echo "usage: scripts/test-sharp-smoke /absolute/path/to/video.mov /absolute/path/to/sharp_2572gikvuh.pt" >&2
+  exit 64
+fi
+
+source_video="$1"
+checkpoint="$2"
+if [[ "$source_video" != /* || ! -r "$source_video" || ! -f "$source_video" ]]; then
+  echo "recording must be an absolute path to a readable file: $source_video" >&2
+  exit 66
+fi
+case "${source_video##*.}" in
+  mov|MOV|mp4|MP4|m4v|M4V) ;;
+  *) echo "recording must be MOV, MP4, or M4V: $source_video" >&2; exit 65 ;;
+esac
+if [[ "$checkpoint" != /* || ! -r "$checkpoint" || ! -f "$checkpoint" || -L "$checkpoint" ]]; then
+  echo "checkpoint must be an absolute path to a readable regular file: $checkpoint" >&2
+  exit 66
+fi
+if ! command -v ffmpeg >/dev/null 2>&1; then
+  echo "ffmpeg is required for the SHARP recording smoke" >&2
+  exit 69
+fi
+if ! command -v uv >/dev/null 2>&1; then
+  echo "uv is required for the locked SHARP worker environment" >&2
+  exit 69
+fi
+
+expected_bytes=2809738232
+expected_sha="94211a75198c47f61fca7d739ba08a215418d8d398d48fddf023baccc24f073d"
+actual_bytes="$(/usr/bin/stat -f '%z' "$checkpoint")"
+actual_sha="$(/usr/bin/shasum -a 256 "$checkpoint" | /usr/bin/awk '{print $1}')"
+if [[ "$actual_bytes" != "$expected_bytes" || "$actual_sha" != "$expected_sha" ]]; then
+  echo "checkpoint does not match the pinned Apple SHARP release" >&2
+  exit 65
+fi
+
+scripts_dir="$(cd "$(dirname "$0")" && pwd)"
+repo_root="$(cd "${scripts_dir}/.." && pwd)"
+worker_root="${repo_root}/worker"
+smoke_project="$(mktemp -d /tmp/cloudpoint-sharp-smoke.XXXXXX).cloudpoint"
+mv "${smoke_project%.cloudpoint}" "$smoke_project"
+smoke_complete=0
+
+cleanup() {
+  if [[ "$smoke_complete" -eq 0 ]]; then
+    case "$smoke_project" in
+      /tmp/cloudpoint-sharp-smoke.*.cloudpoint) rm -rf -- "$smoke_project" ;;
+      *) echo "refusing to remove unexpected smoke directory: $smoke_project" >&2 ;;
+    esac
+  fi
+}
+trap cleanup EXIT
+
+mkdir -p "${smoke_project}/Frames" "${smoke_project}/Outputs/Gaussians"
+ffmpeg -hide_banner -loglevel error -y \
+  -i "$source_video" \
+  -frames:v 1 \
+  -q:v 2 \
+  "${smoke_project}/Frames/00000000.jpg"
+
+events="${smoke_project}/Logs.jsonl"
+(
+  cd "$worker_root"
+  uv run --isolated --frozen --extra model-prep --extra sharp \
+    python -I -B -m cloudpoint_worker.sharp.cli \
+      --project "$smoke_project" \
+      --checkpoint "$checkpoint" \
+      --checkpoint-sha256 "$expected_sha" \
+      --source-commit "1eaa046834b81852261262b41b0919f5c1efdd2e" \
+      --input-relative-path "Frames/00000000.jpg" \
+      --output-relative-path "Outputs/Gaussians/00000000.ply"
+) | tee "$events"
+
+(
+  cd "$worker_root"
+  uv run --isolated --frozen --extra model-prep --extra sharp python -I -B - \
+    "$smoke_project" "$events" "$expected_sha" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+from cloudpoint_worker.sharp.session import _validate_ply
+
+project = Path(sys.argv[1])
+events = [json.loads(line) for line in Path(sys.argv[2]).read_text().splitlines()]
+completed = [event for event in events if event.get("type") == "completed"]
+if len(completed) != 1:
+    raise SystemExit("SHARP smoke did not produce exactly one completion event")
+event = completed[0]
+if event.get("gaussianCount") != 1_179_648:
+    raise SystemExit("SHARP smoke produced an unexpected Gaussian count")
+ply = project / event["plyRelativePath"]
+provenance = project / event["provenanceRelativePath"]
+_validate_ply(ply, event["gaussianCount"])
+record = json.loads(provenance.read_text())
+if record.get("checkpointSHA256") != sys.argv[3]:
+    raise SystemExit("SHARP smoke provenance checkpoint mismatch")
+if record.get("gaussianCount") != event["gaussianCount"]:
+    raise SystemExit("SHARP smoke provenance count mismatch")
+print(f"validated {event['gaussianCount']:,} Gaussians on {event['device']}")
+PY
+)
+
+smoke_complete=1
+echo "SHARP smoke project: $smoke_project"

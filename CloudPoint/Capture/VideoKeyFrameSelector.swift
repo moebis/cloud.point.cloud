@@ -45,6 +45,20 @@ enum VideoKeyFrameSelectorError: Error, LocalizedError, Equatable, Sendable {
 }
 
 struct VideoKeyFrameSelector: VideoKeyFrameSelecting {
+    static func candidate(
+        from frame: CapturedFrame,
+        index: Int = 0,
+        temporalScore: Double = 1
+    ) throws -> VideoKeyFrameCandidate {
+        let context = CIContext(options: [.cacheIntermediates: false])
+        return try candidate(
+            from: frame,
+            index: index,
+            temporalScore: temporalScore,
+            context: context
+        )
+    }
+
     func candidates(
         for url: URL,
         durationSeconds: Double,
@@ -68,22 +82,14 @@ struct VideoKeyFrameSelector: VideoKeyFrameSelecting {
         result.reserveCapacity(count)
         for try await frame in AssetFrameSource(assetURL: url).frames(at: timestamps) {
             try Task.checkCancellation()
-            let oriented = try Self.orientedImage(from: frame, context: context)
-            let fullJPEG = try Self.jpegData(oriented, quality: 0.92)
-            let thumbnail = try Self.thumbnail(of: oriented, maximumDimension: 280)
-            let thumbnailJPEG = try Self.jpegData(thumbnail, quality: 0.82)
-            let metrics = try Self.metrics(for: thumbnail)
             let timestamp = frame.presentationTimestamp.seconds
             let normalizedTime = min(max(timestamp / durationSeconds, 0), 1)
             let temporalScore = 1 - abs(normalizedTime - 0.5) * 2
-            result.append(VideoKeyFrameCandidate(
+            result.append(try Self.candidate(
+                from: frame,
                 index: result.count,
-                timestampSeconds: timestamp,
-                thumbnailJPEG: thumbnailJPEG,
-                fullResolutionJPEG: fullJPEG,
-                sharpnessScore: metrics.sharpness,
-                exposureScore: metrics.exposure,
-                temporalScore: temporalScore
+                temporalScore: temporalScore,
+                context: context
             ))
         }
         guard !result.isEmpty else { throw VideoKeyFrameSelectorError.noFrames }
@@ -113,6 +119,28 @@ struct VideoKeyFrameSelector: VideoKeyFrameSelecting {
             return preferred
         }
         return recommended(in: candidates)
+    }
+
+    private static func candidate(
+        from frame: CapturedFrame,
+        index: Int,
+        temporalScore: Double,
+        context: CIContext
+    ) throws -> VideoKeyFrameCandidate {
+        let oriented = try orientedImage(from: frame, context: context)
+        let fullJPEG = try jpegData(oriented, quality: 0.92)
+        let thumbnail = try thumbnail(of: oriented, maximumDimension: 280)
+        let thumbnailJPEG = try jpegData(thumbnail, quality: 0.82)
+        let metrics = try metrics(for: thumbnail)
+        return VideoKeyFrameCandidate(
+            index: index,
+            timestampSeconds: max(frame.presentationTimestamp.seconds, 0),
+            thumbnailJPEG: thumbnailJPEG,
+            fullResolutionJPEG: fullJPEG,
+            sharpnessScore: metrics.sharpness,
+            exposureScore: metrics.exposure,
+            temporalScore: temporalScore
+        )
     }
 
     private static func orientedImage(

@@ -122,8 +122,15 @@ if sys.version_info[:3] != (3, 12, 11):
 
 from cloudpoint_worker.model._vendor.ml_sharp.models import PredictorParams
 from cloudpoint_worker.model._vendor.ml_sharp.utils.gaussians import save_ply
+from cloudpoint_worker.sharp.cli import main as sharp_main
+from cloudpoint_worker.sharp.session import reconstruct as sharp_reconstruct
 
-if PredictorParams is None or save_ply is None:
+if any(value is None for value in (
+    PredictorParams,
+    save_ply,
+    sharp_main,
+    sharp_reconstruct,
+)):
     raise SystemExit("Apple SHARP inference source is not importable")
 PY
 
