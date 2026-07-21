@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+scripts_dir="$(cd "$(dirname "$0")/.." && pwd)"
+repo_root="$(cd "${scripts_dir}/.." && pwd)"
+
+for executable in \
+  "${scripts_dir}/package-worker-runtime" \
+  "${scripts_dir}/verify-worker-runtime"
+do
+  if [[ ! -x "$executable" ]]; then
+    echo "required executable is missing: $executable" >&2
+    exit 1
+  fi
+done
+
+launcher_source="${scripts_dir}/runtime-launchers/cloudpoint-runtime-launcher.c"
+if [[ ! -f "$launcher_source" ]]; then
+  echo "native runtime launcher source is missing: $launcher_source" >&2
+  exit 1
+fi
+
+if grep -F -- '--mock-engine' "${scripts_dir}/run-first-version" >/dev/null; then
+  echo "the first-version launcher must never enable the mock engine" >&2
+  exit 1
+fi
+
+if ! grep -F 'scripts/package-worker-runtime' "${repo_root}/project.yml" >/dev/null; then
+  echo "Release builds must package the worker runtime" >&2
+  exit 1
+fi
+
+if grep -E '/Users/|worker/\.venv' "$launcher_source" >/dev/null; then
+  echo "runtime launcher contains a build-machine path: $launcher_source" >&2
+  exit 1
+fi
+if ! grep -F 'execve(python_path, child_arguments, environ)' \
+  "$launcher_source" >/dev/null; then
+  echo "native runtime launcher must preserve the exact supplied environment" >&2
+  exit 1
+fi
+for flag in '"-I"' '"-B"' '"-m"'; do
+  if ! grep -F "$flag" "$launcher_source" >/dev/null; then
+    echo "native runtime launcher is missing isolated Python flag: $flag" >&2
+    exit 1
+  fi
+done
+
+echo "worker runtime packaging contract passed"

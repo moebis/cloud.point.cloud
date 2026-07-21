@@ -1,0 +1,175 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "$#" -ne 1 ]]; then
+  echo "usage: scripts/package-worker-runtime /absolute/path/to/WorkerRuntime" >&2
+  exit 64
+fi
+
+scripts_dir="$(cd "$(dirname "$0")" && pwd)"
+repo_root="$(cd "${scripts_dir}/.." && pwd)"
+worker_root="${repo_root}/worker"
+output="$1"
+
+if [[ "$output" != /* || "$(basename "$output")" != "WorkerRuntime" ]]; then
+  echo "output must be an absolute path ending in WorkerRuntime" >&2
+  exit 64
+fi
+if [[ "$(uname -s)" != "Darwin" || "$(uname -m)" != "arm64" ]]; then
+  echo "CloudPoint worker runtimes can only be packaged on Apple Silicon" >&2
+  exit 69
+fi
+if ! command -v uv >/dev/null 2>&1; then
+  echo "uv is required to package the locked worker runtime" >&2
+  exit 69
+fi
+
+output_parent="$(dirname "$output")"
+mkdir -p "$output_parent"
+output_parent="$(realpath "$output_parent")"
+output="${output_parent}/WorkerRuntime"
+if [[ -L "$output" ]]; then
+  echo "refusing to replace a symlinked worker runtime: $output" >&2
+  exit 65
+fi
+
+cloudpoint_stage="$(mktemp -d "${output_parent}/.cloudpoint-worker-runtime.XXXXXX")"
+cloudpoint_build_env="${cloudpoint_stage}/build-environment"
+cloudpoint_runtime_build="${cloudpoint_stage}/WorkerRuntime build"
+cloudpoint_runtime_ready="${cloudpoint_stage}/WorkerRuntime"
+cloudpoint_backup=""
+
+cleanup() {
+  if [[ -n "$cloudpoint_backup" && -e "$cloudpoint_backup" && ! -e "$output" ]]; then
+    mv "$cloudpoint_backup" "$output"
+    cloudpoint_backup=""
+  fi
+  rm -rf -- "$cloudpoint_stage"
+}
+trap cleanup EXIT
+
+(
+  cd "$worker_root"
+  UV_PROJECT_ENVIRONMENT="$cloudpoint_build_env" \
+    uv sync \
+      --frozen \
+      --no-dev \
+      --extra model-prep \
+      --no-editable \
+      --managed-python \
+      --python 3.12.11
+)
+
+cloudpoint_python="$(realpath "${cloudpoint_build_env}/bin/python3.12")"
+cloudpoint_python_root="$(cd "$(dirname "$cloudpoint_python")/.." && pwd -P)"
+if [[ ! -x "${cloudpoint_python_root}/bin/python3.12" || \
+      ! -f "${cloudpoint_python_root}/lib/libpython3.12.dylib" ]]; then
+  echo "uv did not provide the expected standalone CPython 3.12.11 runtime" >&2
+  exit 70
+fi
+
+mkdir -p "${cloudpoint_runtime_build}/bin" "${cloudpoint_runtime_build}/lib"
+install -m 755 \
+  "${cloudpoint_python_root}/bin/python3.12" \
+  "${cloudpoint_runtime_build}/bin/python3.12"
+ln -s python3.12 "${cloudpoint_runtime_build}/bin/python"
+ln -s python3.12 "${cloudpoint_runtime_build}/bin/python3"
+ditto "${cloudpoint_python_root}/lib" "${cloudpoint_runtime_build}/lib"
+ditto \
+  "${cloudpoint_build_env}/lib/python3.12/site-packages" \
+  "${cloudpoint_runtime_build}/lib/python3.12/site-packages"
+
+install_name_tool -id '@loader_path/libpython3.12.dylib' \
+  "${cloudpoint_runtime_build}/lib/libpython3.12.dylib"
+codesign --force --sign - --timestamp=none \
+  "${cloudpoint_runtime_build}/lib/libpython3.12.dylib"
+
+cloudpoint_sysconfig="${cloudpoint_runtime_build}/lib/python3.12/_sysconfigdata__darwin_darwin.py"
+"${cloudpoint_runtime_build}/bin/python3.12" -I -B - \
+  "$cloudpoint_sysconfig" "$cloudpoint_python_root" <<'PY'
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+source_prefix = sys.argv[2]
+sentinel = "__CLOUDPOINT_RUNTIME__"
+text = path.read_text(encoding="utf-8").replace(source_prefix, sentinel)
+if source_prefix in text:
+    raise SystemExit("could not scrub the standalone Python installation prefix")
+text += f'''\n\n# CloudPoint relocates the standalone CPython distribution inside the app.\nimport sys as _cloudpoint_sys\nfor _cloudpoint_key, _cloudpoint_value in tuple(build_time_vars.items()):\n    if isinstance(_cloudpoint_value, str):\n        build_time_vars[_cloudpoint_key] = _cloudpoint_value.replace(\n            "{sentinel}", _cloudpoint_sys.prefix\n        )\n'''
+path.write_text(text, encoding="utf-8")
+PY
+
+rm -rf -- \
+  "${cloudpoint_runtime_build}/lib/python3.12/site-packages/pip" \
+  "${cloudpoint_runtime_build}/lib/python3.12/site-packages/pip-24.3.1.dist-info"
+find "$cloudpoint_runtime_build" -type f \
+  \( -name '*.pyc' -o -name 'direct_url.json' \) -delete
+find "$cloudpoint_runtime_build" -depth -type d -name '__pycache__' -empty -delete
+
+xcrun --sdk macosx clang \
+  -arch arm64 \
+  -mmacosx-version-min=15.0 \
+  -Os \
+  -Wall \
+  -Wextra \
+  -Werror \
+  -Wl,-dead_strip \
+  "${scripts_dir}/runtime-launchers/cloudpoint-runtime-launcher.c" \
+  -o "${cloudpoint_runtime_build}/bin/cloudpoint-worker"
+install -m 755 \
+  "${cloudpoint_runtime_build}/bin/cloudpoint-worker" \
+  "${cloudpoint_runtime_build}/bin/cloudpoint-model"
+
+cloudpoint_lock_sha="$(shasum -a 256 "${worker_root}/uv.lock" | awk '{print $1}')"
+"${cloudpoint_runtime_build}/bin/python3.12" -I -B - \
+  "${cloudpoint_runtime_build}/runtime-manifest.json" \
+  "$cloudpoint_lock_sha" <<'PY'
+import importlib.metadata
+import json
+import sys
+from pathlib import Path
+
+packages = [
+    "cloudpoint-worker",
+    "mlx",
+    "msgspec",
+    "numpy",
+    "pillow",
+    "safetensors",
+    "torch",
+    "tqdm",
+]
+manifest = {
+    "formatVersion": 1,
+    "packages": {name: importlib.metadata.version(name) for name in packages},
+    "python": "3.12.11",
+    "workerLockSHA256": sys.argv[2],
+}
+Path(sys.argv[1]).write_text(
+    json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+    encoding="utf-8",
+)
+PY
+
+# The runtime is deliberately renamed before verification. This catches
+# launchers or Python installations that accidentally retain their staging path.
+mv "$cloudpoint_runtime_build" "$cloudpoint_runtime_ready"
+"${scripts_dir}/verify-worker-runtime" "$cloudpoint_runtime_ready"
+
+if [[ -e "$output" ]]; then
+  cloudpoint_backup="${output_parent}/.WorkerRuntime.previous.$$"
+  if [[ -e "$cloudpoint_backup" || -L "$cloudpoint_backup" ]]; then
+    echo "refusing to overwrite an existing runtime backup: $cloudpoint_backup" >&2
+    exit 65
+  fi
+  mv "$output" "$cloudpoint_backup"
+fi
+mv "$cloudpoint_runtime_ready" "$output"
+if [[ -n "$cloudpoint_backup" ]]; then
+  rm -rf -- "$cloudpoint_backup"
+  cloudpoint_backup=""
+fi
+
+runtime_bytes="$(du -sk "$output" | awk '{print $1 * 1024}')"
+echo "packaged CloudPoint worker runtime: $output (${runtime_bytes} bytes)"

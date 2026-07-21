@@ -27,8 +27,7 @@ if [[ ! -x "${app_path}/Contents/MacOS/CloudPoint" ]]; then
 fi
 
 echo "CloudPoint first version: $app_path"
-echo "Mock reconstruction is enabled only for this test launch."
 
 if [[ "${1:-}" != "--build-only" ]]; then
-  open -n "$app_path" --args --mock-engine
+  open -n "$app_path"
 fi

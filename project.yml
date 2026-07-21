@@ -33,6 +33,13 @@ targets:
           - "$(BUILT_PRODUCTS_DIR)/CloudPointWorkerLauncher"
         outputFiles:
           - "$(TARGET_BUILD_DIR)/$(CONTENTS_FOLDER_PATH)/Helpers/CloudPointWorkerLauncher"
+      - name: Embed Release Worker Runtime
+        basedOnDependencyAnalysis: false
+        script: |
+          if [ "${CONFIGURATION}" = "Release" ]; then
+            "${SRCROOT}/scripts/package-worker-runtime" \
+              "${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/WorkerRuntime"
+          fi
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: cloud.point.cloud.CloudPoint
@@ -43,6 +50,9 @@ targets:
         MACOSX_DEPLOYMENT_TARGET: "15.0"
         SWIFT_VERSION: "6.0"
         SWIFT_STRICT_CONCURRENCY: complete
+      configs:
+        Release:
+          CLOUDPOINT_WORKER_RUNTIME: ""
 
   CloudPointTests:
     type: bundle.unit-test

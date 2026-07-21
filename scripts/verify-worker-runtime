@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "$#" -ne 1 ]]; then
+  echo "usage: scripts/verify-worker-runtime /absolute/path/to/WorkerRuntime" >&2
+  exit 64
+fi
+
+runtime_root="$1"
+if [[ "$runtime_root" != /* || ! -d "$runtime_root" || -L "$runtime_root" ]]; then
+  echo "worker runtime must be an absolute, non-symlinked directory: $runtime_root" >&2
+  exit 65
+fi
+runtime_root="$(realpath "$runtime_root")"
+
+if [[ "$(uname -s)" != "Darwin" || "$(uname -m)" != "arm64" ]]; then
+  echo "CloudPoint worker runtimes can only be verified on Apple Silicon" >&2
+  exit 69
+fi
+
+python_executable="${runtime_root}/bin/python3.12"
+worker_executable="${runtime_root}/bin/cloudpoint-worker"
+model_executable="${runtime_root}/bin/cloudpoint-model"
+manifest="${runtime_root}/runtime-manifest.json"
+
+for executable in "$python_executable" "$worker_executable" "$model_executable"; do
+  if [[ ! -f "$executable" || -L "$executable" || ! -x "$executable" ]]; then
+    echo "worker runtime executable is missing, linked, or not executable: $executable" >&2
+    exit 66
+  fi
+done
+
+if [[ ! -f "$manifest" || -L "$manifest" ]]; then
+  echo "worker runtime manifest is missing: $manifest" >&2
+  exit 66
+fi
+
+if ! lipo -archs "$python_executable" | tr ' ' '\n' | grep -Fx arm64 >/dev/null; then
+  echo "bundled Python does not contain arm64 code" >&2
+  exit 69
+fi
+
+for launcher in "$worker_executable" "$model_executable"; do
+  if sed -n '1p' "$launcher" | grep -q '^#!'; then
+    echo "runtime launcher must be a native executable: $launcher" >&2
+    exit 65
+  fi
+  if ! lipo -archs "$launcher" | tr ' ' '\n' | grep -Fx arm64 >/dev/null; then
+    echo "runtime launcher does not contain arm64 code: $launcher" >&2
+    exit 69
+  fi
+done
+
+if find "$runtime_root" -type f -name 'lingbot-map-long.pt' -print -quit | grep -q .; then
+  echo "the source model must not be embedded in the app runtime" >&2
+  exit 65
+fi
+if find "$runtime_root" -type f -name '*.pyc' -print -quit | grep -q .; then
+  echo "worker runtime contains location-bound Python bytecode" >&2
+  exit 65
+fi
+cloudpoint_build_path=""
+if [[ "${HOME:-}" == /Users/* ]]; then
+  cloudpoint_build_path="$(
+    LC_ALL=C grep -r -a -l -F "$HOME" "$runtime_root" | head -n 1 || true
+  )"
+fi
+if [[ -z "$cloudpoint_build_path" ]]; then
+  cloudpoint_build_path="$(
+    LC_ALL=C grep -r -a -l -E 'cloud\.point\.cloud/worker' \
+      "$runtime_root" | head -n 1 || true
+  )"
+fi
+if [[ -n "$cloudpoint_build_path" ]]; then
+  echo "worker runtime contains a build-machine path: $cloudpoint_build_path" >&2
+  exit 65
+fi
+
+"$python_executable" -I -B - "$manifest" <<'PY'
+import importlib.metadata
+import json
+import platform
+import re
+import sys
+from pathlib import Path
+
+import mlx.core
+import torch
+
+manifest = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+expected = {
+    "cloudpoint-worker": "0.1.0",
+    "mlx": "0.32.0",
+    "msgspec": "0.19.0",
+    "numpy": "2.3.1",
+    "pillow": "11.3.0",
+    "safetensors": "0.5.3",
+    "torch": "2.8.0",
+    "tqdm": "4.67.1",
+}
+actual = {name: importlib.metadata.version(name) for name in expected}
+if actual != expected:
+    raise SystemExit(f"runtime package versions differ from the lock: {actual!r}")
+if manifest.get("packages") != expected:
+    raise SystemExit("runtime manifest package versions differ from installed packages")
+if not re.fullmatch(r"[0-9a-f]{64}", manifest.get("workerLockSHA256", "")):
+    raise SystemExit("runtime manifest has no valid worker lock digest")
+if platform.system() != "Darwin" or platform.machine() != "arm64":
+    raise SystemExit("runtime is not executing natively on Apple Silicon")
+if sys.version_info[:3] != (3, 12, 11):
+    raise SystemExit(f"unexpected Python version: {sys.version_info[:3]!r}")
+PY
+
+"$worker_executable" --help >/dev/null
+"$model_executable" --help >/dev/null
+
+echo "verified relocatable CloudPoint worker runtime: $runtime_root"
