@@ -31,6 +31,21 @@ struct VideoProbeResult: Sendable, Equatable {
     let sampledFrameCount: Int
 }
 
+struct PendingReconstructionRequest: Identifiable, Sendable, Equatable {
+    enum Source: Sendable, Equatable {
+        case video(URL, VideoProbeResult)
+        case camera(CameraPreflightResult)
+    }
+
+    let id: UUID
+    let source: Source
+
+    init(id: UUID = UUID(), source: Source) {
+        self.id = id
+        self.source = source
+    }
+}
+
 protocol VideoMetadataProbing: Sendable {
     func probe(_ url: URL, framesPerSecond: Int) async throws -> VideoProbeResult
 }
@@ -45,6 +60,20 @@ enum VideoProbeError: Error, LocalizedError, Equatable {
         case .noVideoTrack: "The selected file does not contain a readable video track."
         case .invalidDuration: "The selected video has an invalid duration."
         case .noSampledFrames: "The selected video does not contain any usable frames."
+        }
+    }
+}
+
+enum PendingReconstructionError: Error, LocalizedError, Equatable, Sendable {
+    case noPendingSource
+    case videoRequired
+    case invalidSelectedFrame
+
+    var errorDescription: String? {
+        switch self {
+        case .noPendingSource: "Choose a video or camera before selecting a reconstruction mode."
+        case .videoRequired: "This SHARP flow requires a video frame."
+        case .invalidSelectedFrame: "Choose a valid source frame for the Gaussian scene."
         }
     }
 }
@@ -207,6 +236,7 @@ final class AppCoordinator: ObservableObject {
     @Published private(set) var recentProjects: [RecentProject] = []
     @Published private(set) var isBusy = false
     @Published private(set) var errorMessage: String?
+    @Published private(set) var pendingReconstruction: PendingReconstructionRequest?
     @Published var engineState: WelcomeEngineState
     @Published var isModelSetupPresented = false
 
@@ -215,6 +245,7 @@ final class AppCoordinator: ObservableObject {
     private let projectStore: any ManagedProjectStoring
     private let videoProbe: any VideoMetadataProbing
     private let recordingSources: any RecordingSourceManaging
+    private let videoKeyFrameSelector: any VideoKeyFrameSelecting
     private let cameraPreflight: any CameraPreflighting
     private let panelPresenter: any InputPanelPresenting
     private let modelInstaller: (any ModelInstalling)?
@@ -227,6 +258,7 @@ final class AppCoordinator: ObservableObject {
         projectStore: any ManagedProjectStoring,
         videoProbe: any VideoMetadataProbing,
         recordingSources: any RecordingSourceManaging = SystemRecordingSourceManager(),
+        videoKeyFrameSelector: any VideoKeyFrameSelecting = VideoKeyFrameSelector(),
         cameraPreflight: any CameraPreflighting = SystemCameraPreflight(),
         panelPresenter: any InputPanelPresenting = SystemInputPanelPresenter(),
         modelInstaller: (any ModelInstalling)? = nil,
@@ -237,6 +269,7 @@ final class AppCoordinator: ObservableObject {
         self.projectStore = projectStore
         self.videoProbe = videoProbe
         self.recordingSources = recordingSources
+        self.videoKeyFrameSelector = videoKeyFrameSelector
         self.cameraPreflight = cameraPreflight
         self.panelPresenter = panelPresenter
         self.modelInstaller = modelInstaller
@@ -307,7 +340,81 @@ final class AppCoordinator: ObservableObject {
     }
 
     func useCamera() async {
-        await createCameraProject()
+        await prepareCameraReconstruction()
+    }
+
+    func cancelPendingReconstruction() {
+        pendingReconstruction = nil
+    }
+
+    func createPendingReconstruction(mode: ReconstructionModeID) async {
+        guard let request = pendingReconstruction else { return }
+        guard mode == .lingbotPointCloud else {
+            errorMessage = "Choose a source frame before creating a SHARP Gaussian scene."
+            return
+        }
+        await performRoute {
+            switch request.source {
+            case let .video(url, probe):
+                guard await requireReadyModel(for: .recording(url, probe)) else {
+                    pendingReconstruction = nil
+                    return
+                }
+                try await finishOpenVideo(url, probe: probe)
+            case let .camera(preflight):
+                guard await requireReadyModel(for: .camera(preflight)) else {
+                    pendingReconstruction = nil
+                    return
+                }
+                try await finishCameraProject(preflight)
+            }
+            pendingReconstruction = nil
+        }
+    }
+
+    func loadPendingVideoKeyFrames() async throws -> [VideoKeyFrameCandidate] {
+        guard let pendingReconstruction else {
+            throw PendingReconstructionError.noPendingSource
+        }
+        guard case let .video(url, probe) = pendingReconstruction.source else {
+            throw PendingReconstructionError.videoRequired
+        }
+        return try await videoKeyFrameSelector.candidates(
+            for: url,
+            durationSeconds: probe.durationSeconds,
+            count: 7
+        )
+    }
+
+    func createPendingSharpReconstruction(
+        selectedFrame: VideoKeyFrameCandidate
+    ) async {
+        guard let request = pendingReconstruction,
+              case let .video(url, probe) = request.source else {
+            errorMessage = PendingReconstructionError.videoRequired.localizedDescription
+            return
+        }
+        guard selectedFrame.timestampSeconds.isFinite,
+              selectedFrame.timestampSeconds >= 0,
+              selectedFrame.timestampSeconds < probe.durationSeconds,
+              !selectedFrame.fullResolutionJPEG.isEmpty else {
+            errorMessage = PendingReconstructionError.invalidSelectedFrame.localizedDescription
+            return
+        }
+        await performRoute {
+            let reference = try await recordingSources.makeReference(
+                for: url,
+                probe: probe,
+                framesPerSecond: Self.defaultSamplingRate
+            )
+            let project = try await projectStore.createSharpRecordingProject(
+                sourceName: url.lastPathComponent,
+                source: reference,
+                selectedFrame: selectedFrame
+            )
+            pendingReconstruction = nil
+            await presentWorkspace(Self.launch(project, initialSource: nil))
+        }
     }
 
     func openInput(_ url: URL) async {
@@ -429,8 +536,9 @@ final class AppCoordinator: ObservableObject {
                 url,
                 framesPerSecond: Self.defaultSamplingRate
             )
-            guard await requireReadyModel(for: .recording(url, probe)) else { return }
-            try await finishOpenVideo(url, probe: probe)
+            pendingReconstruction = PendingReconstructionRequest(
+                source: .video(url, probe)
+            )
         }
     }
 
@@ -495,11 +603,10 @@ final class AppCoordinator: ObservableObject {
         )
     }
 
-    private func createCameraProject() async {
+    private func prepareCameraReconstruction() async {
         await performRoute {
             let preflight = try await cameraPreflight.preflight()
-            guard await requireReadyModel(for: .camera(preflight)) else { return }
-            try await finishCameraProject(preflight)
+            pendingReconstruction = PendingReconstructionRequest(source: .camera(preflight))
         }
     }
 
@@ -616,6 +723,11 @@ private actor UnavailableManagedProjectStore: ManagedProjectStoring {
     func createRecordingProject(
         sourceName: String,
         source: RecordingSourceReference
+    ) throws -> ManagedProject { throw error }
+    func createSharpRecordingProject(
+        sourceName: String,
+        source: RecordingSourceReference,
+        selectedFrame: VideoKeyFrameCandidate
     ) throws -> ManagedProject { throw error }
     func createCameraProject(
         sourceName: String,

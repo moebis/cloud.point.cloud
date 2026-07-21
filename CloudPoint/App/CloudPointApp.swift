@@ -55,5 +55,13 @@ private struct CloudPointRootView: View {
                 }
             }
         }
+        .sheet(item: Binding(
+            get: { coordinator.pendingReconstruction },
+            set: { value in
+                if value == nil { coordinator.cancelPendingReconstruction() }
+            }
+        )) { request in
+            NewReconstructionView(coordinator: coordinator, request: request)
+        }
     }
 }

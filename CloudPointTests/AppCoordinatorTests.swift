@@ -11,7 +11,7 @@ final class AppCoordinatorTests: XCTestCase {
         XCTAssertNil(CloudPointInputRouter.kind(for: URL(filePath: "/tmp/a.txt")))
     }
 
-    func testVideoRouteProbesThenCreatesDurableProjectAndCarriesInitialSource() async throws {
+    func testVideoRouteProbesBeforePresentingModeAndCreatesNoProjectUntilConfirmation() async throws {
         let video = URL(filePath: "/tmp/IMG_2285.MOV")
         let package = URL(filePath: "/tmp/IMG_2285.cloudpoint", directoryHint: .isDirectory)
         let project = ManagedProject(
@@ -34,9 +34,20 @@ final class AppCoordinatorTests: XCTestCase {
         await coordinator.openInput(video)
 
         let probedURLs = await probe.requestedURLs()
-        let createdSourceNames = await store.requestedSourceNames()
+        let sourceNamesBeforeConfirmation = await store.requestedSourceNames()
         XCTAssertEqual(probedURLs, [video])
-        XCTAssertEqual(createdSourceNames, ["IMG_2285.MOV"])
+        XCTAssertEqual(sourceNamesBeforeConfirmation, [])
+        XCTAssertEqual(
+            coordinator.pendingReconstruction?.source,
+            .video(video, VideoProbeResult(durationSeconds: 10.6, sampledFrameCount: 22))
+        )
+        XCTAssertEqual(coordinator.destination, .welcome)
+
+        await coordinator.createPendingReconstruction(mode: .lingbotPointCloud)
+
+        let sourceNamesAfterConfirmation = await store.requestedSourceNames()
+        XCTAssertEqual(sourceNamesAfterConfirmation, ["IMG_2285.MOV"])
+        XCTAssertNil(coordinator.pendingReconstruction)
         guard case let .workspace(launch) = coordinator.destination else {
             return XCTFail("Expected a workspace destination")
         }
@@ -52,7 +63,7 @@ final class AppCoordinatorTests: XCTestCase {
         XCTAssertEqual(recordingSources.first?.nextSampleOrdinal, 0)
     }
 
-    func testCameraRoutePreflightsBeforeCreatingProjectAndCarriesSelectedDevice() async {
+    func testCameraRoutePreflightsBeforeModeConfirmationAndCarriesSelectedDevice() async {
         let store = CoordinatorStore(project: .fixture())
         let preflight = CoordinatorCameraPreflight(
             result: CameraPreflightResult(
@@ -71,9 +82,21 @@ final class AppCoordinatorTests: XCTestCase {
         await coordinator.useCamera()
 
         let preflightRequestCount = await preflight.requestCount()
-        let requestedSourceNames = await store.requestedSourceNames()
+        let sourceNamesBeforeConfirmation = await store.requestedSourceNames()
         XCTAssertEqual(preflightRequestCount, 1)
-        XCTAssertEqual(requestedSourceNames, ["Moebis’s iPhone Capture"])
+        XCTAssertEqual(sourceNamesBeforeConfirmation, [])
+        XCTAssertEqual(
+            coordinator.pendingReconstruction?.source,
+            .camera(CameraPreflightResult(
+                deviceID: "continuity-camera",
+                deviceName: "Moebis’s iPhone"
+            ))
+        )
+
+        await coordinator.createPendingReconstruction(mode: .lingbotPointCloud)
+
+        let sourceNamesAfterConfirmation = await store.requestedSourceNames()
+        XCTAssertEqual(sourceNamesAfterConfirmation, ["Moebis’s iPhone Capture"])
         guard case let .workspace(launch) = coordinator.destination else {
             return XCTFail("Expected camera preflight workspace")
         }
@@ -81,6 +104,46 @@ final class AppCoordinatorTests: XCTestCase {
             launch.initialSource,
             .camera(deviceID: "continuity-camera", deviceName: "Moebis’s iPhone")
         )
+    }
+
+    func testSharpVideoConfirmationCreatesProjectWithSelectedOrientedFrameWithoutLingBotSetup() async throws {
+        let video = URL(filePath: "/tmp/scene.mp4")
+        let store = CoordinatorStore(project: .fixture())
+        let selected = VideoKeyFrameCandidate(
+            index: 2,
+            timestampSeconds: 1.25,
+            thumbnailJPEG: Data("thumbnail".utf8),
+            fullResolutionJPEG: Data("oriented-full-frame".utf8),
+            sharpnessScore: 0.9,
+            exposureScore: 0.8,
+            temporalScore: 0.7
+        )
+        let selector = CoordinatorKeyFrameSelector(candidates: [selected])
+        let coordinator = AppCoordinator(
+            projectStore: store,
+            videoProbe: CoordinatorVideoProbe(
+                result: VideoProbeResult(durationSeconds: 3, sampledFrameCount: 6)
+            ),
+            recordingSources: CoordinatorRecordingSources(),
+            videoKeyFrameSelector: selector,
+            modelInstaller: CoordinatorModelInstaller(health: .absent),
+            engineContext: nil
+        )
+
+        await coordinator.openInput(video)
+        let candidates = try await coordinator.loadPendingVideoKeyFrames()
+        await coordinator.createPendingSharpReconstruction(selectedFrame: selected)
+        let requestedKeyFrameURLs = await selector.requestedURLs()
+        let requestedSharpFrames = await store.requestedSharpFrames()
+
+        XCTAssertEqual(candidates, [selected])
+        XCTAssertEqual(requestedKeyFrameURLs, [video])
+        XCTAssertEqual(requestedSharpFrames, [selected])
+        XCTAssertFalse(coordinator.isModelSetupPresented)
+        XCTAssertNil(coordinator.pendingReconstruction)
+        guard case .workspace = coordinator.destination else {
+            return XCTFail("Expected SHARP workspace")
+        }
     }
 
     func testCameraFailureDoesNotCreateOrListAnEmptyProject() async {
@@ -115,7 +178,9 @@ final class AppCoordinatorTests: XCTestCase {
         )
 
         await coordinator.openDroppedItems([first])
+        await coordinator.createPendingReconstruction(mode: .lingbotPointCloud)
         await coordinator.openExternalURL(second)
+        await coordinator.createPendingReconstruction(mode: .lingbotPointCloud)
 
         let probedURLs = await probe.requestedURLs()
         let createdSourceNames = await store.requestedSourceNames()
@@ -160,6 +225,7 @@ final class AppCoordinatorTests: XCTestCase {
         await coordinator.start()
 
         await coordinator.openInput(video)
+        await coordinator.createPendingReconstruction(mode: .lingbotPointCloud)
 
         let requestedSourceNames = await store.requestedSourceNames()
         XCTAssertEqual(requestedSourceNames, [])
@@ -379,6 +445,7 @@ final class AppCoordinatorTests: XCTestCase {
         await coordinator.start()
 
         await coordinator.openInput(video)
+        await coordinator.createPendingReconstruction(mode: .lingbotPointCloud)
 
         let requestedSourceNames = await store.requestedSourceNames()
         XCTAssertEqual(requestedSourceNames, ["ready.mov"])
@@ -393,6 +460,7 @@ private actor CoordinatorStore: ManagedProjectStoring {
     private(set) var createdSourceNames: [String] = []
     private(set) var openedURLs: [URL] = []
     private(set) var recordingSources: [RecordingSourceReference] = []
+    private(set) var sharpFrames: [VideoKeyFrameCandidate] = []
     private(set) var cameraSources: [CameraSourceReference] = []
 
     init(project: ManagedProject) {
@@ -420,6 +488,17 @@ private actor CoordinatorStore: ManagedProjectStoring {
         return project
     }
 
+    func createSharpRecordingProject(
+        sourceName: String,
+        source: RecordingSourceReference,
+        selectedFrame: VideoKeyFrameCandidate
+    ) -> ManagedProject {
+        createdSourceNames.append(sourceName)
+        recordingSources.append(source)
+        sharpFrames.append(selectedFrame)
+        return project
+    }
+
     func createCameraProject(
         sourceName: String,
         source: CameraSourceReference
@@ -441,6 +520,28 @@ private actor CoordinatorStore: ManagedProjectStoring {
     func requestedProjectURLs() -> [URL] { openedURLs }
 
     func requestedRecordingSources() -> [RecordingSourceReference] { recordingSources }
+
+    func requestedSharpFrames() -> [VideoKeyFrameCandidate] { sharpFrames }
+}
+
+private actor CoordinatorKeyFrameSelector: VideoKeyFrameSelecting {
+    let providedCandidates: [VideoKeyFrameCandidate]
+    private var urls: [URL] = []
+
+    init(candidates: [VideoKeyFrameCandidate]) {
+        providedCandidates = candidates
+    }
+
+    func candidates(
+        for url: URL,
+        durationSeconds: Double,
+        count: Int
+    ) -> [VideoKeyFrameCandidate] {
+        urls.append(url)
+        return providedCandidates
+    }
+
+    func requestedURLs() -> [URL] { urls }
 }
 
 private actor CoordinatorVideoProbe: VideoMetadataProbing {

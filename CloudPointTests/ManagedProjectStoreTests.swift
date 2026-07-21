@@ -126,6 +126,56 @@ final class ManagedProjectStoreTests: XCTestCase {
         XCTAssertEqual(try ProjectManifest.load(from: project.packageURL).recordingSource, source)
     }
 
+    func testSharpRecordingProjectAtomicallyPersistsSelectedFullResolutionFrame() async throws {
+        let support = try TemporaryDirectory.make()
+        let store = ManagedProjectStore(applicationSupportDirectory: support.url)
+        let source = RecordingSourceReference(
+            bookmarkData: Data("video-bookmark".utf8),
+            originalFilename: "Atrium.mov",
+            fingerprint: RecordingSourceFingerprint(
+                byteCount: 1_024,
+                sha256: String(repeating: "d", count: 64)
+            ),
+            durationSeconds: 11,
+            framesPerSecond: 2,
+            expectedSampleCount: 22,
+            nextSampleOrdinal: 0
+        )
+        let selected = VideoKeyFrameCandidate(
+            index: 3,
+            timestampSeconds: 4.25,
+            thumbnailJPEG: Data("thumbnail".utf8),
+            fullResolutionJPEG: Data("full-resolution-jpeg".utf8),
+            sharpnessScore: 0.8,
+            exposureScore: 0.9,
+            temporalScore: 0.7
+        )
+
+        let project = try await store.createSharpRecordingProject(
+            sourceName: "Atrium.mov",
+            source: source,
+            selectedFrame: selected
+        )
+        let manifest = try ProjectManifest.load(from: project.packageURL)
+
+        XCTAssertEqual(manifest.reconstructionPlan.modeID, .sharpGaussian)
+        XCTAssertEqual(manifest.outputState, .gaussian(nil))
+        XCTAssertEqual(manifest.frames, [PersistedFrame(
+            index: 0,
+            sourceTimestamp: 4.25,
+            relativePath: "Frames/00000000.jpg"
+        )])
+        XCTAssertEqual(manifest.recordingSource?.expectedSampleCount, 1)
+        XCTAssertEqual(manifest.recordingSource?.nextSampleOrdinal, 1)
+        XCTAssertEqual(manifest.sessionState.phase, .ready)
+        XCTAssertEqual(manifest.sessionState.capturedCount, 1)
+        XCTAssertEqual(
+            try Data(contentsOf: project.packageURL.appending(path: "Frames/00000000.jpg")),
+            selected.fullResolutionJPEG
+        )
+        XCTAssertEqual(try partialFiles(beneath: support.url), [])
+    }
+
     func testCameraProjectPersistsPreflightSelection() async throws {
         let support = try TemporaryDirectory.make()
         let store = ManagedProjectStore(applicationSupportDirectory: support.url)

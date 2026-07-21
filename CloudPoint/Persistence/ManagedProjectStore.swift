@@ -57,6 +57,11 @@ protocol ManagedProjectStoring: Sendable {
         sourceName: String,
         source: RecordingSourceReference
     ) async throws -> ManagedProject
+    func createSharpRecordingProject(
+        sourceName: String,
+        source: RecordingSourceReference,
+        selectedFrame: VideoKeyFrameCandidate
+    ) async throws -> ManagedProject
     func createCameraProject(
         sourceName: String,
         source: CameraSourceReference
@@ -133,27 +138,67 @@ actor ManagedProjectStore: ManagedProjectStoring {
     }
 
     func createProject(sourceName: String) throws -> ManagedProject {
-        try createProject(sourceName: sourceName, recordingSource: nil, cameraSource: nil)
+        try createProject(
+            sourceName: sourceName,
+            recordingSource: nil,
+            cameraSource: nil,
+            reconstructionPlan: nil,
+            selectedFrame: nil
+        )
     }
 
     func createRecordingProject(
         sourceName: String,
         source: RecordingSourceReference
     ) async throws -> ManagedProject {
-        try createProject(sourceName: sourceName, recordingSource: source, cameraSource: nil)
+        try createProject(
+            sourceName: sourceName,
+            recordingSource: source,
+            cameraSource: nil,
+            reconstructionPlan: nil,
+            selectedFrame: nil
+        )
+    }
+
+    func createSharpRecordingProject(
+        sourceName: String,
+        source: RecordingSourceReference,
+        selectedFrame: VideoKeyFrameCandidate
+    ) async throws -> ManagedProject {
+        var singleFrameSource = source
+        singleFrameSource.framesPerSecond = 1
+        singleFrameSource.expectedSampleCount = 1
+        singleFrameSource.nextSampleOrdinal = 1
+        return try createProject(
+            sourceName: sourceName,
+            recordingSource: singleFrameSource,
+            cameraSource: nil,
+            reconstructionPlan: .sharp(
+                SharpReconstructionConfiguration(inputFrameIndex: 0)
+            ),
+            selectedFrame: selectedFrame
+        )
     }
 
     func createCameraProject(
         sourceName: String,
         source: CameraSourceReference
     ) async throws -> ManagedProject {
-        try createProject(sourceName: sourceName, recordingSource: nil, cameraSource: source)
+        try createProject(
+            sourceName: sourceName,
+            recordingSource: nil,
+            cameraSource: source,
+            reconstructionPlan: nil,
+            selectedFrame: nil
+        )
     }
 
     private func createProject(
         sourceName: String,
         recordingSource: RecordingSourceReference?,
-        cameraSource: CameraSourceReference?
+        cameraSource: CameraSourceReference?,
+        reconstructionPlan: ReconstructionPlan?,
+        selectedFrame: VideoKeyFrameCandidate?
     ) throws -> ManagedProject {
         let projectID = makeUUID()
         let openedAt = now()
@@ -179,12 +224,33 @@ actor ManagedProjectStore: ManagedProjectStoring {
                 withIntermediateDirectories: true
             )
         }
+        let frames: [PersistedFrame]
+        let sessionState: SessionState
+        if let selectedFrame {
+            let frame = PersistedFrame(
+                index: 0,
+                sourceTimestamp: selectedFrame.timestampSeconds,
+                relativePath: "Frames/00000000.jpg"
+            )
+            try selectedFrame.fullResolutionJPEG.write(
+                to: stagingURL.appending(path: frame.relativePath),
+                options: .withoutOverwriting
+            )
+            frames = [frame]
+            sessionState = SessionState(phase: .ready, capturedCount: 1)
+        } else {
+            frames = []
+            sessionState = .empty
+        }
         let manifest = ProjectManifest(
             projectID: projectID,
             createdAt: openedAt,
             updatedAt: openedAt,
+            reconstructionPlan: reconstructionPlan,
             recordingSource: recordingSource,
-            cameraSource: cameraSource
+            cameraSource: cameraSource,
+            frames: frames,
+            sessionState: sessionState
         )
         try manifest.writeAtomically(to: stagingURL)
         try Self.renameExclusively(from: stagingURL, to: packageURL)

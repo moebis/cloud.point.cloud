@@ -80,7 +80,7 @@ struct WelcomeView: View {
             Text("CloudPoint")
                 .font(.system(size: 36, weight: .bold, design: .rounded))
                 .foregroundStyle(.white)
-            Text("Turn video and live capture into a spatial point cloud.")
+            Text("Turn video and live capture into spatial 3D scenes.")
                 .font(.title3)
                 .foregroundStyle(.white.opacity(0.68))
 
